@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MMXPlayer</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#1a1a1a;color:#fff;display:flex;flex-direction:column;height:100vh}
+#bar{background:#333;padding:12px 16px;display:flex;gap:10px;align-items:center;border-bottom:1px solid #444;flex-wrap:wrap}
+#bar label{font-size:13px;color:#aaa}
+#bar input{flex:1;min-width:140px;padding:6px 10px;border-radius:4px;border:1px solid #555;background:#222;color:#fff;font-size:13px}
+#bar button{padding:6px 16px;border:none;border-radius:4px;font-weight:bold;cursor:pointer;font-size:13px}
+#btnStart{background:#28a745;color:#fff}
+#btnStart:hover{background:#218838}
+#btnStop{background:#dc3545;color:#fff;display:none}
+.badge{padding:2px 8px;border-radius:10px;font-size:11px;font-weight:600}
+.badge-main{background:#28a745}
+.badge-fallback{background:#d2991d;color:#000}
+#status{font-size:12px;color:#888}
+#frame{border:none;flex:1;width:100%;display:none}
+#frame.show{display:block}
+</style>
+</head>
+<body>
+<div id="bar">
+  <label>API Server:</label>
+  <input id="apiServer" value="http://localhost:8080" placeholder="http://host:port">
+  <label>App:</label>
+  <input id="app" value="live" style="max-width:80px">
+  <label>Stream:</label>
+  <input id="stream" value="3drush-fwv" style="max-width:160px">
+  <select id="mode" style="padding:6px 10px;border-radius:4px;border:1px solid #555;background:#222;color:#fff;font-size:13px">
+    <option value="simulcast">Simulcast</option>
+    <option value="multitrack">Multitrack</option>
+  </select>
+  <button id="btnStart" onclick="connect()">Connect</button>
+  <button id="btnStop" onclick="disconnect()">Disconnect</button>
+  <span id="status"></span>
+</div>
+<iframe id="frame"></iframe>
+
+<script>
+let currentPlayer = null;
+
+function isValidWHEP(url) {
+  return !!(url && (url.indexOf('whep') !== -1 || url.indexOf('/live/') !== -1));
+}
+
+function parseQuery() {
+  const p = new URLSearchParams(location.search);
+  if (p.get('api')) document.getElementById('apiServer').value = p.get('api');
+  if (p.get('app')) document.getElementById('app').value = p.get('app');
+  if (p.get('stream')) document.getElementById('stream').value = p.get('stream');
+}
+parseQuery();
+
+async function connect() {
+  const api = document.getElementById('apiServer').value.trim();
+  const app = document.getElementById('app').value.trim();
+  const stream = document.getElementById('stream').value.trim();
+  let mode = document.getElementById('mode').value;
+  if (!api || !stream) return setStatus('Enter API server and stream', 'red');
+
+  setStatus('Fetching play URIs...', '#aaa');
+  document.getElementById('btnStart').style.display = 'none';
+  document.getElementById('btnStop').style.display = 'inline-block';
+  document.getElementById('frame').classList.add('show');
+
+  try {
+    const res = await fetch(`${api}/api/playUri?app=${encodeURIComponent(app)}&stream=${encodeURIComponent(stream)}`);
+    const json = await res.json();
+    const data = json.data || json;
+    const vsa = encodeURIComponent(data.video_stat_api||'');
+
+    // If user chose simulcast but main_play_uri is missing or invalid,
+    // automatically fall back to multitrack.
+    if (mode === 'simulcast' && !isValidWHEP(data.main_play_uri)) {
+      if (data.backup_play_uri) {
+        console.warn('[MMXPlayer] main play URI invalid, falling back to multitrack');
+        mode = 'multitrack';
+      }
+    }
+
+    if (mode === 'simulcast' && data.main_play_uri) {
+      setStatus(`<span class="badge badge-main">Simulcast</span>`, '#28a745');
+      document.getElementById('frame').src = `simulcast/?url=${encodeURIComponent(data.main_play_uri)}&videostat_api=${vsa}`;
+      currentPlayer = 'simulcast';
+    } else if (data.backup_play_uri) {
+      setStatus(`<span class="badge badge-fallback">Multitrack</span>`, '#d2991d');
+      document.getElementById('frame').src = `multitrack/?videostat_api=${vsa}`;
+      currentPlayer = 'multitrack';
+    } else {
+      setStatus('No play URI available', '#f85149');
+      disconnect();
+    }
+  } catch(e) {
+    setStatus(`Error: ${e.message}`, '#f85149');
+    document.getElementById('btnStart').style.display = 'inline-block';
+    document.getElementById('btnStop').style.display = 'none';
+    document.getElementById('frame').classList.remove('show');
+  }
+}
+
+function disconnect() {
+  document.getElementById('frame').src = '';
+  document.getElementById('frame').classList.remove('show');
+  document.getElementById('btnStart').style.display = 'inline-block';
+  document.getElementById('btnStop').style.display = 'none';
+  setStatus('Stopped', '#aaa');
+  currentPlayer = null;
+}
+
+function setStatus(msg, color) {
+  const s = document.getElementById('status');
+  s.innerHTML = msg;
+  s.style.color = color || '#888';
+}
+</script>
+</body>
+</html>

@@ -1,0 +1,63 @@
+###############################################
+# mmx edge node configuration
+# 边缘节点：按需从 Origin 回源，服务观众
+#
+# 多 Edge 部署：每个 Edge 实例需不同的端口和日志文件
+#   Edge-1: webrtcAddress=:8890, webrtcLocalUDPAddress=:8190, logFile=logs/mmx-edge1.log
+#   Edge-2: webrtcAddress=:8891, webrtcLocalUDPAddress=:8191, logFile=logs/mmx-edge2.log
+#   Edge-N: 以此类推
+###############################################
+
+logLevel: info
+logDestinations: [stdout, file]
+logFile: logs/mmx-edge.log
+
+# ── PPCDN control plane ───────────────────────
+mmxControl: true
+mmxControlURL: ws://127.0.0.1:8080/ws/mmx
+mmxNodeRole: NODE_ROLE_EDGE
+mmxNodeID: 1
+mmxNodeRegion: local
+mmxNodeCapacity: 300
+mmxHeartbeatInterval: 10s
+mmxWebRTCBaseURL: http://127.0.0.1:8890
+
+readTimeout: 10s
+writeTimeout: 10s
+writeQueueSize: 512
+
+# ── Control API ──────────────────────────────
+api: true
+apiAddress: :9998
+
+# ── Protocols ─────────────────────────────────
+rtsp: false
+rtmp: false
+hls: false
+srt: false
+moq: false
+
+# ── WebRTC ────────────────────────────────────
+webrtc: true
+webrtcAddress: :8890                # 不同 HTTP 端口
+webrtcLocalUDPAddress: :8190        # 不同 ICE UDP 端口
+webrtcAllowOrigins: ["*"]
+
+webrtcABREnable: true
+webrtcABRWSPath: /ws/control
+webrtcABRSwitchCooldown: 3000
+
+# ── Paths ─────────────────────────────────────
+paths:
+  all:
+    # 按需从 Origin 拉流 (WHEP), $G1 替换为路径名
+    source: whep://127.0.0.1:8889/$G1/whep
+
+    sourceOnDemand: true
+    sourceOnDemandStartTimeout: 10s
+    sourceOnDemandCloseAfter: 10s
+
+    whepBearerToken: ""
+    whepSTUNGatherTimeout: 5s
+    whepHandshakeTimeout: 10s
+    whepTrackGatherTimeout: 5s

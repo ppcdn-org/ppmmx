@@ -1,0 +1,74 @@
+###############################################
+# mmx origin node configuration
+# 源节点：接受 WHIP 推流，提供 WHEP 回源
+###############################################
+
+logLevel: info
+logDestinations: [stdout, file]
+logFile: logs/mmx-origin.log
+
+# ── PPCDN control plane ───────────────────────
+mmxControl: true
+mmxControlURL: ws://127.0.0.1:8080/ws/mmx
+mmxNodeRole: NODE_ROLE_ORIGIN
+mmxNodeID: 1
+mmxNodeRegion: local
+mmxNodeCapacity: 100
+mmxHeartbeatInterval: 10s
+mmxWebRTCBaseURL: http://127.0.0.1:8889
+
+readTimeout: 10s
+writeTimeout: 10s
+writeQueueSize: 512
+udpReadBufferSize: 2097152            # UDP 读缓冲 2MB，避免大关键帧 burst 丢包
+
+# ── Control API ──────────────────────────────
+api: true
+apiAddress: :9997
+
+# ── Protocols ─────────────────────────────────
+rtsp: false
+# RTMP: 用于接收 OBS Enhanced Broadcasting (Multitrack Video)，
+# 4 路视频以 Enhanced RTMP 私有多轨扩展在同一条 RTMP 连接内下发，
+# gortmplib 已原生支持解析 (OneTrack 子模式，与 OBS 实际发送格式一致)。
+rtmp: true
+rtmpAddress: :1935
+hls: false
+srt: false
+# srtAddress: :8890  # disabled: conflicts with Edge WHEP port
+moq: false
+
+# ── WebRTC ────────────────────────────────────
+webrtc: true
+webrtcAddress: :8889
+webrtcLocalUDPAddress: :8189           # 固定 ICE UDP，才能设置缓冲区大小
+webrtcAllowOrigins: ["*"]
+# Simulcast 推流端(如 OBS)冷启动时视频编码器可能晚于音频出包;
+# 默认 2s 窗口过短会导致只采集到音频(播放黑屏)。轨道齐了会提前返回。
+webrtcTrackGatherTimeout: 10s
+
+# ABR (Adaptive Bitrate)
+webrtcABREnable: true
+webrtcABRWSPath: /ws/control
+webrtcABRSwitchCooldown: 3000
+
+# ── Forward (腾讯云 WHIP 转推) ──────────────────
+# 默认关闭。开启前必须在下面填好账号级信息，且每条要转推的 path
+# 还要单独设置 forwardTencent: true (见下方 paths 示例)。
+# 见 doc/forward-tencent-design.md —— WHIP 地址的确切拼装方式和多层
+# stream key 命名规则还没有对照真实腾讯云账号验证过，先用默认模板试。
+tencentWHIPEnable: false
+tencentWHIPEndpoint: "webrtc://{domain}/{app}/{streamKey}?txSecret={txSecret}&txTime={txTime}"
+tencentWHIPDomain: example.invalid
+tencentWHIPApp: live
+tencentWHIPSecretKey: ""
+tencentWHIPTokenDays: 30
+
+# ── Paths ─────────────────────────────────────
+paths:
+  all:                          # 接受任意路径的推流
+    source: publisher
+    sourceOnDemand: false
+    maxReaders: 30              # WHEP 拉流最大并发数，0=不限制
+    forwardTencent: false                      # 该 path 是否转推腾讯云
+    # forwardTencentStreamKey: my-stream-name    # 留空则默认用 path 名

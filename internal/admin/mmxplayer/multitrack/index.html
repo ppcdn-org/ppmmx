@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html>
+  <link rel="icon" href="data:,">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=Edge,chrome=1">
+    <meta name="viewport" content="width=device-width,initial-scale=1.0,viewport-fit=cover">
+    <title>WebRTC Player(tencent)</title>
+    <link type="text/css" rel="stylesheet" href="./css/materialize.min.css">
+    <link type="text/css" rel="stylesheet" href="./css/main.css?v=1.0.3-grid2">
+  </head>
+  <body>
+    <link href="https://fonts.googleapis.com/icon?family=Material+Icons" rel="stylesheet">
+
+    <!-- <nav class="blue darken-1">
+      <div class="nav-wrapper container">
+        <div class="brand-logo">
+          <span class="logo"></span><span class="title">TCPlayer</span>
+        </div>
+        <ul class="right">
+          <li><a href="./index_en.html"><span class="icon-language left"></span>English</a></li>
+        </ul>
+      </div>
+    </nav> -->
+    <div class="section container player-page">
+      <div id="timestamp"></div>
+      <div class="card-panel grey lighten-5 z-depth-1 player-card">
+        <div class="row">
+          <!-- <div class="col s12">
+            <span class="new badge hide orange" data-badge-caption="" id="tbsInfo"></span>
+            <span class="new badge hide" data-badge-caption="" id="h264Support"></span>
+            <span class="new badge hide" data-badge-caption="" id="webrtcSupport"></span>
+          </div> -->
+          
+          <div class="selector-row">
+            <!-- selectors -->
+            <div class="input-field selector-field selector-field-site">
+              <select id="stream-select">
+                <option value="" selected>loading...</option>
+              </select>
+              <label>Site name</label>
+            </div>
+
+            <div class="input-field selector-field selector-field-view">
+              <select id="view-select">
+                <option value="fwh" selected>fwh</option>
+                <option value="fwv">fwv</option>
+              </select>
+              <label>View name</label>
+            </div>
+
+            <div class="input-field selector-field selector-field-quality">
+              <select id="quality-select">
+                <option value="auto" selected>auto</option>
+                <option value="high">1080P</option>
+                <option value="standard">720P</option>
+                <option value="economic">360P</option>
+                <option value="bottom">audio</option>
+              </select>
+              <label>quality level</label>
+            </div>
+
+          </div>
+
+
+          <div class="input-field col s12 webrtc-field">
+            <input id="webrtc" class="validate" type="text" placeholder="input a customized webrtc://uri or leave it blank.">
+          </div>
+
+          <div class="col s12 button-group center-align player-actions">
+            <a id="startPlay" class="waves-effect waves-light btn-small">
+              <i class="material-icons">play_arrow</i>
+            </a>
+            <!-- <a id="pausePlay" class="waves-effect waves-light btn-small red">pause</a> -->
+            <a id="stopPlay" class="waves-effect waves-light btn-small red">stop</a>
+            <!-- <a id="destroyPlayer" class="waves-effect waves-light btn-small red">destroy</a> -->
+            <!-- <a id="pausePlay" class="waves-effect waves-light btn-small light-blue lighten-1">pause</a> -->
+            <!-- <a id="resumePlay" class="waves-effect waves-light btn-small light-blue lighten-1">resume</a> -->
+            <a id="mutePlay" class="waves-effect waves-light btn-small light-blue lighten-1 tooltipped" data-tooltip="Mute / unmute">
+              <i class="material-icons">volume_up</i>
+            </a>
+            <!-- <a id="unmutePlay" class="waves-effect waves-light btn-small light-blue lighten-1">unmute</a> -->
+             <!-- <a id="showControls" class="waves-effect waves-light btn-small light-blue lighten-1">Show controls</a> -->
+             <!-- <a id="hideControls" class="waves-effect waves-light btn-small light-blue lighten-1">Hide controls</a> -->
+            <a id="enterFullScreen" class="waves-effect waves-light btn-small light-blue lighten-1">
+              <i class="material-icons">fullscreen</i>
+            </a>
+            <a id="showStat" class="waves-effect waves-light btn-small orange lighten-1">stat</a>
+          </div>
+          <!-- <div class="col s12 m8 l8 range">
+             <label for="volume">Volume&nbsp;<span id="volumeValue">50</span></label>
+            <div class="range-field">
+              <input type="range" id="volume" min="0" max="100" step="1" value="50" />
+            </div>
+          </div> -->
+          
+          <div class="col s12">
+            <div class="video" id="local-video">
+              <video id="player-container-id" playsinline webkit-playsinline></video>
+              <div class="stat-info">
+                <i class="close-icon"></i>
+                <ul class="stat">
+                  No data available
+                </ul>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <link href="./css/tcplayer.min.css" rel="stylesheet">
+    <script src="https://video.sdk.qcloudecdn.com/web/TXLivePlayer-1.3.4.min.js"></script>
+    <script src="./js/jquery-3.5.1.min.js"></script>
+    <script src="./js/materialize.min.js"></script>
+    <script src="./js/tcplayer.v4.8.0.min.js"></script>
+    <!-- <script src="./js/vconsole.min.js"></script> -->
+    <script src="./js/copy.min.js"></script>
+    <script src="./js/view.js"></script>
+    
+    <script src="./js/v3/utils.js?v=1.0.3-embed2"></script>
+    <script src="./js/v3/abrplayer.js?v=1.0.3-audio360"></script>
+    <script src="./js/v3/main.js?v=1.0.3-manualplay1"></script>
+
+    <!-- <script src="./js/main-v1.0.3.js"></script> -->
+  </body>
+</html>

@@ -1,0 +1,21 @@
+/tmp
+/binaries
+/coverage*.txt
+/api/*.html
+/internal/core/VERSION
+/internal/servers/hls/hls.min.js
+/internal/staticsources/rpicamera/mtxrpicam_*/
+/auto.crt
+/auto.key
+/internal/core/auto.crt
+/internal/core/auto.key
+*.exe
+/bin/logs/
+*.sock
+.env
+.env.*
+*.env
+
+# local test-run artifacts, not upstream fixtures
+/internal/core/data/
+/internal/externalcmd/C*Usersgreg*

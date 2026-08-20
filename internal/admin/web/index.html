@@ -1,0 +1,512 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MMX Admin</title>
+<style>
+:root{--bg:#08111f;--surface:#101d2d;--border:#203852;--text:#e6eef7;--muted:#8da3bb;--accent:#4dd4c6;--blue:#62a8ff;--green:#47d18c;--red:#ff6b78;--yellow:#f5c96a}
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:Inter,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:radial-gradient(circle at 80% 0,#123554 0,transparent 34%),var(--bg);color:var(--text);min-height:100vh}
+#adminApp{display:grid;grid-template-columns:238px 1fr;min-height:100vh}
+header{grid-column:1;background:rgba(16,29,45,.92);border-right:1px solid var(--border);padding:28px 18px;position:fixed;inset:0 auto 0 0;width:238px}
+header .header-inner{height:100%;display:flex;flex-direction:column;align-items:stretch;justify-content:flex-start;padding:0}
+header h1{font-size:21px;color:var(--accent);letter-spacing:.03em;padding:0 12px 34px}
+.header-actions{display:flex;align-items:center;gap:8px}
+nav{display:flex;flex-direction:column;gap:7px}
+nav a{padding:12px 14px;border-radius:9px;text-decoration:none;color:var(--muted);font-size:14px;transition:all .2s}
+nav a:hover,nav a.active{background:var(--accent);color:#07131e;font-weight:700}
+main{grid-column:2;padding:38px clamp(22px,4vw,64px);max-width:1500px;width:100%;margin:0 auto}
+.card{background:rgba(16,29,45,.86);border:1px solid var(--border);border-radius:14px;padding:22px;margin-bottom:18px;box-shadow:0 16px 40px rgba(0,0,0,.12)}
+.card h3{margin-bottom:12px;color:var(--accent)}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th,td{text-align:left;padding:8px 12px;border-bottom:1px solid var(--border)}
+th{font-weight:600;color:var(--muted)}
+.badge{padding:2px 8px;border-radius:10px;font-size:12px;font-weight:600}
+.badge-on{background:var(--green);color:#fff}
+.badge-off{background:var(--red);color:#fff}
+.badge-pub{background:var(--accent);color:#fff}
+.badge-reader{background:var(--yellow);color:#000}
+button{padding:6px 14px;border:none;border-radius:6px;cursor:pointer;font-size:13px;transition:all .2s}
+.btn-danger{background:var(--red);color:#fff}
+.btn-danger:hover{opacity:.8}
+.status{font-size:13px;color:var(--muted);margin:12px 0}
+.loading{color:#8b949e;text-align:center;padding:40px}
+.error{color:var(--red)}
+a.dl-link{color:var(--accent);text-decoration:none;font-size:14px}
+a.dl-link:hover{text-decoration:underline}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:16px}
+.stat-value{font-size:32px;font-weight:700;color:var(--accent)}
+.stat-label{font-size:13px;color:var(--muted);margin-top:4px}
+code{background:var(--bg);padding:3px 7px;border-radius:5px;font-size:12px;color:#b9d8f4}
+.node-card{cursor:pointer;transition:border-color .2s}
+.node-card:hover{border-color:var(--accent)}
+.auth-screen{min-height:100vh;display:grid;place-items:center;padding:24px}
+.auth-card{width:min(380px,100%)}
+.auth-card input{width:100%;margin:6px 0 14px;padding:10px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text)}
+.btn-primary{background:var(--accent);color:#fff}
+.hidden{display:none}
+.config-input{min-width:min(560px,100%);padding:9px 10px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text)}
+.config-input:disabled{opacity:.8;border-color:transparent;background:transparent;padding-left:0}
+.config-actions{display:flex;gap:10px;margin-top:18px}
+.path-config-input{width:100%;padding:8px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text)}
+.path-config-table td{vertical-align:middle}
+.player-frame{width:100%;height:720px;border:1px solid var(--border);border-radius:10px;background:#000}
+.player-stack{display:flex;flex-direction:column;gap:18px}
+.player-stack .card{margin-bottom:0}
+@media(max-width:800px){.player-frame{height:560px}}
+@media(max-width:900px){#adminApp{display:block}header{position:static;width:auto;padding:14px 18px;border-right:0;border-bottom:1px solid var(--border)}header .header-inner{height:auto}header h1{padding:0 0 14px}nav{flex-direction:row;overflow:auto}nav a{white-space:nowrap}main{padding:24px 16px}}
+</style>
+</head>
+<body>
+<section id="loginScreen" class="auth-screen">
+  <form id="loginForm" class="card auth-card">
+    <h3>MMX Admin Login</h3>
+    <label>Username<input id="loginUsername" autocomplete="username" required></label>
+    <label>Password<input id="loginPassword" type="password" autocomplete="current-password" required></label>
+    <button class="btn-primary" type="submit">Login</button>
+    <div id="loginError" class="error status"></div>
+  </form>
+</section>
+<div id="adminApp" class="hidden">
+<header>
+  <div class="header-inner">
+    <h1>MMX Admin</h1>
+    <nav>
+      <a href="#" data-page="dashboard" class="active">Dashboard</a>
+      <a href="#" data-page="statistics">Statistics</a>
+      <a href="#" data-page="siteConfig">Configuration</a>
+      <a href="#" data-page="mainPlayer">Main Player</a>
+      <a href="#" data-page="backupPlayer">Backup Player</a>
+      <a href="#" data-page="downloads">Downloads</a>
+    </nav>
+    <div class="header-actions"><button onclick="resetPassword()">Reset Password</button><button class="btn-danger" onclick="logout()">Logout</button></div>
+  </div>
+</header>
+<main id="content"><div class="loading">Loading...</div></main>
+</div>
+
+<script>
+const API = '/admin/api/v1';
+
+document.querySelectorAll('nav a').forEach(a => {
+  a.addEventListener('click', e => {
+    e.preventDefault();
+    document.querySelectorAll('nav a').forEach(x => x.classList.remove('active'));
+    a.classList.add('active');
+    const p = a.dataset.page;
+    if (p === 'dashboard') renderDashboard();
+    else if (p === 'streams') renderStreams();
+    else if (p === 'statistics') renderStatistics();
+    else if (p === 'siteConfig') renderSiteConfig();
+    else if (p === 'sessions') renderSessions();
+    else if (p === 'mainPlayer') renderPlayer('primary');
+    else if (p === 'backupPlayer') renderPlayer('backup');
+    else if (p === 'downloads') renderDownloads();
+  });
+});
+
+async function api(path, opts = {}) {
+  const res = await fetch(API + path, { credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, ...opts });
+  if (res.status === 401 && path !== '/auth/login') showLogin();
+  if (!res.ok) throw new Error(await res.text());
+  const json = await res.json();
+  return json.data;
+}
+
+function showLogin() {
+  document.getElementById('adminApp').classList.add('hidden');
+  document.getElementById('loginScreen').classList.remove('hidden');
+  document.getElementById('loginPassword').value = '';
+}
+
+function showAdmin() {
+  document.getElementById('loginScreen').classList.add('hidden');
+  document.getElementById('adminApp').classList.remove('hidden');
+  renderDashboard();
+}
+
+document.getElementById('loginForm').addEventListener('submit', async e => {
+  e.preventDefault();
+  try {
+    await api('/auth/login', { method: 'POST', body: JSON.stringify({ username: document.getElementById('loginUsername').value, password: document.getElementById('loginPassword').value }) });
+    document.getElementById('loginError').textContent = '';
+    showAdmin();
+  } catch (_) { document.getElementById('loginError').textContent = 'Invalid username or password'; }
+});
+
+async function logout() {
+  try { await api('/auth/logout', { method: 'POST' }); } finally { showLogin(); }
+}
+
+async function resetPassword() {
+  const newPassword = prompt('Set new password (at least 8 characters)');
+  if (newPassword === null) return;
+  try {
+    await api('/auth/change-password', { method: 'POST', body: JSON.stringify({ new_password: newPassword }) });
+    alert('Password reset. Please log in again.');
+    showLogin();
+  } catch(e) { alert(e.message); }
+}
+
+// ── Dashboard ──────────────────────────────────────────────────
+async function renderDashboard() {
+  const main = document.getElementById('content');
+  main.innerHTML = '<div class="loading">Loading...</div>';
+  try {
+    const [nodesData, streams, sessions] = await Promise.all([
+      api('/nodes'), api('/streams'), api('/sessions')
+    ]);
+    const nodes = nodesData.nodes || [];
+    const streamCount = (streams.streams || []).length;
+    const pubCount = (sessions.sessions || []).filter(s => s.publish).length;
+    const readerCount = (sessions.sessions || []).filter(s => !s.publish).length;
+
+    let nodesHTML = nodes.map(n => `
+      <div class="card node-card" onclick="renderNodeDetail('${esc(n.name)}')">
+        <div class="stat-value"><span class="badge ${n.reachable?'badge-on':'badge-off'}">${n.reachable?'ONLINE':'OFFLINE'}</span></div>
+        <div class="stat-label">${esc(n.name)} &mdash; ${esc(n.version)}</div>
+        <div style="margin-top:8px;font-size:11px;color:#8b949e">${n.reachable ? 'since '+new Date(n.started).toLocaleString() : 'unreachable'} &bull; Click for config</div>
+      </div>`).join('');
+
+    main.innerHTML = `
+      <h2>Dashboard</h2>
+      <div class="grid">
+        ${nodesHTML}
+        <div class="card"><div class="stat-value">${streamCount}</div><div class="stat-label">Active Streams (origin)</div></div>
+        <div class="card"><div class="stat-value">${pubCount}</div><div class="stat-label">Publishers</div></div>
+        <div class="card"><div class="stat-value">${readerCount}</div><div class="stat-label">Readers</div></div>
+      </div>
+      <div class="status">Last updated: ${new Date().toLocaleTimeString()}</div>`;
+  } catch(e) { main.innerHTML = `<div class="error">Error: ${e.message}</div>`; }
+}
+
+// ── Node Detail ───────────────────────────────────────────────
+async function renderNodeDetail(name) {
+  const main = document.getElementById('content');
+  main.innerHTML = '<div class="loading">Loading...</div>';
+  try {
+    const data = await api('/nodes/' + encodeURIComponent(name));
+    const info = data.info || {};
+    const g = data.config || {};
+    const paths = (data.paths && data.paths.items) || [];
+    const allPath = paths.find(p => p.name === 'all') || {};
+    const b = (v) => v ? '<span class="badge badge-on">enabled</span>' : '<span class="badge badge-off">disabled</span>';
+
+    main.innerHTML = `
+      <h2>&larr; <a href="#" onclick="renderDashboard();return false" style="color:var(--accent)">Dashboard</a> &nbsp;|&nbsp; ${esc(name)}</h2>
+      <div class="card">
+        <h3>Info</h3>
+        <table>
+          <tr><td>Version</td><td><code>${esc(info.version||'-')}</code></td></tr>
+          <tr><td>Started</td><td>${esc(info.started?new Date(info.started).toLocaleString():'-')}</td></tr>
+          <tr><td>Backend</td><td><code>${esc(data.backend||'')}</code></td></tr>
+          <tr><td>Player Domain</td><td><code>${esc(data.player||'')}</code></td></tr>
+        </table>
+      </div>
+      <div class="card"><h3>Protocols</h3><table>
+        <tr><td>WebRTC</td><td>${b(g.webrtc)} ${esc(g.webrtcAddress||'')}</td></tr>
+        <tr><td>RTMP</td><td>${b(g.rtmp)} ${esc(g.rtmpAddress||'')}</td></tr>
+        <tr><td>SRT</td><td>${b(g.srt)} ${esc(g.srtAddress||'')}</td></tr>
+        <tr><td>HLS</td><td>${b(g.hls)}</td></tr>
+      </table></div>
+      <div class="card"><h3>WebRTC / ABR</h3><table>
+        <tr><td>HTTP Address</td><td><code>${esc(g.webrtcAddress||'')}</code></td></tr>
+        <tr><td>ICE UDP</td><td><code>${esc(g.webrtcLocalUDPAddress||'')}</code></td></tr>
+        <tr><td>ABR</td><td>${b(g.webrtcABREnable)}</td></tr>
+        <tr><td>ABR Cooldown</td><td>${esc(g.webrtcABRSwitchCooldown||3000)} ms</td></tr>
+      </table></div>
+      <div class="card"><h3>Path Config (all)</h3><table>
+        <tr><td>Source</td><td><code>${esc(allPath.source||'publisher')}</code></td></tr>
+        <tr><td>Max Readers</td><td><code>${allPath.maxReaders||0}</code></td></tr>
+        <tr><td>Forward Tencent</td><td>${b(allPath.forwardTencent)}</td></tr>
+      </table></div>
+      <div class="card"><h3>Limits</h3><table>
+        <tr><td>Write Queue</td><td>${esc(g.writeQueueSize||512)}</td></tr>
+        <tr><td>UDP Buffer</td><td><code>${formatBytesUDP(g.udpReadBufferSize||0)}</code></td></tr>
+        <tr><td>Read Timeout</td><td>${esc(g.readTimeout||'')}</td></tr>
+        <tr><td>Write Timeout</td><td>${esc(g.writeTimeout||'')}</td></tr>
+      </table></div>
+      <div class="status">Last updated: ${new Date().toLocaleTimeString()}</div>`;
+  } catch(e) { main.innerHTML = `<div class="error">Error: ${e.message}</div>`; }
+}
+
+// ── Streams ────────────────────────────────────────────────────
+async function renderStreams() {
+  const main = document.getElementById('content');
+  main.innerHTML = '<div class="loading">Loading...</div>';
+  try {
+    const data = await api('/streams');
+    const streams = data.streams || [];
+    let html = '<h2>Streams</h2>';
+    if (data.error && streams.length === 0) {
+      html += `<div class="card"><p class="error">${esc(data.error)}</p></div>`;
+    } else if (streams.length === 0) {
+      html += '<div class="card"><p class="status">No active streams</p></div>';
+    } else {
+      html += '<table><thead><tr><th>Path</th><th>Tracks</th><th>Readers</th></tr></thead><tbody>';
+      streams.forEach(s => {
+        html += `<tr>
+          <td><code>${esc(s.name)}</code></td>
+          <td>${(s.tracks||[]).length}</td>
+          <td>${s.readers?s.readers.length:'-'}</td></tr>`;
+      });
+      html += '</tbody></table>';
+    }
+    main.innerHTML = html;
+  } catch(e) { main.innerHTML = `<div class="error">Error: ${e.message}</div>`; }
+}
+
+// ── Statistics ─────────────────────────────────────────────────
+async function renderStatistics() {
+  const main = document.getElementById('content');
+  main.innerHTML = '<div class="loading">Loading...</div>';
+  try {
+    const [ingest, game] = await Promise.all([api('/ingest-stats'), api('/game-stats')]);
+    main.innerHTML = `<h2>Statistics</h2>
+      <div class="card"><h3>Ingest Statistics</h3>${renderIngestStats(ingest.items || [])}</div>
+      <div class="card"><h3>Game Statistics</h3>${renderGameStats(game.items || [])}</div>`;
+  } catch(e) { main.innerHTML = `<div class="error">Error: ${e.message}</div>`; }
+}
+
+function renderIngestStats(items) {
+  if (!items.length) return '<p class="status">No ingest stream data</p>';
+  let html = '<table><thead><tr><th>Path</th><th>Ready</th><th>Source</th><th>Tracks</th><th>Readers</th></tr></thead><tbody>';
+  items.forEach(s => {
+    const ready = !!s.ready;
+    html += `<tr><td><code>${esc(s.name||'-')}</code></td><td><span class="badge ${ready?'badge-on':'badge-off'}">${ready?'ready':'down'}</span></td><td>${esc(s.source && (s.source.type || s.source.id) || '-')}</td><td>${(s.tracks||[]).length}</td><td>${s.readers?s.readers.length:'-'}</td></tr>`;
+  });
+  return html + '</tbody></table>';
+}
+
+function renderGameStats(items) {
+  if (!items.length) return '<p class="status">No game/round statistics available yet</p>';
+  let html = '<table><thead><tr><th>Table</th><th>GC</th><th>Game</th><th>Status</th><th>Updated</th></tr></thead><tbody>';
+  items.forEach(x => { html += `<tr><td>${esc(x.table||'-')}</td><td>${esc(x.gc||'-')}</td><td>${esc(x.game||'-')}</td><td>${esc(x.status||'-')}</td><td>${esc(x.updated||'-')}</td></tr>`; });
+  return html + '</tbody></table>';
+}
+
+// ── Configuration ───────────────────────────────────────────────
+async function renderSiteConfig() {
+  const main = document.getElementById('content');
+  main.innerHTML = '<div class="loading">Loading...</div>';
+  try {
+    const data = await api('/site-config');
+    const configs = data.site_stream_configs || [];
+    main.innerHTML = `
+      <h2>Configuration</h2>
+      <div class="card"><h3>Player Domains</h3><table>
+        <tr><td>Main Player Domain</td><td><input id="mainPlayerDomain" class="config-input" value="${esc(data.main_player_domain||'')}" disabled></td></tr>
+        <tr><td>Backup Player Domain</td><td><input id="backupPlayerDomain" class="config-input" value="${esc(data.backup_player_domain||'')}" disabled></td></tr>
+        <tr><td>VideoStat Domain</td><td><select id="videoStatDomain" class="config-input" disabled>
+          <option value="test" ${data.videostat_env==='test'?'selected':''}>test: https://lotto-videostat.gelotto-test.com/api/stat</option>
+          <option value="uat" ${data.videostat_env==='uat'?'selected':''}>uat: https://lotto-videostat.gelotto-uat.com/api/stat</option>
+          <option value="stag" ${data.videostat_env==='stag'?'selected':''}>stag: https://lotto-videostat.numericgame.io/api/stat</option>
+          <option value="prod" ${data.videostat_env==='prod'?'selected':''}>prod: https://lotto-videostat.numericgame.ph/api/stat</option>
+        </select></td></tr>
+      </table><div class="config-actions">
+        <button class="btn-primary" id="editConfigBtn" onclick="editConfig()">Edit</button>
+        <button class="btn-primary hidden" id="saveConfigBtn" onclick="saveConfig()">Save</button>
+      </div></div>
+      <div class="card"><h3>Stream Configuration</h3>
+        <p class="status">Site is generated as <code>studio_&lt;site name&gt;</code>; stream is generated as <code>live/&lt;stream name&gt;-&lt;view name&gt;</code>.</p>
+        <div id="siteStreamConfigTable">${renderSiteStreamConfigTable(configs, false)}</div>
+        <div class="config-actions">
+          <button class="btn-primary" id="editPathConfigBtn" onclick="editPathConfig()">Edit</button>
+          <button class="btn-primary hidden" id="savePathConfigBtn" onclick="savePathConfig()">Save</button>
+        </div>
+      </div>`;
+  } catch(e) { main.innerHTML = `<div class="error">Error: ${e.message}</div>`; }
+}
+
+function editConfig() {
+  document.querySelectorAll('.config-input').forEach(input => { input.disabled = false; });
+  document.getElementById('editConfigBtn').classList.add('hidden');
+  document.getElementById('saveConfigBtn').classList.remove('hidden');
+}
+
+async function saveConfig() {
+  const button = document.getElementById('saveConfigBtn');
+  button.disabled = true;
+  try {
+    await api('/player-config', {
+      method: 'POST',
+      body: JSON.stringify({
+        main_player_domain: document.getElementById('mainPlayerDomain').value.trim(),
+        backup_player_domain: document.getElementById('backupPlayerDomain').value.trim(),
+        videostat_env: document.getElementById('videoStatDomain').value
+      })
+    });
+    await renderSiteConfig();
+  } catch (e) {
+    alert('Save failed: ' + e.message);
+    button.disabled = false;
+  }
+}
+
+function renderSiteStreamConfigTable(configs, editable) {
+  let html = `<table class="path-config-table"><thead><tr><th>Site Name</th><th>Generated Site</th><th>Stream Name</th><th>View Name</th><th>Generated Stream</th>${editable?'<th></th>':''}</tr></thead><tbody>`;
+  if (!configs.length) {
+    html += `<tr class="empty-config"><td colspan="${editable?6:5}" class="status">No stream configuration</td></tr>`;
+  }
+  configs.forEach((item, index) => {
+    html += `<tr class="site-stream-row">
+      <td><input class="path-config-input site-name" value="${esc(item.site_name||'')}" disabled></td>
+      <td class="generated-site"><code>studio_${esc(item.site_name||'')}</code></td>
+      <td><input class="path-config-input stream-name" value="${esc(item.stream_name||'')}" disabled></td>
+      <td><input class="path-config-input view-name" value="${esc(item.view_name||'')}" disabled></td>
+      <td class="generated-stream"><code>live/${esc(item.stream_name||'')}-${esc(item.view_name||'')}</code></td>
+      ${editable?'<td><button class="btn-danger" onclick="this.closest(\'tr\').remove()">Remove</button></td>':''}
+    </tr>`;
+  });
+  return html + '</tbody></table>' + (editable ? '<button class="btn-primary" style="margin-top:12px" onclick="addPathConfigRow()">Add</button>' : '');
+}
+
+function editPathConfig() {
+  const table = document.getElementById('siteStreamConfigTable');
+  const rows = [...table.querySelectorAll('.site-stream-row')].map(row => ({
+    site_name: row.querySelector('.site-name').value,
+    stream_name: row.querySelector('.stream-name').value,
+    view_name: row.querySelector('.view-name').value
+  }));
+  table.innerHTML = renderSiteStreamConfigTable(rows, true);
+  table.querySelectorAll('.path-config-input').forEach(input => input.disabled = false);
+  document.getElementById('editPathConfigBtn').classList.add('hidden');
+  document.getElementById('savePathConfigBtn').classList.remove('hidden');
+}
+
+function addPathConfigRow() {
+  const table = document.getElementById('siteStreamConfigTable');
+  const empty = table.querySelector('.empty-config');
+  if (empty) empty.remove();
+  const body = table.querySelector('tbody');
+  const row = document.createElement('tr');
+  row.className = 'site-stream-row';
+  row.innerHTML = `<td><input class="path-config-input site-name" disabled></td><td class="generated-site"><code>studio_</code></td><td><input class="path-config-input stream-name" disabled></td><td><input class="path-config-input view-name" disabled></td><td class="generated-stream"><code>live/-</code></td><td><button class="btn-danger" onclick="this.closest('tr').remove()">Remove</button></td>`;
+  body.appendChild(row);
+  row.querySelectorAll('.path-config-input').forEach(input => input.disabled = false);
+}
+
+async function savePathConfig() {
+  const rows = [...document.querySelectorAll('#siteStreamConfigTable .site-stream-row')];
+  const configs = rows.map(row => ({
+    site_name: row.querySelector('.site-name').value.trim(),
+    stream_name: row.querySelector('.stream-name').value.trim(),
+    view_name: row.querySelector('.view-name').value.trim()
+  }));
+  if (configs.some(item => !item.site_name || !item.stream_name || !item.view_name)) {
+    alert('Site name, stream name and view name are required.');
+    return;
+  }
+  const button = document.getElementById('savePathConfigBtn');
+  button.disabled = true;
+  try {
+    await api('/site-stream-config', { method: 'POST', body: JSON.stringify({ configs }) });
+    await renderSiteConfig();
+  } catch (e) {
+    alert('Save failed: ' + e.message);
+    button.disabled = false;
+  }
+}
+
+function renderPathConfigTable(paths) {
+  let html = '<table><thead><tr><th>Name</th><th>Source</th><th>Record</th><th>Forward Tencent</th></tr></thead><tbody>';
+  paths.forEach(p => {
+    html += `<tr><td><code>${esc(p.name||'-')}</code></td><td>${esc(p.source||'publisher')}</td><td>${p.record?'on':'off'}</td><td>${p.forwardTencent?'on':'off'}</td></tr>`;
+  });
+  return html + '</tbody></table>';
+}
+
+// ── Sessions ───────────────────────────────────────────────────
+async function renderSessions() {
+  const main = document.getElementById('content');
+  main.innerHTML = '<div class="loading">Loading...</div>';
+  try {
+    const data = await api('/sessions');
+    const sessions = data.sessions || [];
+    let html = '<h2>Sessions (WebRTC)</h2>';
+    if (data.error && sessions.length === 0) {
+      html += `<div class="card"><p class="error">${esc(data.error)}</p></div>`;
+    } else if (sessions.length === 0) {
+      html += '<div class="card"><p class="status">No active sessions</p></div>';
+    } else {
+      html += '<table><thead><tr><th>ID</th><th>Type</th><th>Path</th><th>Address</th><th>Connected</th><th>Sent</th><th>Actions</th></tr></thead><tbody>';
+      sessions.forEach(s => {
+        const typ = s.publish ? 'publisher' : 'reader';
+        html += `<tr>
+          <td style="font-family:monospace;font-size:11px">${esc(s.id).substring(0,8)}...</td>
+          <td><span class="badge ${typ==='publisher'?'badge-pub':'badge-reader'}">${typ}</span></td>
+          <td><code>${esc(s.name||s.path||'-')}</code></td>
+          <td>${esc(s.remoteAddr||'-')}</td>
+          <td>${s.created?new Date(s.created).toLocaleString():'-'}</td>
+          <td>${s.bytesSent?formatBytes(s.bytesSent):'-'}</td>
+          <td><button class="btn-danger" onclick="kickSession('${esc(s.id)}')">Kick</button></td></tr>`;
+      });
+      html += '</tbody></table>';
+    }
+    main.innerHTML = html;
+  } catch(e) { main.innerHTML = `<div class="error">Error: ${e.message}</div>`; }
+}
+
+async function kickSession(uuid) {
+  if (!confirm(`Kick ${uuid.substring(0,8)}...?`)) return;
+  try { await api('/sessions/' + uuid, { method: 'DELETE' }); renderSessions(); }
+  catch(e) { alert('Error: ' + e.message); }
+}
+
+// ── Player ────────────────────────────────────────────────────
+async function renderPlayer(playerType) {
+  const main = document.getElementById('content');
+  main.innerHTML = '<div class="loading">Loading...</div>';
+  try {
+    const data = await api('/player');
+    const players = data.players || [];
+    const selected = players.filter(p => p.type === playerType);
+    let html = `<h2>${playerType === 'backup' ? 'Backup Player' : 'Main Player'}</h2><div class="player-stack">`;
+    selected.forEach(p => {
+      const badge = p.type === 'backup' ? 'badge-reader' : 'badge-on';
+      const label = p.type === 'backup' ? 'Backup' : p.name;
+      html += `<div class="card">
+        <h3><span class="badge ${badge}">${label}</span></h3>
+        <table>
+          <tr><td>Host</td><td><code>${esc(p.host)}</code></td></tr>
+          <tr><td>Mode</td><td>${esc(p.desc)}</td></tr>
+        </table>
+        <iframe class="player-frame" src="${esc(p.url+'?whep_host='+encodeURIComponent(p.host))}" title="${esc(label)} player" allow="autoplay; fullscreen; microphone; camera"></iframe>
+      </div>`;
+    });
+    if (!selected.length) html += '<div class="card"><p class="status">Player configuration is unavailable.</p></div>';
+    html += '</div>';
+    main.innerHTML = html;
+  } catch(e) { main.innerHTML = `<div class="error">Error: ${e.message}</div>`; }
+}
+
+// ── Downloads ──────────────────────────────────────────────────
+async function renderDownloads() {
+  const main = document.getElementById('content');
+  main.innerHTML = '<div class="loading">Loading...</div>';
+  try {
+    const data = await api('/downloads');
+    const obs = data.obs;
+    main.innerHTML = `
+      <h2>Downloads</h2>
+      <div class="card">
+        <h3>${esc(obs.name)}</h3>
+        <table>
+          <tr><td>Version</td><td><code>${esc(obs.version)}</code></td></tr>
+          <tr><td>Platform</td><td>${esc(obs.platform)}</td></tr>
+          <tr><td>Download</td><td><a class="dl-link" href="${esc(obs.url)}" target="_blank">${esc(obs.url)}</a></td></tr>
+          <tr><td>SHA-256</td><td><code style="font-size:11px">${esc(obs.sha256)}</code></td></tr>
+        </table>
+      </div>`;
+  } catch(e) { main.innerHTML = `<div class="error">Error: ${e.message}</div>`; }
+}
+
+function esc(s) { const d=document.createElement('div');d.textContent=s||'';return d.innerHTML; }
+function formatBytes(b) { return b>1e9?(b/1e9).toFixed(1)+' GB':b>1e6?(b/1e6).toFixed(1)+' MB':b>1e3?(b/1e3).toFixed(0)+' kB':b+' B'; }
+function formatBytesUDP(b) { return b>1e6?(b/1e6).toFixed(0)+' MB':b>1e3?(b/1e3).toFixed(0)+' KB':b+' B'; }
+
+api('/auth/me').then(showAdmin).catch(showLogin);
+</script>
+</body>
+</html>
