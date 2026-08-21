@@ -27,13 +27,14 @@ import (
 	"github.com/bluenviron/mediamtx/internal/confwatcher"
 	"github.com/bluenviron/mediamtx/internal/externalcmd"
 	"github.com/bluenviron/mediamtx/internal/forward"
+	"github.com/bluenviron/mediamtx/internal/ingest"
 	"github.com/bluenviron/mediamtx/internal/logger"
 	"github.com/bluenviron/mediamtx/internal/metrics"
+	"github.com/bluenviron/mediamtx/internal/mmxcontrol"
 	"github.com/bluenviron/mediamtx/internal/playback"
 	"github.com/bluenviron/mediamtx/internal/pprof"
 	"github.com/bluenviron/mediamtx/internal/recordcleaner"
 	"github.com/bluenviron/mediamtx/internal/recording"
-	"github.com/bluenviron/mediamtx/internal/mmxcontrol"
 	"github.com/bluenviron/mediamtx/internal/rlimit"
 	"github.com/bluenviron/mediamtx/internal/servers/hls"
 	"github.com/bluenviron/mediamtx/internal/servers/moq"
@@ -52,8 +53,7 @@ var version []byte
 var started = time.Now()
 
 var defaultConfPaths = []string{
-	"rtsp-simple-server.yml",
-	"mediamtx.yml",
+	"conf/edge.yml",
 }
 
 var defaultConfPathsNotWin = []string{
@@ -140,6 +140,7 @@ type Core struct {
 	api             *api.API
 	adminSrv        *admin.Server
 	adminStore      *admin.Store
+	ingestMgr       *ingest.Manager
 	confWatcher     *confwatcher.ConfWatcher
 
 	// in
@@ -251,6 +252,19 @@ func (p *Core) Close() {
 // Wait waits for the Core to exit.
 func (p *Core) Wait() {
 	<-p.done
+}
+
+// restartProcess terminates the process with a non-zero exit code so that
+// the surrounding process supervisor (systemd's Restart=on-failure)
+// restarts it with a freshly re-read configuration. This is how
+// ingestSources changes made through the admin deploy-config API (see
+// internal/admin) take effect, since it's only read once at startup. The
+// short delay lets the triggering HTTP response reach the client before
+// the process exits.
+func (p *Core) restartProcess() {
+	p.Log(logger.Info, "restarting process (admin API request)")
+	time.Sleep(500 * time.Millisecond)
+	os.Exit(1)
 }
 
 // Log implements logger.Writer.
@@ -424,10 +438,11 @@ func (p *Core) createResources(initial bool) error {
 	}
 
 	if p.recordCleaner == nil &&
-		atLeastOneRecordDeleteAfter(p.conf.Paths) {
+		(atLeastOneRecordDeleteAfter(p.conf.Paths) || p.conf.RecordMinFreeSpace > 0) {
 		p.recordCleaner = &recordcleaner.Cleaner{
-			PathConfs: p.conf.Paths,
-			Parent:    p,
+			PathConfs:          p.conf.Paths,
+			RecordMinFreeSpace: p.conf.RecordMinFreeSpace,
+			Parent:             p,
 		}
 		p.recordCleaner.Initialize()
 	}
@@ -475,11 +490,12 @@ func (p *Core) createResources(initial bool) error {
 				SecretKey: p.conf.TencentWHIPSecretKey,
 				TokenDays: p.conf.TencentWHIPTokenDays,
 			},
-			pathConfs:       p.conf.Paths,
-			authManager:     p.authManager,
-			externalCmdPool: p.externalCmdPool,
-			metrics:         p.metrics,
-			parent:          p,
+			forwardMmxEnable: p.conf.ForwardMmxEnable,
+			pathConfs:        p.conf.Paths,
+			authManager:      p.authManager,
+			externalCmdPool:  p.externalCmdPool,
+			metrics:          p.metrics,
+			parent:           p,
 		}
 		p.pathManager.initialize()
 	}
@@ -663,6 +679,32 @@ func (p *Core) createResources(initial bool) error {
 		p.hlsServer = i
 	}
 
+	// CDN ingest thread (see docs/cdn-ingest-thread.md). Only constructed on
+	// initial boot, not re-evaluated on config reload - changing
+	// ingestSources or ingestThreadEnable requires a restart. Sources are
+	// only parsed here, not pulled yet: pulling starts on demand, triggered
+	// by a POST /api/split-rec round-start call for a path with no
+	// publisher already live (see SplitRecHandler.execute), not at boot.
+	if initial && p.ingestMgr == nil && p.conf.IngestThreadEnable && len(p.conf.IngestSources) > 0 {
+		if !p.conf.RTMP {
+			p.Log(logger.Warn, "ingest: ingestThreadEnable is set but 'rtmp' is disabled, "+
+				"there's no local listener to republish to; skipping")
+		} else {
+			rtmpPort, err2 := portFromAddress(p.conf.RTMPAddress)
+			if err2 != nil {
+				return fmt.Errorf("derive ingest local RTMP target: %w", err2)
+			}
+			mgr := &ingest.Manager{
+				Sources:              p.conf.IngestSources,
+				LocalRTMPURL:         "rtmp://127.0.0.1:" + rtmpPort,
+				TencentSecretKeyBack: p.conf.TXSecretKeyBack,
+				Parent:               p,
+			}
+			mgr.Initialize()
+			p.ingestMgr = mgr
+		}
+	}
+
 	if p.conf.WebRTC &&
 		p.webRTCServer == nil {
 		// Initialize recording manager (if not already done)
@@ -678,7 +720,17 @@ func (p *Core) createResources(initial bool) error {
 			} else {
 				p.recMgr = recording.NewManager(store)
 				p.splitHandler = recording.NewSplitRecHandler(p.recMgr, p.pathManager, p)
-				recording.SetTablePathMapping(map[string]string{"3drush": "live/3drush-fwv"})
+				if p.ingestMgr != nil {
+					p.splitHandler.SetIngestManager(p.ingestMgr)
+				}
+				// adminStore (the source of truth for table->view fan-out,
+				// see SetViewResolver) is opened later, in the admin
+				// backend block below; if this isn't the first time
+				// through (e.g. a config reload recreated recMgr while
+				// adminStore survived), wire it in immediately.
+				if p.adminStore != nil {
+					p.splitHandler.SetViewResolver(p.adminStore)
+				}
 			}
 		}
 		if p.splitHandler != nil {
@@ -709,7 +761,7 @@ func (p *Core) createResources(initial bool) error {
 				WebRTCBaseURL:         p.conf.MMXWebRTCBaseURL,
 				PublishURL:            p.conf.MMXPublishURL,
 				ABRNegotiationAddress: p.conf.MMXABRNegotiationAddress,
-				PoolID:               p.conf.MMXNodePoolID,
+				PoolID:                p.conf.MMXNodePoolID,
 			}, func() []string { return nil }, p)
 			p.mmxControl.SetHTTPFallback(strings.Replace(strings.Replace(p.conf.MMXControlURL, "ws://", "http://", 1), "wss://", "https://", 1),
 				"", 10*time.Second)
@@ -750,6 +802,12 @@ func (p *Core) createResources(initial bool) error {
 			ABRSwitchCooldown:     p.conf.WebRTCABRSwitchCooldown,
 			RecMgr:                p.recMgr,
 			SplitHandler:          p.splitHandler,
+			DegradeEnable:         p.conf.WebRTCDegradeEnable,
+			DegradeWSPathSuffix:   p.conf.WebRTCDegradeWSPathSuffix,
+			DegradeInstantLossPct: p.conf.WebRTCDegradeInstantLossPct,
+			DegradeAvgLossPct:     p.conf.WebRTCDegradeAvgLossPct,
+			DegradeObservationSec: p.conf.WebRTCDegradeObservationSec,
+			DegradeWSSecret:       p.conf.WebRTCDegradeWSSecret,
 		}
 		err = i.Initialize()
 		if err != nil {
@@ -831,11 +889,17 @@ func (p *Core) createResources(initial bool) error {
 			MoQServer:      p.moqServer,
 			Parent:         p,
 		}
-		err = i.Initialize()
-		if err != nil {
-			return err
-		}
 		p.api = i
+		// When admin is active, the Control API /v3 routes are mounted
+		// directly on the admin's gin engine (:8080) - no separate
+		// :9997 listener is needed. Otherwise, start a standalone API
+		// HTTP listener on the configured apiAddress.
+		if p.conf.AdminAddress == "" {
+			err = i.Initialize()
+			if err != nil {
+				return err
+			}
+		}
 	}
 
 	if initial && p.confPath != "" {
@@ -853,9 +917,20 @@ func (p *Core) createResources(initial bool) error {
 		if err2 != nil {
 			return fmt.Errorf("derive admin WebRTC backend: %w", err2)
 		}
-		apiPort, err2 := portFromAddress(p.conf.APIAddress)
+		// When the Control API is mounted on the admin engine (see the "API"
+		// block above), MMXAPI must point at the admin's own port, since
+		// that's where /v3/* actually lives now - not apiAddress, which may
+		// have no listener at all in that case.
+		adminPort, err2 := portFromAddress(p.conf.AdminAddress)
 		if err2 != nil {
-			return fmt.Errorf("derive admin API backend: %w", err2)
+			return fmt.Errorf("derive admin port: %w", err2)
+		}
+		apiPort := adminPort
+		if p.api == nil {
+			apiPort, err2 = portFromAddress(p.conf.APIAddress)
+			if err2 != nil {
+				return fmt.Errorf("derive admin API backend: %w", err2)
+			}
 		}
 		selfName := p.conf.AdminName
 		if selfName == "" {
@@ -872,6 +947,10 @@ func (p *Core) createResources(initial bool) error {
 				p.Log(logger.Warn, "admin store failed: %v", err2)
 			} else {
 				p.adminStore = st
+				p.pathManager.SetAdminStore(st)
+				if p.splitHandler != nil {
+					p.splitHandler.SetViewResolver(st)
+				}
 			}
 		}
 		p.adminSrv = &admin.Server{
@@ -884,6 +963,15 @@ func (p *Core) createResources(initial bool) error {
 			TXSecretKeyBack:  p.conf.TXSecretKeyBack,
 			Version:          string(version),
 			PlayURIRateLimit: p.conf.PlayURIRateLimit,
+			PlaySignatureTTL: time.Duration(p.conf.PlaySignatureTTL),
+			ConfPath:         p.confPath,
+			RestartFunc:      p.restartProcess,
+		}
+		// When the Control API is active, mount its /v3 routes on the
+		// admin's gin engine so everything is served from a single port
+		// (:8080) instead of needing a separate :9997 listener.
+		if p.api != nil {
+			p.adminSrv.SetV3Handler(p.api.NewRouter())
 		}
 		if err := p.adminSrv.Initialize(); err != nil {
 			return err
@@ -947,7 +1035,9 @@ func (p *Core) closeResources(newConf *conf.Conf, calledByAPI bool) {
 		closeLogger
 
 	closeRecorderCleaner := newConf == nil ||
-		atLeastOneRecordDeleteAfter(newConf.Paths) != atLeastOneRecordDeleteAfter(p.conf.Paths) ||
+		(atLeastOneRecordDeleteAfter(newConf.Paths) || newConf.RecordMinFreeSpace > 0) !=
+			(atLeastOneRecordDeleteAfter(p.conf.Paths) || p.conf.RecordMinFreeSpace > 0) ||
+		newConf.RecordMinFreeSpace != p.conf.RecordMinFreeSpace ||
 		closeLogger
 	if !closeRecorderCleaner && p.recordCleaner != nil && !reflect.DeepEqual(newConf.Paths, p.conf.Paths) {
 		p.recordCleaner.ReloadPathConfs(newConf.Paths)
@@ -1126,7 +1216,14 @@ func (p *Core) closeResources(newConf *conf.Conf, calledByAPI bool) {
 		newConf.NetStorageMinioSecretKey != p.conf.NetStorageMinioSecretKey ||
 		newConf.NetStorageMinioUseSSL != p.conf.NetStorageMinioUseSSL ||
 		newConf.NetStorageMinioDomain != p.conf.NetStorageMinioDomain ||
+		newConf.WebRTCDegradeEnable != p.conf.WebRTCDegradeEnable ||
+		newConf.WebRTCDegradeWSPathSuffix != p.conf.WebRTCDegradeWSPathSuffix ||
+		newConf.WebRTCDegradeInstantLossPct != p.conf.WebRTCDegradeInstantLossPct ||
+		newConf.WebRTCDegradeAvgLossPct != p.conf.WebRTCDegradeAvgLossPct ||
+		newConf.WebRTCDegradeObservationSec != p.conf.WebRTCDegradeObservationSec ||
+		newConf.WebRTCDegradeWSSecret != p.conf.WebRTCDegradeWSSecret ||
 		newConf.DumpPackets != p.conf.DumpPackets ||
+		closeMetrics ||
 		closePathManager ||
 		closeLogger
 
@@ -1187,6 +1284,7 @@ func (p *Core) closeResources(newConf *conf.Conf, calledByAPI bool) {
 		newConf.AdminName != p.conf.AdminName ||
 		newConf.TXSecretKeyBack != p.conf.TXSecretKeyBack ||
 		newConf.PlayURIRateLimit != p.conf.PlayURIRateLimit ||
+		newConf.PlaySignatureTTL != p.conf.PlaySignatureTTL ||
 		newConf.WebRTCAddress != p.conf.WebRTCAddress ||
 		newConf.APIAddress != p.conf.APIAddress
 	closeAdminStore := newConf == nil || newConf.AdminAddress == "" || newConf.AdminName != p.conf.AdminName
@@ -1296,6 +1394,11 @@ func (p *Core) closeResources(newConf *conf.Conf, calledByAPI bool) {
 	if closeAdminStore && p.adminStore != nil {
 		p.adminStore.Close()
 		p.adminStore = nil
+	}
+
+	if newConf == nil && p.ingestMgr != nil {
+		p.ingestMgr.Close()
+		p.ingestMgr = nil
 	}
 
 	if newConf == nil && p.externalCmdPool != nil {

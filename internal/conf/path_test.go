@@ -19,6 +19,25 @@ func TestPathClone(t *testing.T) {
 	require.Equal(t, original, clone)
 }
 
+func TestPathWHEPVideoTrackCount(t *testing.T) {
+	for _, count := range []int{0, 1, 4} {
+		path := &Path{}
+		path.setDefaults()
+		path.Source = "whep://localhost/stream"
+		path.WHEPVideoTrackCount = count
+		require.NoError(t, path.validate(&Conf{}, "test", false, nil))
+	}
+
+	for _, count := range []int{-1, 5} {
+		path := &Path{}
+		path.setDefaults()
+		path.Source = "whep://localhost/stream"
+		path.WHEPVideoTrackCount = count
+		require.EqualError(t, path.validate(&Conf{}, "test", false, nil),
+			"'whepVideoTrackCount' must be between 0 and 4")
+	}
+}
+
 func TestIsValidPathName(t *testing.T) {
 	for _, ca := range []struct {
 		name   string

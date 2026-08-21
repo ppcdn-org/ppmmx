@@ -54,3 +54,32 @@ func TestServerConn(t *testing.T) {
 
 	<-pingReceived
 }
+
+func TestServerConnConcurrentWriteAndClose(t *testing.T) {
+	done := make(chan struct{})
+	s := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := NewServerConn(w, r)
+		require.NoError(t, err)
+		for range 20 {
+			go c.WriteJSON("testing") //nolint:errcheck
+		}
+		c.Close()
+		close(done)
+	})}
+
+	ln, err := net.Listen("tcp", "localhost:6345")
+	require.NoError(t, err)
+	go s.Serve(ln) //nolint:errcheck
+	defer s.Shutdown(context.Background())
+
+	c, res, err := websocket.DefaultDialer.Dial("ws://localhost:6345/", nil)
+	require.NoError(t, err)
+	defer res.Body.Close()
+	defer c.Close() //nolint:errcheck
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("concurrent writes did not stop after close")
+	}
+}

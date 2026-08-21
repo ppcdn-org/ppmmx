@@ -74,12 +74,14 @@ func (s *Source) Run(params defs.StaticSourceRunParams) error {
 			Timeout:   time.Duration(s.ReadTimeout),
 			Transport: tr,
 		},
-		BearerToken:        params.Conf.WHEPBearerToken,
-		UDPReadBufferSize:  s.UDPReadBufferSize,
-		STUNGatherTimeout:  time.Duration(params.Conf.WHEPSTUNGatherTimeout),
-		HandshakeTimeout:   time.Duration(params.Conf.WHEPHandshakeTimeout),
-		TrackGatherTimeout: time.Duration(params.Conf.WHEPTrackGatherTimeout),
-		Log:                s,
+		BearerToken:         params.Conf.WHEPBearerToken,
+		RecvOnlyVideoTracks: params.Conf.WHEPVideoTrackCount,
+		AutoVideoTracks:     params.Conf.WHEPVideoTrackCount == 0,
+		UDPReadBufferSize:   s.UDPReadBufferSize,
+		STUNGatherTimeout:   time.Duration(params.Conf.WHEPSTUNGatherTimeout),
+		HandshakeTimeout:    time.Duration(params.Conf.WHEPHandshakeTimeout),
+		TrackGatherTimeout:  time.Duration(params.Conf.WHEPTrackGatherTimeout),
+		Log:                 s,
 	}
 	err = client.Initialize(params.Context)
 	if err != nil {

@@ -48,18 +48,31 @@ type UploadConfig struct {
 	MinioDomain string
 }
 
-func (c UploadConfig) isProd() bool {
-	return strings.EqualFold(strings.TrimSpace(c.Env), "prod")
+// resolveEnv returns the environment to use for this upload: appEnv (from
+// the split-rec request's optional "app_env" field) takes priority when
+// non-empty, so a single process serving multiple game environments routes
+// each round's upload independently; an empty appEnv (older callers that
+// don't send it) falls back to c.Env, the process-wide APP_ENV - the
+// original, single-environment-per-process behavior is unchanged.
+func (c UploadConfig) resolveEnv(appEnv string) string {
+	if appEnv != "" {
+		return appEnv
+	}
+	return c.Env
+}
+
+func (c UploadConfig) isProd(appEnv string) bool {
+	return strings.EqualFold(strings.TrimSpace(c.resolveEnv(appEnv)), "prod")
 }
 
 // minioBucket is not a separate setting: the MinIO bucket is always the
-// (lowercased) environment name, e.g. Env "test" -> bucket "test".
-func (c UploadConfig) minioBucket() string {
-	return strings.ToLower(strings.TrimSpace(c.Env))
+// (lowercased) environment name, e.g. env "test" -> bucket "test".
+func (c UploadConfig) minioBucket(appEnv string) string {
+	return strings.ToLower(strings.TrimSpace(c.resolveEnv(appEnv)))
 }
 
 // s3BucketName strips a "s3://" prefix some deployments include in
-// S3_BUCKET (e.g. "s3://ge-lotto-live"): the AWS SDK's Bucket field, and a
+// S3_BUCKET (e.g. "s3://example-bucket"): the AWS SDK's Bucket field, and a
 // path-style playback URL, both need the bare bucket name.
 func (c UploadConfig) s3BucketName() string {
 	b := strings.TrimSpace(c.S3Bucket)
@@ -77,11 +90,11 @@ func (c UploadConfig) minioSecure() bool {
 	return secure
 }
 
-func (c UploadConfig) configured() bool {
-	if c.isProd() {
+func (c UploadConfig) configured(appEnv string) bool {
+	if c.isProd(appEnv) {
 		return c.S3Bucket != "" && c.S3AccessKey != "" && c.S3SecretKey != ""
 	}
-	return c.MinioEndpoint != "" && c.MinioAccessKey != "" && c.MinioSecretKey != "" && c.minioBucket() != ""
+	return c.MinioEndpoint != "" && c.MinioAccessKey != "" && c.MinioSecretKey != "" && c.minioBucket(appEnv) != ""
 }
 
 // uploader pushes finished round recordings to S3 (prod) or MinIO (other
@@ -96,16 +109,21 @@ func newUploader(cfg UploadConfig, parent logger.Writer) *uploader {
 	return &uploader{cfg: cfg, parent: parent}
 }
 
-// uploadAsync uploads filePath under objectKey in the background. It is a
-// no-op if net storage isn't configured for the active environment.
-func (u *uploader) uploadAsync(filePath, objectKey string) {
-	if u == nil || !u.cfg.configured() {
+// uploadAsync uploads filePath under objectKey in the background. appEnv is
+// the split-rec request's optional "app_env" field: when non-empty it picks
+// which environment's bucket/backend this round's file goes to, taking
+// priority over the process-wide APP_ENV (see UploadConfig.resolveEnv) -
+// this is what lets one process serve multiple game environments without
+// their recordings landing in the same bucket. It is a no-op if net storage
+// isn't configured for the resolved environment.
+func (u *uploader) uploadAsync(filePath, objectKey, appEnv string) {
+	if u == nil || !u.cfg.configured(appEnv) {
 		return
 	}
-	go u.uploadWithRetry(filePath, objectKey)
+	go u.uploadWithRetry(filePath, objectKey, appEnv)
 }
 
-func (u *uploader) uploadWithRetry(filePath, objectKey string) {
+func (u *uploader) uploadWithRetry(filePath, objectKey, appEnv string) {
 	const maxAttempts = 10
 
 	// The recorder writes fragmented MP4 (moov first, but data split across
@@ -134,14 +152,14 @@ func (u *uploader) uploadWithRetry(filePath, objectKey string) {
 		}
 
 		var err error
-		if u.cfg.isProd() {
+		if u.cfg.isProd(appEnv) {
 			err = u.uploadS3(uploadPath, objectKey)
 		} else {
-			err = u.uploadMinio(uploadPath, objectKey)
+			err = u.uploadMinio(uploadPath, objectKey, appEnv)
 		}
 		if err == nil {
 			u.parent.Log(logger.Info, "[upload] %s -> %s succeeded (attempt %d/%d)%s",
-				filePath, objectKey, attempt, maxAttempts, u.playbackURLSuffix(objectKey))
+				filePath, objectKey, attempt, maxAttempts, u.playbackURLSuffix(objectKey, appEnv))
 			return
 		}
 		lastErr = err
@@ -255,7 +273,7 @@ func (u *uploader) uploadS3(filePath, objectKey string) error {
 	return err
 }
 
-func (u *uploader) uploadMinio(filePath, objectKey string) error {
+func (u *uploader) uploadMinio(filePath, objectKey, appEnv string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), uploadTimeout(filePath))
 	defer cancel()
 
@@ -267,14 +285,14 @@ func (u *uploader) uploadMinio(filePath, objectKey string) error {
 		return fmt.Errorf("create minio client: %w", err)
 	}
 
-	_, err = client.FPutObject(ctx, u.cfg.minioBucket(), objectKey, filePath, minio.PutObjectOptions{
+	_, err = client.FPutObject(ctx, u.cfg.minioBucket(appEnv), objectKey, filePath, minio.PutObjectOptions{
 		ContentType: "video/mp4",
 	})
 	return err
 }
 
 // objectKeyFor returns the storage object key for a finished round file:
-// just its base name, e.g. "3drush-fwv-loto20250904109-p2w001.mp4".
+// just its base name, e.g. "table1-fwv-rec20250904109-p2w001.mp4".
 func objectKeyFor(filePath string) string {
 	return filepath.Base(filePath)
 }
@@ -283,12 +301,12 @@ func objectKeyFor(filePath string) string {
 // configured for the active backend, for a friendlier success log line.
 // The URL is path-style (domain/bucket/key): both the S3 and MinIO
 // endpoints in use here serve objects that way, not virtual-hosted-style.
-func (u *uploader) playbackURLSuffix(objectKey string) string {
+func (u *uploader) playbackURLSuffix(objectKey, appEnv string) string {
 	domain := u.cfg.S3Domain
 	bucket := u.cfg.s3BucketName()
-	if !u.cfg.isProd() {
+	if !u.cfg.isProd(appEnv) {
 		domain = u.cfg.MinioDomain
-		bucket = u.cfg.minioBucket()
+		bucket = u.cfg.minioBucket(appEnv)
 	}
 	domain = strings.TrimSpace(domain)
 	if domain == "" || bucket == "" {

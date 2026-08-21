@@ -73,6 +73,61 @@ func TestPeerConnectionCloseImmediately2(t *testing.T) {
 	time.Sleep(500 * time.Millisecond)
 }
 
+func TestPeerConnectionOfferMultipleVideoTracks(t *testing.T) {
+	pc := &PeerConnection{
+		LocalRandomUDP:      true,
+		IPsFromInterfaces:   true,
+		RecvOnlyVideoTracks: 3,
+		Log:                 test.NilLogger,
+	}
+	require.NoError(t, pc.Start())
+	t.Cleanup(pc.Close)
+
+	offer, err := pc.CreatePartialOffer(false)
+	require.NoError(t, err)
+
+	var desc sdp.SessionDescription
+	require.NoError(t, desc.Unmarshal([]byte(offer.SDP)))
+	require.Equal(t, 3, ActiveMediaCount(desc.MediaDescriptions, "video"))
+	require.Equal(t, 1, ActiveMediaCount(desc.MediaDescriptions, "audio"))
+}
+
+func TestTracksAreValidVideoLimits(t *testing.T) {
+	medias := []*sdp.MediaDescription{
+		{MediaName: sdp.MediaName{Media: "video", Port: sdp.RangedPort{Value: 9}}},
+		{MediaName: sdp.MediaName{Media: "video", Port: sdp.RangedPort{Value: 9}}},
+		{MediaName: sdp.MediaName{Media: "video", Port: sdp.RangedPort{Value: 9}}},
+		{MediaName: sdp.MediaName{Media: "audio", Port: sdp.RangedPort{Value: 9}}},
+	}
+
+	require.NoError(t, TracksAreValid(medias, 3, 3))
+	require.Error(t, TracksAreValid(medias, 1, 0))
+	require.Error(t, TracksAreValid(medias[:3], 3, 2))
+}
+
+func TestTracksAreValidAllowsDataChannelApplicationMedia(t *testing.T) {
+	medias := []*sdp.MediaDescription{
+		{MediaName: sdp.MediaName{Media: "video", Port: sdp.RangedPort{Value: 9}}},
+		{MediaName: sdp.MediaName{Media: "audio", Port: sdp.RangedPort{Value: 9}}},
+		{MediaName: sdp.MediaName{Media: "application", Port: sdp.RangedPort{Value: 9}},
+			Attributes: []sdp.Attribute{{Key: "sctp-port", Value: "5000"}}},
+	}
+	require.NoError(t, TracksAreValid(medias, 4, 0))
+}
+
+func TestInboundMediaCount(t *testing.T) {
+	medias := []*sdp.MediaDescription{
+		{MediaName: sdp.MediaName{Media: "video", Port: sdp.RangedPort{Value: 9}}, Attributes: []sdp.Attribute{{Key: "sendonly"}}},
+		{MediaName: sdp.MediaName{Media: "video", Port: sdp.RangedPort{Value: 0}}, Attributes: []sdp.Attribute{{Key: "sendonly"}}},
+		{MediaName: sdp.MediaName{Media: "video", Port: sdp.RangedPort{Value: 9}}, Attributes: []sdp.Attribute{{Key: "inactive"}}},
+		{MediaName: sdp.MediaName{Media: "audio", Port: sdp.RangedPort{Value: 9}}, Attributes: []sdp.Attribute{{Key: "recvonly"}}},
+		{MediaName: sdp.MediaName{Media: "audio", Port: sdp.RangedPort{Value: 9}}, Attributes: []sdp.Attribute{{Key: "sendonly"}}},
+	}
+
+	require.Equal(t, 1, InboundMediaCount(medias, "video"))
+	require.Equal(t, 1, InboundMediaCount(medias, "audio"))
+}
+
 func TestPeerConnectionCandidates(t *testing.T) {
 	for _, ca := range []string{
 		"udp random",
@@ -883,6 +938,63 @@ func TestPeerConnectionPublishDataChannel(t *testing.T) {
 	<-dataChanCreated
 
 	pc2.OutboundDataChannels[0].Write([]byte("test data"))
+
+	<-dataReceived
+}
+
+func TestPeerConnectionInboundDataChannel(t *testing.T) {
+	pub, err := webrtc.NewPeerConnection(webrtc.Configuration{})
+	require.NoError(t, err)
+	defer pub.Close() //nolint:errcheck
+
+	pubDC, err := pub.CreateDataChannel("obs-timestamp", nil)
+	require.NoError(t, err)
+
+	dataReceived := make(chan struct{})
+
+	receivedChan := make(chan *webrtc.DataChannel, 1)
+
+	reader := &PeerConnection{
+		LocalRandomUDP:    true,
+		IPsFromInterfaces: true,
+		Publish:           false,
+		OnInboundDataChannel: func(dc *webrtc.DataChannel) {
+			receivedChan <- dc
+		},
+		Log: test.NilLogger,
+	}
+	err = reader.Start()
+	require.NoError(t, err)
+	defer reader.Close()
+
+	offer, err := pub.CreateOffer(nil)
+	require.NoError(t, err)
+
+	err = pub.SetLocalDescription(offer)
+	require.NoError(t, err)
+
+	answer, err := reader.CreateFullAnswer(&offer, false)
+	require.NoError(t, err)
+
+	err = pub.SetRemoteDescription(*answer)
+	require.NoError(t, err)
+
+	err = reader.WaitUntilConnected(10 * time.Second)
+	require.NoError(t, err)
+
+	dc := <-receivedChan
+	require.Equal(t, "obs-timestamp", dc.Label())
+
+	dc.OnMessage(func(msg webrtc.DataChannelMessage) {
+		require.Equal(t, []byte(`{"frame_no":1,"timestamp":2,"rid":"0"}`), msg.Data)
+		close(dataReceived)
+	})
+
+	require.Eventually(t, func() bool {
+		return pubDC.ReadyState() == webrtc.DataChannelStateOpen
+	}, 10*time.Second, 10*time.Millisecond)
+
+	require.NoError(t, pubDC.SendText(`{"frame_no":1,"timestamp":2,"rid":"0"}`))
 
 	<-dataReceived
 }

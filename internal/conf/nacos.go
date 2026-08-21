@@ -17,12 +17,20 @@ import (
 	"github.com/bluenviron/mediamtx/internal/logger"
 )
 
-// dataId/group this service publishes its Nacos config under. Same
-// convention as the previous Go implementation (backup_v120/comm).
+// dataId/group this service publishes its Nacos config under. Defaults to
+// "mmx"; override with BOOTSTRAP_NACOS_CONFIG_DATA_ID to match an existing
+// deployment's Nacos config entry.
 const (
-	nacosDataID = "backend-lotto-recorder"
-	nacosGroup  = "DEFAULT_GROUP"
+	nacosDataIDDefault = "mmx"
+	nacosGroup         = "DEFAULT_GROUP"
 )
+
+func nacosDataID() string {
+	if v := strings.TrimSpace(DotenvValue("BOOTSTRAP_NACOS_CONFIG_DATA_ID")); v != "" {
+		return v
+	}
+	return nacosDataIDDefault
+}
 
 const (
 	jasyptIterations = 1000
@@ -36,7 +44,7 @@ const (
 // Fetch failures are logged and otherwise ignored so a Nacos outage never
 // blocks startup; the MINIO_* env vars remain available as a fallback.
 func applyNacosMinioConfig(conf *Conf, l logger.Writer) {
-	aesKey := strings.TrimSpace(dotenvValue("BOOTSTRAP_JASYPT_ENCRYPTOR_PASSWORD"))
+	aesKey := strings.TrimSpace(DotenvValue("BOOTSTRAP_JASYPT_ENCRYPTOR_PASSWORD"))
 	if aesKey == "" {
 		return
 	}
@@ -68,16 +76,17 @@ func applyNacosMinioConfig(conf *Conf, l logger.Writer) {
 
 // nacosFetchMinioConfig connects to Nacos - connection info from the
 // BOOTSTRAP_NACOS_CONFIG_* env vars / bin/.env - and returns the key=value
-// pairs published under dataId "backend-lotto-recorder". The Nacos client's
+// pairs published under dataId nacosDataID() (default "mmx", override via
+// BOOTSTRAP_NACOS_CONFIG_DATA_ID). The Nacos client's
 // own password (BOOTSTRAP_NACOS_CONFIG_PASSWORD) is Jasypt-encrypted
 // (PBEWithMD5AndDES, matching Java's org.jasypt.util.text.BasicTextEncryptor)
 // and is decrypted with aesKey (BOOTSTRAP_JASYPT_ENCRYPTOR_PASSWORD) first.
 func nacosFetchMinioConfig(aesKey string) (map[string]string, error) {
-	server := strings.TrimSpace(dotenvValue("BOOTSTRAP_NACOS_CONFIG_SERVER"))
+	server := strings.TrimSpace(DotenvValue("BOOTSTRAP_NACOS_CONFIG_SERVER"))
 	if server == "" {
 		return nil, fmt.Errorf("BOOTSTRAP_NACOS_CONFIG_SERVER is not set")
 	}
-	portStr := strings.TrimSpace(dotenvValue("BOOTSTRAP_NACOS_CONFIG_SERVER_PORT"))
+	portStr := strings.TrimSpace(DotenvValue("BOOTSTRAP_NACOS_CONFIG_SERVER_PORT"))
 	if portStr == "" {
 		portStr = "8848"
 	}
@@ -85,9 +94,9 @@ func nacosFetchMinioConfig(aesKey string) (map[string]string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("invalid BOOTSTRAP_NACOS_CONFIG_SERVER_PORT: %w", err)
 	}
-	username := strings.TrimSpace(dotenvValue("BOOTSTRAP_NACOS_CONFIG_USERNAME"))
-	namespace := strings.TrimSpace(dotenvValue("BOOTSTRAP_NACOS_CONFIG_NAMESPACE"))
-	encPassword := strings.TrimSpace(dotenvValue("BOOTSTRAP_NACOS_CONFIG_PASSWORD"))
+	username := strings.TrimSpace(DotenvValue("BOOTSTRAP_NACOS_CONFIG_USERNAME"))
+	namespace := strings.TrimSpace(DotenvValue("BOOTSTRAP_NACOS_CONFIG_NAMESPACE"))
+	encPassword := strings.TrimSpace(DotenvValue("BOOTSTRAP_NACOS_CONFIG_PASSWORD"))
 
 	password := ""
 	if encPassword != "" {
@@ -120,7 +129,7 @@ func nacosFetchMinioConfig(aesKey string) (map[string]string, error) {
 		return nil, fmt.Errorf("create nacos client: %w", err)
 	}
 
-	content, err := client.GetConfig(vo.ConfigParam{DataId: nacosDataID, Group: nacosGroup})
+	content, err := client.GetConfig(vo.ConfigParam{DataId: nacosDataID(), Group: nacosGroup})
 	if err != nil {
 		return nil, fmt.Errorf("get nacos config: %w", err)
 	}

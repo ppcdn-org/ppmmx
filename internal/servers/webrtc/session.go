@@ -39,6 +39,103 @@ func whipOffer(body []byte) *pwebrtc.SessionDescription {
 	}
 }
 
+func offerH264SendTrackCount(medias []*sdp.MediaDescription) (int, error) {
+	count := 0
+	for _, media := range medias {
+		if media.MediaName.Media != "video" || media.MediaName.Port.Value == 0 {
+			continue
+		}
+
+		canSend := true
+		for _, attr := range media.Attributes {
+			if attr.Key == "sendonly" || attr.Key == "inactive" {
+				canSend = false
+				break
+			}
+		}
+		if !canSend {
+			continue
+		}
+
+		hasH264 := false
+		for _, attr := range media.Attributes {
+			if attr.Key != "rtpmap" {
+				continue
+			}
+			fields := strings.Fields(attr.Value)
+			if len(fields) == 2 && strings.EqualFold(strings.SplitN(fields[1], "/", 2)[0], "H264") {
+				hasH264 = true
+				break
+			}
+		}
+		if hasH264 {
+			count++
+			if count > 4 {
+				return 0, fmt.Errorf("multi-layer WHEP supports at most 4 H264 video tracks")
+			}
+		}
+	}
+	return count, nil
+}
+
+// maxWHIPSimulcastLayers is mmx's own cap on the number of RIDs (Simulcast
+// layers) a WHIP publisher may offer on its single video m-line. OBS (the
+// publisher) decides the actual layer count entirely on its own - this is
+// not a mmx policy preference, only a hard ceiling: any offer requesting
+// more than this many layers is rejected outright (406, see
+// offerVideoSimulcastLayerCount's call site) rather than silently
+// truncated, so the publisher gets an explicit failure and can retry with
+// a layer count mmx will accept.
+const maxWHIPSimulcastLayers = 5
+
+// offerVideoSimulcastLayerCount returns how many Simulcast layers a WHIP
+// publish offer requests: OBS puts every layer on the same (single) video
+// m-line as one "a=rid:<n> send" attribute each (see
+// frontend/utility/WHIPSimulcastEncoders.hpp and whip-output.cpp in the OBS
+// repo) rather than one m-line per layer, so this counts rid attributes,
+// not video m-lines. A video m-line with no rid attributes at all counts
+// as a single (non-Simulcast) layer.
+func offerVideoSimulcastLayerCount(medias []*sdp.MediaDescription) int {
+	count := 0
+	for _, media := range medias {
+		if media.MediaName.Media != "video" {
+			continue
+		}
+
+		ridCount := 0
+		for _, attr := range media.Attributes {
+			if attr.Key == "rid" {
+				ridCount++
+			}
+		}
+		if ridCount == 0 {
+			ridCount = 1
+		}
+		count += ridCount
+	}
+	return count
+}
+
+func offerSendVideoTrackCount(medias []*sdp.MediaDescription) int {
+	count := 0
+	for _, media := range medias {
+		if media.MediaName.Media != "video" || media.MediaName.Port.Value == 0 {
+			continue
+		}
+		canSend := true
+		for _, attr := range media.Attributes {
+			if attr.Key == "sendonly" || attr.Key == "inactive" {
+				canSend = false
+				break
+			}
+		}
+		if canSend {
+			count++
+		}
+	}
+	return count
+}
+
 func parseOfferUfrag(offer []byte) string {
 	var desc sdp.SessionDescription
 	if err := desc.Unmarshal(offer); err != nil {
@@ -234,6 +331,27 @@ type sessionParent interface {
 	closeSession(sx *session)
 	generateICEServers(clientConfig bool) ([]pwebrtc.ICEServer, error)
 	logger.Writer
+
+	// WHIP degrade protocol (see docs/obs-mmx-degrade-protocol.md)
+	degradeSampleEnabled() bool
+	recordDegradeSample(pathName string, cumLost, cumReceived uint64)
+	observeDegradeSessionLayers(pathName string, realLayers int)
+
+	// WHIP publish reconnect tracking (see publishstats.go) - independent
+	// of the degrade protocol, gives operators plain visibility into how
+	// often a publisher has reconnected during a streaming period.
+	recordPublishSessionStart(pathName string) publishSessionStartInfo
+	recordPublishSessionEnd(pathName string)
+	publishStatsSummary(pathName string) (time.Duration, int)
+
+	// OBS abs-timestamp fan-out (see obs_timestamp_broadcast.go): relays
+	// "obs-timestamp" DataChannel messages from a path's WHIP publish
+	// session to all of that path's WHEP reader sessions over their ABR
+	// control WebSocket, so a player can compute true end-to-end p2p
+	// delay (see docs/obs-abs-timestamp-protocol.md in the OBS repo).
+	subscribeObsTimestamp(pathName string, sx *session)
+	unsubscribeObsTimestamp(pathName string, sx *session)
+	broadcastObsTimestamp(pathName string, msg abrMessage)
 }
 
 type session struct {
@@ -274,8 +392,30 @@ type session struct {
 	abrEnabled        bool
 	trackSelector     *webrtc.TrackSelector
 	wsConn            *wsproto.ServerConn
+	wsWriteMutex      sync.Mutex
 	lastSwitchTime    time.Time
 	abrSwitchCooldown int // ms
+	mediaState        *webrtc.MediaState
+	abrReady          bool
+
+	// OBS abs-timestamp protocol (see docs/obs-abs-timestamp-protocol.md
+	// in the OBS repo): end-to-end publish latency computed from the most
+	// recently received "obs-timestamp" DataChannel message, in
+	// milliseconds. nil until the first message arrives (e.g. the
+	// publisher isn't a patched OBS build, or hasn't sent one yet).
+	obsTimestampLatencyMs *float64
+}
+
+func (s *session) writeABRMessage(msg abrMessage) error {
+	s.wsWriteMutex.Lock()
+	defer s.wsWriteMutex.Unlock()
+	s.mutex.RLock()
+	ws := s.wsConn
+	s.mutex.RUnlock()
+	if ws == nil {
+		return nil
+	}
+	return ws.WriteJSON(msg)
 }
 
 func (s *session) initialize() {
@@ -368,6 +508,16 @@ func (s *session) runPublish(req *initialRequestReq) (int, error) {
 		return http.StatusBadRequest, err
 	}
 
+	// site_stream_configs whitelist: checked here, before any handshake
+	// work happens, so a disallowed publisher gets a definitive 403 up
+	// front instead of a successful WHIP handshake followed by the
+	// connection being torn down - a client like OBS doesn't reliably
+	// treat a later mid-session close as "publish denied" and may just
+	// keep reconnecting.
+	if !s.pathManager.IsPublishAllowed(s.pathName) {
+		return http.StatusForbidden, fmt.Errorf("'%s' not configured caused publish refusal!", s.pathName)
+	}
+
 	s.mutex.Lock()
 	s.user = res1.User
 	s.mutex.Unlock()
@@ -387,6 +537,7 @@ func (s *session) runPublish(req *initialRequestReq) (int, error) {
 		AdditionalHosts:       s.additionalHosts,
 		STUNGatherTimeout:     time.Duration(s.stunGatherTimeout),
 		Publish:               false,
+		OnInboundDataChannel:  s.onInboundDataChannel,
 		Log:                   s,
 	}
 	err = pc.Start()
@@ -417,7 +568,7 @@ func (s *session) runPublish(req *initialRequestReq) (int, error) {
 		return http.StatusBadRequest, err
 	}
 
-	err = webrtc.TracksAreValid(sdp.MediaDescriptions)
+	err = webrtc.TracksAreValid(sdp.MediaDescriptions, 1, 0)
 	if err != nil {
 		// RFC draft-ietf-wish-whip
 		// if the number of audio and or video
@@ -425,6 +576,20 @@ func (s *session) runPublish(req *initialRequestReq) (int, error) {
 		// MUST reject the HTTP POST request with a "406 Not Acceptable" error
 		// response.
 		return http.StatusNotAcceptable, err
+	}
+
+	// Simulcast layer count is decided by the publisher (OBS), not mmx -
+	// mmx unconditionally accepts any offer up to maxWHIPSimulcastLayers.
+	// Above that, reject the whole POST (406, same RFC rationale as
+	// TracksAreValid above) rather than silently truncating the answer's
+	// RIDs: OBS checks the answer's accepted layer count against what it
+	// offered (whip-output.cpp's simulcast_layers_in_answer) and already
+	// treats any mismatch as a hard failure needing a retry, so failing
+	// the request outright here is no worse for OBS and avoids emitting
+	// an answer this server would then have to keep track of separately.
+	if n := offerVideoSimulcastLayerCount(sdp.MediaDescriptions); n > maxWHIPSimulcastLayers {
+		return http.StatusNotAcceptable, fmt.Errorf(
+			"at most %d Simulcast layers are supported, offer requested %d", maxWHIPSimulcastLayers, n)
 	}
 
 	answer, err := pc.CreateFullAnswer(offer, false)
@@ -483,6 +648,26 @@ func (s *session) runPublish(req *initialRequestReq) (int, error) {
 
 	pc.StartReading()
 
+	if s.parent.degradeSampleEnabled() {
+		go s.runDegradeSampling(pc)
+	}
+
+	// Publish reconnect tracking (see publishstats.go), independent of the
+	// degrade protocol above: logs immediately if this session is a
+	// reconnect within the current streaming period, then periodically
+	// (every publishStatsSummaryInterval) reports the cumulative count and
+	// how long the path has been streaming - useful to correlate operator
+	// reports of "it reconnected" with real RTP loss, even when loss was
+	// too brief/mild to trip the degrade FSM's 60s observation window.
+	startInfo := s.parent.recordPublishSessionStart(s.pathName)
+	defer s.parent.recordPublishSessionEnd(s.pathName)
+	if startInfo.isReconnect {
+		s.Log(logger.Warn, "[publish-stats] path=%s reconnected (likely RTP loss/network drop) - "+
+			"this is reconnect #%d since streaming started at %s",
+			s.pathName, startInfo.reconnectCount, startInfo.streamingSince.Format(time.RFC3339))
+	}
+	go s.runPublishStatsSummary()
+
 	select {
 	case <-pc.Failed():
 		return 0, fmt.Errorf("peer connection closed")
@@ -539,19 +724,43 @@ func (s *session) runRead(req *initialRequestReq) (int, error) {
 		Log:                   s,
 	}
 
-	r := &stream.Reader{Parent: s}
+	offer := whipOffer(s.offer)
+	var offerSDP sdp.SessionDescription
+	err = offerSDP.Unmarshal([]byte(offer.SDP))
+	if err != nil {
+		return http.StatusBadRequest, err
+	}
+	videoTrackCount := offerSendVideoTrackCount(offerSDP.MediaDescriptions)
+	if videoTrackCount > 1 {
+		videoTrackCount, err = offerH264SendTrackCount(offerSDP.MediaDescriptions)
+		if err != nil {
+			return http.StatusBadRequest, err
+		}
+		if videoTrackCount < 2 {
+			return http.StatusBadRequest, fmt.Errorf("multi-layer WHEP requires H264 on every requested video track")
+		}
+	}
 
-	// ABR: use TrackSelector for video routing
-	if s.abrEnabled {
-		selector := webrtc.NewTrackSelector(s, func(from, to int) {
+	mediaState := &webrtc.MediaState{}
+	r := &stream.Reader{Parent: s, MediaFilter: mediaState.Allow}
+	s.mutex.Lock()
+	s.mediaState = mediaState
+	s.mutex.Unlock()
+
+	if videoTrackCount > 1 {
+		err = webrtc.SetupFromStreamMultiH264(res.Stream.OrigDesc, r, pc, videoTrackCount)
+		if err != nil {
+			return http.StatusBadRequest, err
+		}
+	} else if s.abrEnabled {
+		var selector *webrtc.TrackSelector
+		selector = webrtc.NewTrackSelector(s, func(from, to int) {
 			s.Log(logger.Info, "ABR track switched: %d → %d", from, to)
 			// Send LAYER_SWITCHED via WebSocket if connected
-			s.mutex.RLock()
-			ws := s.wsConn
-			s.mutex.RUnlock()
-			if ws != nil {
-				sendLayerSwitched(ws, to, from)
-			}
+			s.writeABRMessage(layerSwitchedMessage(to, from)) //nolint:errcheck
+		})
+		selector.SetOnTracksChanged(func() {
+			s.writeABRMessage(tracksInfoMessage(selector)) //nolint:errcheck
 		})
 
 		if err := selector.LoadFromDescription(res.Stream.OrigDesc); err != nil {
@@ -595,8 +804,6 @@ func (s *session) runRead(req *initialRequestReq) (int, error) {
 		pc.Close()
 	}()
 
-	offer := whipOffer(s.offer)
-
 	answer, err := pc.CreateFullAnswer(offer, false)
 	if err != nil {
 		return http.StatusBadRequest, err
@@ -635,7 +842,13 @@ func (s *session) runRead(req *initialRequestReq) (int, error) {
 
 	s.mutex.Lock()
 	s.reader = r
+	s.abrReady = true
 	s.mutex.Unlock()
+
+	// Subscribe to this path's obs-timestamp fan-out (see
+	// obs_timestamp_broadcast.go) so p2p delay can be computed client-side.
+	s.parent.subscribeObsTimestamp(s.pathName, s)
+	defer s.parent.unsubscribeObsTimestamp(s.pathName, s)
 
 	select {
 	case <-pc.Failed():
@@ -701,6 +914,129 @@ func (s *session) readRemoteCandidates(offer []byte, pc *webrtc.PeerConnection) 
 			} else {
 				req.res <- addSessionCandidatesRes{}
 			}
+
+		case <-s.ctx.Done():
+			return
+		}
+	}
+}
+
+// onInboundDataChannel is registered as PeerConnection.OnInboundDataChannel
+// for WHIP publish sessions. Only reacts to the "obs-timestamp" channel
+// (see docs/obs-abs-timestamp-protocol.md in the OBS repo); any other
+// channel a publisher happens to create is left alone.
+func (s *session) onInboundDataChannel(dc *pwebrtc.DataChannel) {
+	if dc.Label() != webrtc.OBSTimestampDataChannelLabel {
+		return
+	}
+
+	dc.OnMessage(func(msg pwebrtc.DataChannelMessage) {
+		ts, err := webrtc.ParseOBSTimestampMessage(msg.Data)
+		if err != nil {
+			s.Log(logger.Debug, "obs-timestamp: invalid message: %v", err)
+			return
+		}
+
+		latencyMs := float64(time.Now().UnixMilli() - int64(ts.TimestampMS))
+
+		s.mutex.Lock()
+		s.obsTimestampLatencyMs = &latencyMs
+		s.mutex.Unlock()
+
+		// Relay to this path's WHEP readers (see
+		// obs_timestamp_broadcast.go) so a player can compute true
+		// end-to-end p2p delay, not just the OBS-to-mmx leg above.
+		s.parent.broadcastObsTimestamp(s.pathName, obsTimestampMessage(ts))
+	})
+}
+
+// degradeStatsLogInterval is how often runDegradeSampling logs the
+// received bitrate / active simulcast layer count - independent of
+// degradeSampleInterval (the FSM's 1s loss-sampling cadence, which stays
+// fine-grained since it drives the 60s observation window).
+const degradeStatsLogInterval = 5 * time.Second
+
+// runDegradeSampling periodically feeds this publish session's cumulative
+// RTP loss/received counters into the path's degrade FSM (see
+// docs/obs-mmx-degrade-protocol.md), and separately logs a live
+// bitrate/layer-count summary every degradeStatsLogInterval - useful for
+// telling apart "OBS's own WebRTC congestion control already throttled
+// the send bitrate (or paused a layer) down on its own" from "the
+// configured bitrate/layers are actually reaching us and still causing
+// loss". Only meaningful once pc.StartReading has been called
+// (PeerConnection.Stats only reports inbound-track stats after that
+// point).
+func (s *session) runDegradeSampling(pc *webrtc.PeerConnection) {
+	videoLayers := 0
+	for _, tr := range pc.InboundTracks() {
+		if tr.Kind() == pwebrtc.RTPCodecTypeVideo {
+			videoLayers++
+		}
+	}
+	s.parent.observeDegradeSessionLayers(s.pathName, videoLayers)
+
+	sampleTicker := time.NewTicker(degradeSampleInterval)
+	defer sampleTicker.Stop()
+	statsTicker := time.NewTicker(degradeStatsLogInterval)
+	defer statsTicker.Stop()
+
+	var lastBytesReceived uint64
+	haveLastBytes := false
+	lastTrackReceived := map[*webrtc.InboundTrack]uint64{}
+
+	for {
+		select {
+		case <-sampleTicker.C:
+			stats := pc.Stats()
+			s.parent.recordDegradeSample(s.pathName, stats.RTPPacketsLost, stats.RTPPacketsReceived)
+
+		case <-statsTicker.C:
+			stats := pc.Stats()
+			var kbps float64
+			if haveLastBytes && stats.BytesReceived >= lastBytesReceived {
+				kbps = float64(stats.BytesReceived-lastBytesReceived) * 8 / 1000 / degradeStatsLogInterval.Seconds()
+			}
+			lastBytesReceived = stats.BytesReceived
+			haveLastBytes = true
+
+			activeLayers := 0
+			for _, tr := range pc.InboundTracks() {
+				if tr.Kind() != pwebrtc.RTPCodecTypeVideo {
+					continue
+				}
+				received := tr.Stats().TotalReceived
+				if received > lastTrackReceived[tr] {
+					activeLayers++
+				}
+				lastTrackReceived[tr] = received
+			}
+
+			s.Log(logger.Info, "[degrade] received bitrate=%.0fkbps active simulcast layers=%d", kbps, activeLayers)
+
+		case <-s.ctx.Done():
+			return
+		}
+	}
+}
+
+// publishStatsSummaryInterval is how often an active WHIP publish session
+// logs the cumulative reconnect count / streaming duration for its path
+// (see publishstats.go). Independent of any degrade-protocol logging.
+const publishStatsSummaryInterval = 180 * time.Second
+
+// runPublishStatsSummary periodically logs how long this path has been
+// continuously streaming and how many WHIP publish reconnects have
+// happened during that period - only while a publish session is actually
+// active, so a path with no publisher doesn't accumulate log noise.
+func (s *session) runPublishStatsSummary() {
+	ticker := time.NewTicker(publishStatsSummaryInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			elapsed, reconnects := s.parent.publishStatsSummary(s.pathName)
+			s.Log(logger.Info, "[publish-stats] path=%s streaming for %s, %d reconnect(s) so far",
+				s.pathName, elapsed.Round(time.Second), reconnects)
 
 		case <-s.ctx.Done():
 			return
@@ -811,6 +1147,7 @@ func (s *session) apiItem() *defs.APIWebRTCSession {
 		OutboundRTPPackets:      rtpPacketsSent,
 		OutboundRTCPPackets:     rtcpPacketsSent,
 		OutboundFramesDiscarded: outboundFramesDiscarded,
+		OBSTimestampLatencyMs:   s.obsTimestampLatencyMs,
 		BytesReceived:           bytesReceived,
 		BytesSent:               bytesSent,
 		RTPPacketsReceived:      rtpPacketsReceived,

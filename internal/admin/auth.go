@@ -5,12 +5,14 @@ import (
 	"encoding/base64"
 	"fmt"
 	"net/http"
-	"os"
 	"strings"
 	"sync"
 
 	"github.com/gin-gonic/gin"
 	"golang.org/x/crypto/bcrypt"
+
+	"github.com/bluenviron/mediamtx/internal/conf"
+	"github.com/bluenviron/mediamtx/internal/logger"
 )
 
 const adminSessionCookie = "mmx_admin_session"
@@ -22,19 +24,26 @@ type authManager struct {
 	sessions map[string]struct{}
 }
 
-func newAuthManager(store *Store) (*authManager, error) {
+func newAuthManager(store *Store, log logger.Writer) (*authManager, error) {
 	if store == nil {
 		return nil, fmt.Errorf("admin authentication requires a persistent store")
 	}
 	username, passwordHash := store.AdminCredentials()
 	if username == "" || passwordHash == "" {
-		username = strings.TrimSpace(os.Getenv("MMXADMIN_USERNAME"))
-		password := os.Getenv("MMXADMIN_PASSWORD")
+		username = strings.TrimSpace(conf.DotenvValue("MMXADMIN_USERNAME"))
+		password := conf.DotenvValue("MMXADMIN_PASSWORD")
 		if username == "" {
 			username = "admin"
 		}
-		if len(password) < 12 {
-			return nil, fmt.Errorf("MMXADMIN_PASSWORD must be set to at least 12 characters on first startup")
+		if password == "" {
+			generated, err := generateRandomPassword()
+			if err != nil {
+				return nil, err
+			}
+			password = generated
+			if log != nil {
+				log.Log(logger.Info, "[admin] MMXADMIN_PASSWORD not set, generated random admin password: %s", password)
+			}
 		}
 		hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
 		if err != nil {
@@ -45,6 +54,14 @@ func newAuthManager(store *Store) (*authManager, error) {
 		}
 	}
 	return &authManager{store: store, username: username, sessions: make(map[string]struct{})}, nil
+}
+
+func generateRandomPassword() (string, error) {
+	raw := make([]byte, 16)
+	if _, err := rand.Read(raw); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(raw), nil
 }
 
 func (a *authManager) authenticated(c *gin.Context) bool {

@@ -75,16 +75,21 @@ func offerAndCandidateToSDPFragment(
 
 // Client is a WHIP client.
 type Client struct {
-	URL                *url.URL
-	Publish            bool
-	OutboundTracks     []*webrtc.OutboundTrack
-	HTTPClient         *http.Client
-	BearerToken        string
-	UDPReadBufferSize  uint
-	STUNGatherTimeout  time.Duration
-	HandshakeTimeout   time.Duration
-	TrackGatherTimeout time.Duration
-	Log                logger.Writer
+	URL                 *url.URL
+	Publish             bool
+	RecvOnlyVideoTracks int
+	AutoVideoTracks     bool
+	OutboundTracks      []*webrtc.OutboundTrack
+	HTTPClient          *http.Client
+	BearerToken         string
+	// DeviceID is sent as the "WHIP-Device-Id" header on publish requests
+	// (ignored for WHEP/read). The server compares it against WHIP_WS_SECRET.
+	DeviceID            string
+	UDPReadBufferSize   uint
+	STUNGatherTimeout   time.Duration
+	HandshakeTimeout    time.Duration
+	TrackGatherTimeout  time.Duration
+	Log                 logger.Writer
 
 	pc            *webrtc.PeerConnection
 	useTrickleICE bool
@@ -107,15 +112,27 @@ func (c *Client) Initialize(ctx context.Context) error {
 		return err
 	}
 
+	recvOnlyVideoTracks := c.RecvOnlyVideoTracks
+	if !c.Publish && c.AutoVideoTracks {
+		recvOnlyVideoTracks = webrtc.MaxAutoVideoTracks
+	}
 	c.pc = &webrtc.PeerConnection{
-		Net:               &webrtc.Net{UDPReadBufferSize: int(c.UDPReadBufferSize)},
-		LocalRandomUDP:    true,
-		ICEServers:        iceServers,
-		IPsFromInterfaces: true,
-		Publish:           c.Publish,
-		STUNGatherTimeout: c.STUNGatherTimeout,
-		OutboundTracks:    c.OutboundTracks,
-		Log:               c.Log,
+		Net: &webrtc.Net{
+			UDPReadBufferSize: int(c.UDPReadBufferSize),
+			OnReadBufferWarn: func(format string, args ...any) {
+				if c.Log != nil {
+					c.Log.Log(logger.Warn, format, args...)
+				}
+			},
+		},
+		LocalRandomUDP:      true,
+		ICEServers:          iceServers,
+		IPsFromInterfaces:   true,
+		Publish:             c.Publish,
+		RecvOnlyVideoTracks: recvOnlyVideoTracks,
+		STUNGatherTimeout:   c.STUNGatherTimeout,
+		OutboundTracks:      c.OutboundTracks,
+		Log:                 c.Log,
 	}
 	err = c.pc.Start()
 	if err != nil {
@@ -146,6 +163,9 @@ func (c *Client) Initialize(ctx context.Context) error {
 }
 
 func (c *Client) initializeInner(ctx context.Context) error {
+	expectedVideoTracks := 0
+	expectedAudioTracks := 0
+
 	var offer *pwebrtc.SessionDescription
 	if c.useTrickleICE {
 		var err error
@@ -179,7 +199,15 @@ func (c *Client) initializeInner(ctx context.Context) error {
 			return err
 		}
 
-		err = webrtc.TracksAreValid(sdp.MediaDescriptions)
+		maxVideoTracks := c.RecvOnlyVideoTracks
+		if c.AutoVideoTracks {
+			maxVideoTracks = webrtc.MaxAutoVideoTracks
+		} else if maxVideoTracks == 0 {
+			maxVideoTracks = 1
+		}
+		expectedVideoTracks = webrtc.InboundMediaCount(sdp.MediaDescriptions, "video")
+		expectedAudioTracks = webrtc.InboundMediaCount(sdp.MediaDescriptions, "audio")
+		err = webrtc.TracksAreValid(sdp.MediaDescriptions, maxVideoTracks, expectedVideoTracks)
 		if err != nil {
 			c.deleteSession(context.Background()) //nolint:errcheck
 			return err
@@ -199,7 +227,7 @@ func (c *Client) initializeInner(ctx context.Context) error {
 	}
 
 	if !c.Publish {
-		err = c.pc.GatherInboundTracks(c.TrackGatherTimeout)
+		err = c.pc.GatherInboundTracksExact(c.TrackGatherTimeout, expectedVideoTracks, expectedAudioTracks)
 		if err != nil {
 			c.deleteSession(context.Background()) //nolint:errcheck
 			return err
@@ -319,6 +347,10 @@ func (c *Client) postOffer(
 
 	if c.BearerToken != "" {
 		req.Header.Set("Authorization", "Bearer "+c.BearerToken)
+	}
+
+	if c.Publish && c.DeviceID != "" {
+		req.Header.Set("WHIP-Device-Id", c.DeviceID)
 	}
 
 	req.Header.Set("Content-Type", "application/sdp")

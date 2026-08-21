@@ -10,6 +10,10 @@ require (
 	github.com/abema/go-mp4 v1.6.0
 	github.com/alecthomas/kong v1.15.0
 	github.com/asticode/go-astits v1.15.0
+	github.com/aws/aws-sdk-go-v2 v1.43.0
+	github.com/aws/aws-sdk-go-v2/config v1.32.31
+	github.com/aws/aws-sdk-go-v2/credentials v1.19.30
+	github.com/aws/aws-sdk-go-v2/service/s3 v1.106.0
 	github.com/bluenviron/gohlslib/v2 v2.4.0
 	github.com/bluenviron/gortmplib v0.4.0
 	github.com/bluenviron/gortsplib/v5 v5.6.0
@@ -28,7 +32,9 @@ require (
 	github.com/gorilla/websocket v1.5.3
 	github.com/kballard/go-shellquote v0.0.0-20180428030007-95032a82bc51
 	github.com/matthewhartstonge/argon2 v1.5.4
+	github.com/minio/minio-go/v7 v7.2.1
 	github.com/minio/selfupdate v0.6.0
+	github.com/nacos-group/nacos-sdk-go/v2 v2.3.5
 	github.com/pion/ice/v4 v4.2.8-0.20260604162030-72f5001c4596
 	github.com/pion/interceptor v0.1.45
 	github.com/pion/logging v0.2.4
@@ -77,10 +83,7 @@ require (
 	github.com/aliyun/aliyun-secretsmanager-client-go v1.1.5 // indirect
 	github.com/aliyun/credentials-go v1.4.3 // indirect
 	github.com/asticode/go-astikit v0.30.0 // indirect
-	github.com/aws/aws-sdk-go-v2 v1.43.0 // indirect
 	github.com/aws/aws-sdk-go-v2/aws/protocol/eventstream v1.7.14 // indirect
-	github.com/aws/aws-sdk-go-v2/config v1.32.31 // indirect
-	github.com/aws/aws-sdk-go-v2/credentials v1.19.30 // indirect
 	github.com/aws/aws-sdk-go-v2/feature/ec2/imds v1.18.31 // indirect
 	github.com/aws/aws-sdk-go-v2/internal/configsources v1.4.31 // indirect
 	github.com/aws/aws-sdk-go-v2/internal/endpoints/v2 v2.7.31 // indirect
@@ -89,7 +92,6 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/internal/checksum v1.9.24 // indirect
 	github.com/aws/aws-sdk-go-v2/service/internal/presigned-url v1.13.31 // indirect
 	github.com/aws/aws-sdk-go-v2/service/internal/s3shared v1.19.32 // indirect
-	github.com/aws/aws-sdk-go-v2/service/s3 v1.106.0 // indirect
 	github.com/aws/aws-sdk-go-v2/service/signin v1.5.0 // indirect
 	github.com/aws/aws-sdk-go-v2/service/sso v1.33.0 // indirect
 	github.com/aws/aws-sdk-go-v2/service/ssooidc v1.38.0 // indirect
@@ -133,10 +135,8 @@ require (
 	github.com/matttproud/golang_protobuf_extensions v1.0.1 // indirect
 	github.com/minio/crc64nvme v1.1.1 // indirect
 	github.com/minio/md5-simd v1.1.2 // indirect
-	github.com/minio/minio-go/v7 v7.2.1 // indirect
 	github.com/modern-go/concurrent v0.0.0-20180306012644-bacd9c7ef1dd // indirect
 	github.com/modern-go/reflect2 v1.0.2 // indirect
-	github.com/nacos-group/nacos-sdk-go/v2 v2.3.5 // indirect
 	github.com/ncruces/go-strftime v1.0.0 // indirect
 	github.com/orcaman/concurrent-map v0.0.0-20210501183033-44dafcb38ecc // indirect
 	github.com/pelletier/go-toml/v2 v2.3.1 // indirect

@@ -13,8 +13,8 @@ import (
 	"github.com/bluenviron/mediamtx/internal/externalcmd"
 	"github.com/bluenviron/mediamtx/internal/forward"
 	"github.com/bluenviron/mediamtx/internal/logger"
-	"github.com/bluenviron/mediamtx/internal/recording"
 	"github.com/bluenviron/mediamtx/internal/metrics"
+	"github.com/bluenviron/mediamtx/internal/recording"
 	"github.com/bluenviron/mediamtx/internal/servers/hls"
 )
 
@@ -34,6 +34,9 @@ func pathConfCanBeUpdated(oldPathConf *conf.Path, newPathConf *conf.Path) bool {
 
 	clone.ForwardTencent = newPathConf.ForwardTencent
 	clone.ForwardTencentStreamKey = newPathConf.ForwardTencentStreamKey
+	clone.ForwardMmx = newPathConf.ForwardMmx
+	clone.ForwardMmxURL = newPathConf.ForwardMmxURL
+	clone.ForwardMmxToken = newPathConf.ForwardMmxToken
 
 	clone.RPICameraBrightness = newPathConf.RPICameraBrightness
 	clone.RPICameraContrast = newPathConf.RPICameraContrast
@@ -70,6 +73,14 @@ type pathManagerAuthManager interface {
 	Authenticate(req *auth.Request) (string, *auth.Error)
 }
 
+// pathManagerStreamChecker is satisfied by *admin.Store. It's a narrow
+// interface (rather than importing admin.Store directly) so path_manager.go
+// doesn't need to know anything about the admin package beyond this one
+// method.
+type pathManagerStreamChecker interface {
+	IsStreamAllowed(pathName string) (bool, error)
+}
+
 type pathManagerParent interface {
 	logger.Writer
 }
@@ -84,31 +95,35 @@ type pathManager struct {
 	udpReadBufferSize uint
 	rtpMaxPayloadSize int
 	tencentWHIP       forward.TencentConfig
+	forwardMmxEnable  bool // account-level switch for forwardMmx, see conf.Conf.ForwardMmxEnable
 	pathConfs         map[string]*conf.Path
 	authManager       pathManagerAuthManager
 	externalCmdPool   *externalcmd.Pool
 	metrics           *metrics.Metrics
 	parent            pathManagerParent
 
-	ctx       context.Context
-	ctxCancel func()
-	wg        sync.WaitGroup
-	hlsServer *hls.Server
-	paths     map[string]*path
+	ctx        context.Context
+	ctxCancel  func()
+	wg         sync.WaitGroup
+	hlsServer  *hls.Server
+	adminStore pathManagerStreamChecker
+	paths      map[string]*path
 
 	// in
-	chReloadConf      chan map[string]*conf.Path
-	chSetHLSServer    chan pathSetHLSServerReq
-	chRemovePath      chan *path
-	chClosePathIfIdle chan *path
-	chSetPathReady    chan *path
-	chSetPathNotReady chan *path
-	chFindPathConf    chan defs.PathFindPathConfReq
-	chDescribe        chan defs.PathDescribeReq
-	chAddReader       chan defs.PathAddReaderReq
-	chAddPublisher    chan defs.PathAddPublisherReq
-	chAPIPathsList    chan pathAPIPathsListReq
-	chAPIPathsGet     chan pathAPIPathsGetReq
+	chReloadConf       chan map[string]*conf.Path
+	chSetHLSServer     chan pathSetHLSServerReq
+	chSetAdminStore    chan pathManagerStreamChecker
+	chRemovePath       chan *path
+	chClosePathIfIdle  chan *path
+	chSetPathReady     chan *path
+	chSetPathNotReady  chan *path
+	chFindPathConf     chan defs.PathFindPathConfReq
+	chIsPublishAllowed chan defs.PathIsPublishAllowedReq
+	chDescribe         chan defs.PathDescribeReq
+	chAddReader        chan defs.PathAddReaderReq
+	chAddPublisher     chan defs.PathAddPublisherReq
+	chAPIPathsList     chan pathAPIPathsListReq
+	chAPIPathsGet      chan pathAPIPathsGetReq
 }
 
 func (pm *pathManager) initialize() {
@@ -119,11 +134,13 @@ func (pm *pathManager) initialize() {
 	pm.paths = make(map[string]*path)
 	pm.chReloadConf = make(chan map[string]*conf.Path)
 	pm.chSetHLSServer = make(chan pathSetHLSServerReq)
+	pm.chSetAdminStore = make(chan pathManagerStreamChecker)
 	pm.chRemovePath = make(chan *path)
 	pm.chClosePathIfIdle = make(chan *path)
 	pm.chSetPathReady = make(chan *path)
 	pm.chSetPathNotReady = make(chan *path)
 	pm.chFindPathConf = make(chan defs.PathFindPathConfReq)
+	pm.chIsPublishAllowed = make(chan defs.PathIsPublishAllowedReq)
 	pm.chDescribe = make(chan defs.PathDescribeReq)
 	pm.chAddReader = make(chan defs.PathAddReaderReq)
 	pm.chAddPublisher = make(chan defs.PathAddPublisherReq)
@@ -175,6 +192,9 @@ outer:
 			readyPaths := pm.doSetHLSServer(req.s)
 			req.res <- pathSetHLSServerRes{readyPaths: readyPaths}
 
+		case store := <-pm.chSetAdminStore:
+			pm.adminStore = store
+
 		case pa := <-pm.chRemovePath:
 			if pa2, ok := pm.paths[pa.name]; ok && pa2 == pa {
 				delete(pm.paths, pa.name)
@@ -193,6 +213,9 @@ outer:
 
 		case req := <-pm.chFindPathConf:
 			pm.doFindPathConf(req)
+
+		case req := <-pm.chIsPublishAllowed:
+			pm.doIsPublishAllowed(req)
 
 		case req := <-pm.chDescribe:
 			pm.doDescribe(req)
@@ -344,6 +367,30 @@ func (pm *pathManager) doFindPathConf(req defs.PathFindPathConfReq) {
 	}
 }
 
+// isStreamAllowedUnsafe reports whether pathName is allowed to publish per
+// the site_stream_configs whitelist. adminStore is nil until core finishes
+// opening it (SetAdminStore), and IsStreamAllowed errors are treated as
+// "allowed" so a transient SQLite hiccup degrades to the old open-by-default
+// behavior instead of blocking every publisher. Must be called from the
+// pathManager's own run() goroutine (see the other do* handlers).
+func (pm *pathManager) isStreamAllowedUnsafe(pathName string) bool {
+	if pm.adminStore == nil {
+		return true
+	}
+	allowed, err := pm.adminStore.IsStreamAllowed(pathName)
+	return err != nil || allowed
+}
+
+// doIsPublishAllowed answers IsPublishAllowed(). Kept as its own request
+// type (rather than folded into FindPathConf) so the WHIP OPTIONS preflight
+// - which also calls FindPathConf, before the actual publish attempt - isn't
+// affected: OPTIONS just returns ICE server info and grants nothing by
+// itself, so there's no need to reject early there. Only the actual publish
+// attempt (runPublish, before it builds a PeerConnection) checks this.
+func (pm *pathManager) doIsPublishAllowed(req defs.PathIsPublishAllowedReq) {
+	req.Res <- pm.isStreamAllowedUnsafe(req.Name)
+}
+
 func (pm *pathManager) doDescribe(req defs.PathDescribeReq) {
 	pathConf, pathMatches, err := conf.FindPathConf(pm.pathConfs, req.AccessRequest.Name)
 	if err != nil {
@@ -411,6 +458,17 @@ func (pm *pathManager) doAddPublisher(req defs.PathAddPublisherReq) {
 		return
 	}
 
+	// site_stream_configs whitelist: reject publishers for streams the
+	// dashboard hasn't been told to expect. runPublish already checks this
+	// via IsPublishAllowed before building a PeerConnection - this is a
+	// backstop for a caller reaching AddPublisher some other way.
+	if !pm.isStreamAllowedUnsafe(req.AccessRequest.Name) {
+		req.Res <- defs.PathAddPublisherRes{
+			Err: fmt.Errorf("'%s' not configured caused publish refusal!", req.AccessRequest.Name),
+		}
+		return
+	}
+
 	if req.ConfToCompare != nil && !pathConf.Equal(req.ConfToCompare) {
 		req.Res <- defs.PathAddPublisherRes{Err: fmt.Errorf("configuration has changed")}
 		return
@@ -475,6 +533,7 @@ func (pm *pathManager) createPath(
 		udpReadBufferSize: pm.udpReadBufferSize,
 		rtpMaxPayloadSize: pm.rtpMaxPayloadSize,
 		tencentWHIP:       pm.tencentWHIP,
+		forwardMmxEnable:  pm.forwardMmxEnable,
 		conf:              pathConf,
 		name:              name,
 		matches:           matches,
@@ -546,6 +605,26 @@ func (pm *pathManager) FindPathConf(req defs.PathFindPathConfReq) (*defs.PathFin
 
 	case <-pm.ctx.Done():
 		return nil, fmt.Errorf("terminated")
+	}
+}
+
+// IsPublishAllowed reports whether pathName is allowed to publish per the
+// site_stream_configs whitelist. Called by runPublish before it builds a
+// PeerConnection, so a disallowed publisher gets a definitive rejection
+// (e.g. HTTP 403) up front instead of a successful handshake followed by
+// the connection being torn down - a WHIP client like OBS doesn't reliably
+// treat a later mid-session close as "publish denied" and may just keep
+// reconnecting. On shutdown, degrades to "allowed" (mirroring
+// isStreamAllowedUnsafe's own open-by-default-on-error semantics) rather
+// than blocking the caller.
+func (pm *pathManager) IsPublishAllowed(pathName string) bool {
+	req := defs.PathIsPublishAllowedReq{Name: pathName, Res: make(chan bool)}
+	select {
+	case pm.chIsPublishAllowed <- req:
+		return <-req.Res
+
+	case <-pm.ctx.Done():
+		return true
 	}
 }
 
@@ -629,12 +708,24 @@ func (pm *pathManager) AddReader(req defs.PathAddReaderReq) (*defs.PathAddReader
 // Used by the recording API to control on-demand recording.
 func (pm *pathManager) FindPath(name string) (recording.PathController, bool) {
 	// paths accessed from main goroutine context
-	
+
 	pa, ok := pm.paths[name]
 	if !ok {
 		return nil, false
 	}
 	return pa, true
+}
+
+// SetAdminStore is called by core once the admin store has been opened, so
+// that publish requests can be checked against site_stream_configs. The
+// admin store is created after pathManager (it needs the WebRTC/API ports,
+// which pathManager helps derive), hence this post-initialization setter
+// rather than a constructor field.
+func (pm *pathManager) SetAdminStore(store pathManagerStreamChecker) {
+	select {
+	case pm.chSetAdminStore <- store:
+	case <-pm.ctx.Done():
+	}
 }
 
 // SetHLSServer is called by hls.Server.

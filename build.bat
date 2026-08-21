@@ -32,7 +32,9 @@ if not exist "bin" mkdir "bin"
 
 REM --- build ---
 echo [2/3] Building mmx.exe ...
-go build -ldflags="-s -w" -o "bin\mmx.exe" .
+set "GOTOOLCHAIN=go1.26.1"
+set "CGO_ENABLED=0"
+go build -trimpath -ldflags="-s -w" -o "bin\mmx.exe" .
 if errorlevel 1 (
     echo ERROR: build failed
     exit /b 1

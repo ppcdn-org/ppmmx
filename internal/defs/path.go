@@ -42,6 +42,12 @@ type PathFindPathConfReq struct {
 	Res           chan PathFindPathConfRes
 }
 
+// PathIsPublishAllowedReq contains arguments of IsPublishAllowed().
+type PathIsPublishAllowedReq struct {
+	Name string
+	Res  chan bool
+}
+
 // PathDescribeRes contains the response of Describe().
 type PathDescribeRes struct {
 	Path     Path

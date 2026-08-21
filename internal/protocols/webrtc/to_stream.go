@@ -31,6 +31,55 @@ var errNoSupportedCodecsTo = errors.New(
 	"the stream doesn't contain any supported codec, which are currently " +
 		"AV1, VP9, VP8, H265, H264, Opus, G722, G711, LPCM")
 
+type mediaEntry struct {
+	medi  *description.Media
+	video bool
+	id    string
+	rid   string
+}
+
+func sortMediaEntries(entries []mediaEntry) {
+	videoCount := 0
+	allLayerIDs := true
+	allRID := true
+	for _, entry := range entries {
+		if entry.video {
+			videoCount++
+			if _, ok := videoTrackIndex(entry.id); !ok {
+				allLayerIDs = false
+			}
+			if entry.rid == "" {
+				allRID = false
+			}
+		}
+	}
+
+	if videoCount < 2 || (!allLayerIDs && !allRID) {
+		return
+	}
+
+	sort.SliceStable(entries, func(i, j int) bool {
+		if entries[i].video != entries[j].video {
+			return entries[i].video
+		}
+		if !entries[i].video {
+			return false
+		}
+		if allLayerIDs {
+			ni, _ := videoTrackIndex(entries[i].id)
+			nj, _ := videoTrackIndex(entries[j].id)
+			return ni < nj
+		}
+
+		ni, erri := strconv.Atoi(entries[i].rid)
+		nj, errj := strconv.Atoi(entries[j].rid)
+		if erri == nil && errj == nil {
+			return ni < nj
+		}
+		return entries[i].rid < entries[j].rid
+	})
+}
+
 // ToStream maps a WebRTC connection to a MediaMTX stream.
 func ToStream(
 	pc *PeerConnection,
@@ -219,47 +268,16 @@ func ToStream(
 	// ones. OBS assigns RIDs "0".."N-1" (highest quality first), but RIDs
 	// are compared numerically when possible so the order doesn't break if
 	// a publisher ever uses two-digit RIDs (numeric "10" sorting before "2").
-	type mediaEntry struct {
-		medi  *description.Media
-		video bool
-		rid   string
-	}
-
 	entries := make([]mediaEntry, len(medias))
-	videoCount := 0
-	allRID := true
 
 	for i, medi := range medias {
 		video := medi.Type == description.MediaTypeVideo
-		entries[i] = mediaEntry{medi, video, pc.inboundTracks[i].rid}
-		if video {
-			videoCount++
-			if entries[i].rid == "" {
-				allRID = false
-			}
-		}
+		entries[i] = mediaEntry{medi, video, pc.inboundTracks[i].id, pc.inboundTracks[i].rid}
 	}
 
-	if videoCount >= 2 && allRID {
-		sort.SliceStable(entries, func(i, j int) bool {
-			if entries[i].video != entries[j].video {
-				return entries[i].video
-			}
-			if !entries[i].video {
-				return false
-			}
-
-			ni, erri := strconv.Atoi(entries[i].rid)
-			nj, errj := strconv.Atoi(entries[j].rid)
-			if erri == nil && errj == nil {
-				return ni < nj
-			}
-			return entries[i].rid < entries[j].rid
-		})
-
-		for i, e := range entries {
-			medias[i] = e.medi
-		}
+	sortMediaEntries(entries)
+	for i, entry := range entries {
+		medias[i] = entry.medi
 	}
 
 	if len(medias) == 0 {
@@ -267,4 +285,12 @@ func ToStream(
 	}
 
 	return medias, nil
+}
+
+func videoTrackIndex(id string) (int, bool) {
+	if !strings.HasPrefix(id, "video-") {
+		return 0, false
+	}
+	index, err := strconv.Atoi(strings.TrimPrefix(id, "video-"))
+	return index, err == nil && index >= 0
 }

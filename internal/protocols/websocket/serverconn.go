@@ -31,12 +31,14 @@ type ServerConn struct {
 
 	// in
 	terminate chan struct{}
-	write     chan []byte
-
-	// out
-	writeErr chan error
+	write     chan writeRequest
 
 	closeOnce sync.Once
+}
+
+type writeRequest struct {
+	byts []byte
+	res  chan error
 }
 
 // NewServerConn allocates a ServerConn.
@@ -49,8 +51,7 @@ func NewServerConn(w http.ResponseWriter, req *http.Request) (*ServerConn, error
 	c := &ServerConn{
 		wc:        wc,
 		terminate: make(chan struct{}),
-		write:     make(chan []byte),
-		writeErr:  make(chan error),
+		write:     make(chan writeRequest),
 	}
 
 	go c.run()
@@ -61,8 +62,7 @@ func NewServerConn(w http.ResponseWriter, req *http.Request) (*ServerConn, error
 // Close closes a ServerConn.
 func (c *ServerConn) Close() {
 	c.closeOnce.Do(func() {
-	c.wc.Close() //nolint:errcheck
-	close(c.terminate)
+		close(c.terminate)
 	})
 }
 
@@ -72,6 +72,7 @@ func (c *ServerConn) RemoteAddr() net.Addr {
 }
 
 func (c *ServerConn) run() {
+	defer c.wc.Close()                                               //nolint:errcheck
 	c.wc.SetReadDeadline(time.Now().Add(pingInterval + pingTimeout)) //nolint:errcheck
 
 	c.wc.SetPongHandler(func(string) error {
@@ -84,10 +85,13 @@ func (c *ServerConn) run() {
 
 	for {
 		select {
-		case byts := <-c.write:
+		case req := <-c.write:
 			c.wc.SetWriteDeadline(time.Now().Add(writeTimeout)) //nolint:errcheck
-			err := c.wc.WriteMessage(websocket.TextMessage, byts)
-			c.writeErr <- err
+			err := c.wc.WriteMessage(websocket.TextMessage, req.byts)
+			select {
+			case req.res <- err:
+			case <-c.terminate:
+			}
 
 		case <-pingTicker.C:
 			c.wc.SetWriteDeadline(time.Now().Add(writeTimeout)) //nolint:errcheck
@@ -111,9 +115,16 @@ func (c *ServerConn) WriteJSON(in any) error {
 		return err
 	}
 
+	req := writeRequest{byts: byts, res: make(chan error, 1)}
 	select {
-	case c.write <- byts:
-		return <-c.writeErr
+	case c.write <- req:
+	case <-c.terminate:
+		return fmt.Errorf("terminated")
+	}
+
+	select {
+	case err := <-req.res:
+		return err
 	case <-c.terminate:
 		return fmt.Errorf("terminated")
 	}

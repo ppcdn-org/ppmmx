@@ -152,7 +152,7 @@ func TestConfFromFile(t *testing.T) {
 			RPICameraAfMode:              "continuous",
 			RPICameraAfRange:             "normal",
 			RPICameraAfSpeed:             "normal",
-			RPICameraTextOverlay:         "%Y-%m-%d %H:%M:%S - MediaMTX",
+			RPICameraTextOverlay:         "%Y-%m-%d %H:%M:%S - mmx",
 			RPICameraCodec:               "auto",
 			RPICameraIDRPeriod:           60,
 			RPICameraBitrate:             5000000,
@@ -322,6 +322,24 @@ func TestConfDeprecatedAuth(t *testing.T) {
 			},
 		},
 	}, conf.AuthInternalUsers)
+}
+
+// TestConfWebRTCIPsFromInterfacesFallback verifies that a contradictory
+// combination (webrtcIPsFromInterfaces: false with no webrtcAdditionalHosts)
+// falls back to discovering IPs from interfaces instead of refusing to
+// start - there's no third way to discover host candidates, so the empty
+// hosts list is treated as "the additionalHosts override wasn't actually
+// used", not as a fatal misconfiguration.
+func TestConfWebRTCIPsFromInterfacesFallback(t *testing.T) {
+	tmpf := createTempFile(t, []byte(
+		"webrtc: yes\n"+
+			"webrtcLocalUDPAddress: ':8189'\n"+
+			"webrtcIPsFromInterfaces: false\n"+
+			"webrtcAdditionalHosts: []\n"))
+
+	conf, _, err := Load(tmpf, nil, nil)
+	require.NoError(t, err)
+	require.Equal(t, true, conf.WebRTCIPsFromInterfaces)
 }
 
 func TestConfErrors(t *testing.T) {
@@ -766,14 +784,6 @@ func TestConfErrors(t *testing.T) {
 				"webrtcLocalTCPAddress: ''\n" +
 				"webrtcICEServers2: []\n",
 			"at least one between 'webrtcLocalUDPAddress', 'webrtcLocalTCPAddress' or 'webrtcICEServers2' must be filled",
-		},
-		{
-			"webrtc missing ips config",
-			"webrtc: yes\n" +
-				"webrtcLocalUDPAddress: ':8189'\n" +
-				"webrtcIPsFromInterfaces: false\n" +
-				"webrtcAdditionalHosts: []\n",
-			"at least one between 'webrtcIPsFromInterfaces' or 'webrtcAdditionalHosts' must be filled",
 		},
 		{
 			"missing apiAddress with API enabled",

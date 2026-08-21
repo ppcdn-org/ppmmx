@@ -81,6 +81,7 @@ type path struct {
 	udpReadBufferSize uint
 	rtpMaxPayloadSize int
 	tencentWHIP       forward.TencentConfig
+	forwardMmxEnable  bool // account-level switch for forwardMmx, see conf.Conf.ForwardMmxEnable
 	conf              *conf.Path
 	name              string
 	matches           []string
@@ -100,6 +101,7 @@ type path struct {
 	stream                         *stream.Stream
 	recorder                       *recorder.Recorder
 	tencentForwarders              []*forward.Forwarder
+	mmxForwarder                   *forward.Forwarder
 	availableTime                  time.Time
 	onlineTime                     time.Time
 	onUnDemandHook                 func(string)
@@ -426,6 +428,17 @@ func (pa *path) doReloadConf(newConf *conf.Path) {
 
 	if newConf.ForwardTencent && pa.tencentWHIP.Enable && pa.stream != nil && len(pa.tencentForwarders) == 0 {
 		pa.startTencentForwarding()
+	}
+
+	if pa.mmxForwarder != nil &&
+		(newConf.ForwardMmx != oldConf.ForwardMmx ||
+			newConf.ForwardMmxURL != oldConf.ForwardMmxURL ||
+			newConf.ForwardMmxToken != oldConf.ForwardMmxToken) {
+		pa.stopMmxForwarding()
+	}
+
+	if newConf.ForwardMmx && pa.forwardMmxEnable && pa.stream != nil && pa.mmxForwarder == nil {
+		pa.startMmxForwarding()
 	}
 }
 
@@ -872,6 +885,10 @@ func (pa *path) setAvailable(
 		pa.startTencentForwarding()
 	}
 
+	if pa.conf.ForwardMmx && pa.forwardMmxEnable {
+		pa.startMmxForwarding()
+	}
+
 	var sourceDesc *defs.APIPathSource
 	if source != nil {
 		sourceDesc = source.APISourceDescribe()
@@ -927,6 +944,7 @@ func (pa *path) setNotAvailable() {
 	}
 
 	pa.stopTencentForwarding()
+	pa.stopMmxForwarding()
 
 	if pa.stream != nil {
 		pa.stream.Close()
@@ -1033,7 +1051,7 @@ func (pa *path) startTencentForwarding() {
 	prefix := pa.conf.ForwardTencentStreamKey
 	if prefix == "" {
 		prefix = pa.name
-		// Strip app prefix (e.g. "live/3drush-fwv" → "3drush-fwv")
+		// Strip app prefix (e.g. "live/table1-fwv" → "table1-fwv")
 		if idx := strings.LastIndexByte(prefix, '/'); idx >= 0 {
 			prefix = prefix[idx+1:]
 		}
@@ -1041,13 +1059,14 @@ func (pa *path) startTencentForwarding() {
 
 	layers := forward.SplitLayers(prefix, pa.stream.OrigDesc)
 	if len(layers) == 0 {
-		// Fallback for Simulcast SSRC probing failure: forward as single _q0 layer
-		// even if only audio is available (Tencent accepts audio-only streams)
+		// Fallback for Simulcast SSRC probing failure: forward as a single
+		// unsuffixed layer (the naming SplitLayers gives layer 0) even if
+		// only audio is available (Tencent accepts audio-only streams)
 		layers = []forward.Layer{{
-			StreamKey: prefix + "_q0",
+			StreamKey: prefix,
 			Desc:      pa.stream.OrigDesc,
 		}}
-		pa.Log(logger.Warn, "tencent forward: no H264 video layer found, falling back to _q0 (audio-only)")
+		pa.Log(logger.Warn, "tencent forward: no H264 video layer found, falling back to unsuffixed stream key (audio-only)")
 	}
 
 	pa.tencentForwarders = make([]*forward.Forwarder, len(layers))
@@ -1070,6 +1089,34 @@ func (pa *path) stopTencentForwarding() {
 		f.Close()
 	}
 	pa.tencentForwarders = nil
+}
+
+// startMmxForwarding pushes the path's whole stream (all Simulcast layers
+// in a single WHIP session - see forward.MmxConfig's doc comment for why
+// this differs from startTencentForwarding's one-Forwarder-per-layer
+// split) to another mmx node's WHIP publish endpoint. Mirrors
+// startTencentForwarding/startRecording.
+func (pa *path) startMmxForwarding() {
+	f := &forward.Forwarder{
+		Mmx: forward.MmxConfig{
+			Enable:    true,
+			URL:       pa.conf.ForwardMmxURL,
+			AuthToken: pa.conf.ForwardMmxToken,
+		},
+		PathName: pa.name,
+		Desc:     pa.stream.OrigDesc,
+		Stream:   pa.stream,
+		Parent:   pa,
+	}
+	f.Initialize()
+	pa.mmxForwarder = f
+}
+
+func (pa *path) stopMmxForwarding() {
+	if pa.mmxForwarder != nil {
+		pa.mmxForwarder.Close()
+		pa.mmxForwarder = nil
+	}
 }
 
 func (pa *path) executeRemoveReader(r defs.Reader) {

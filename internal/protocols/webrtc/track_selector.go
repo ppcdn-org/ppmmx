@@ -43,12 +43,13 @@ var layerDefaults = []struct {
 
 // TrackSelector manages Simulcast track selection for a single WHEP reader.
 type TrackSelector struct {
-	mu         sync.RWMutex
-	tracks     []*TrackInfo
-	activeID   int
-	pendingID  int
-	pendingAt  time.Time
-	onSwitched func(from, to int)
+	mu              sync.RWMutex
+	tracks          []*TrackInfo
+	activeID        int
+	pendingID       int
+	pendingAt       time.Time
+	onSwitched      func(from, to int)
+	onTracksChanged func()
 
 	passthrough bool // if true (Simulcast mode), forward all packets, switch immediately
 
@@ -62,6 +63,13 @@ func NewTrackSelector(log logger.Writer, onSwitched func(from, to int)) *TrackSe
 		onSwitched: onSwitched,
 		log:        log,
 	}
+}
+
+// SetOnTracksChanged registers a callback for updates to track metadata.
+func (ts *TrackSelector) SetOnTracksChanged(cb func()) {
+	ts.mu.Lock()
+	ts.onTracksChanged = cb
+	ts.mu.Unlock()
 }
 
 const pendingTimeout = 5 * time.Second
@@ -169,32 +177,102 @@ func (ts *TrackSelector) GetTracks() []TrackInfo {
 	return result
 }
 
+// obsCanvasSizeFromLayer inverts the proportional-scaling formula OBS's WHIP
+// Simulcast encoder uses (WHIPSimulcastEncoders::Create in the OBS repo) to
+// estimate the source canvas size from one layer's real observed dimensions.
+// Layer index 0 (rid "0") is always the canvas itself, unscaled; layer index
+// k (1..layerCount-1) is scaled by (layerCount-k)/layerCount, floored to an
+// even pixel count on the OBS side - inverting that flooring exactly isn't
+// possible from the output size alone, but layerIndex*layerCount/mult is
+// the best integer estimate available, off by at most a couple of pixels.
+func obsCanvasSizeFromLayer(layerIndex, layerCount, w, h int) (canvasW, canvasH int) {
+	if layerIndex <= 0 || layerCount <= 1 {
+		return w, h
+	}
+	mult := layerCount - layerIndex
+	if mult <= 0 {
+		return w, h
+	}
+	return w * layerCount / mult, h * layerCount / mult
+}
+
+// obsSimulcastLayerSize computes layer layerIndex's expected width/height
+// given an estimated canvas size, replicating OBS's own formula so
+// not-yet-resolved layers can display an accurate size ahead of decoding
+// their own SPS (which only happens once ABR actually selects them).
+func obsSimulcastLayerSize(layerIndex, layerCount, canvasW, canvasH int) (w, h int) {
+	if layerIndex <= 0 || layerCount <= 1 {
+		return canvasW, canvasH
+	}
+	mult := layerCount - layerIndex
+	w = (canvasW / layerCount) * mult
+	w -= w % 2
+	h = (canvasH / layerCount) * mult
+	h -= h % 2
+	return w, h
+}
+
 // SetTrackDimensions replaces a video track's layerDefaults-guessed
 // width/height/label with the real values, decoded from the publisher's own
-// SPS once its first keyframe arrives (see from_stream.go). No-op once the
-// track's dimensions have already been resolved once, and on invalid input.
+// SPS once its first keyframe arrives (see from_stream.go). Also backfills
+// every other video layer that hasn't resolved its own SPS yet with an
+// estimated size derived from OBS's proportional simulcast scaling formula
+// (see obsCanvasSizeFromLayer/obsSimulcastLayerSize) - without this, a
+// layer ABR never actually selects (typically the middle layer(s) of a 3+
+// layer ladder) would keep displaying its layerDefaults guess forever,
+// which uses fixed absolute resolutions unrelated to the publisher's real
+// canvas size and layer count (e.g. mislabeling two different real
+// resolutions as the same "720p" for a 1280x720/3-layer stream). No-op on
+// invalid input.
 func (ts *TrackSelector) SetTrackDimensions(trackID, width, height int) {
 	if width <= 0 || height <= 0 {
 		return
 	}
 
 	ts.mu.Lock()
-	defer ts.mu.Unlock()
 
+	var target *TrackInfo
+	layerCount := 0
 	for _, t := range ts.tracks {
-		if t.ID != trackID || t.Type != "video" || t.dimsResolved {
+		if t.Type != "video" {
 			continue
 		}
-
-		t.Width = width
-		t.Height = height
-		// the quality figure ("720p") is conventionally the shorter side,
-		// so portrait streams get the same label a landscape stream at the
-		// equivalent quality would.
-		qualityDim := min(width, height)
-		t.Label = fmt.Sprintf("%dp %s", qualityDim, t.Codec)
-		t.dimsResolved = true
+		layerCount++
+		if t.ID == trackID {
+			target = t
+		}
+	}
+	if target == nil || target.dimsResolved {
+		ts.mu.Unlock()
 		return
+	}
+
+	target.Width = width
+	target.Height = height
+	// the quality figure ("720p") is conventionally the shorter side,
+	// so portrait streams get the same label a landscape stream at the
+	// equivalent quality would.
+	target.Label = fmt.Sprintf("%dp %s", min(width, height), target.Codec)
+	target.dimsResolved = true
+
+	canvasW, canvasH := obsCanvasSizeFromLayer(trackID, layerCount, width, height)
+	for _, t := range ts.tracks {
+		if t.Type != "video" || t.ID == trackID || t.dimsResolved {
+			continue
+		}
+		w, h := obsSimulcastLayerSize(t.ID, layerCount, canvasW, canvasH)
+		if w <= 0 || h <= 0 {
+			continue
+		}
+		t.Width = w
+		t.Height = h
+		t.Label = fmt.Sprintf("%dp %s", min(w, h), t.Codec)
+	}
+
+	cb := ts.onTracksChanged
+	ts.mu.Unlock()
+	if cb != nil {
+		cb()
 	}
 }
 

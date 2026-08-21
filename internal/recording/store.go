@@ -6,9 +6,29 @@ import (
 	"time"
 
 	_ "modernc.org/sqlite"
+	_ "time/tzdata" // embed the IANA database so LoadLocation works even without an OS tzdata package
 )
 
 const maxRecords = 8000
+
+// shanghaiLocation is the timezone every timestamp written to the
+// recordings database is expressed in, independent of the host's own
+// system timezone (dev machines, bare VPS installs, and minimal container
+// images may all differ or default to UTC) - the audit trail must read the
+// same way no matter which host wrote a given row.
+var shanghaiLocation = func() *time.Location {
+	loc, err := time.LoadLocation("Asia/Shanghai")
+	if err != nil {
+		return time.FixedZone("CST", 8*60*60)
+	}
+	return loc
+}()
+
+// now returns the current time in shanghaiLocation, for any timestamp that
+// ends up persisted to (or compared against) the recordings database.
+func now() time.Time {
+	return time.Now().In(shanghaiLocation)
+}
 
 // Record is one entry in the recording database.
 type Record struct {
@@ -17,6 +37,12 @@ type Record struct {
 	Table     string    `json:"table"`
 	GC        string    `json:"gc"`
 	Game      string    `json:"game"`
+	// AppEnv is the split-rec request's optional "app_env" field (see
+	// ownerKey in split.go), persisted here purely for audit/traceability -
+	// a deployment serving multiple game environments from one process can
+	// tell which environment produced a given row. Empty for callers that
+	// don't send app_env.
+	AppEnv    string    `json:"appEnv,omitempty"`
 	Format    string    `json:"format"`
 	Status    string    `json:"status"` // running | completed | error
 	StartedAt time.Time `json:"startedAt"`
@@ -69,7 +95,28 @@ func (s *Store) migrate() error {
 		CREATE INDEX IF NOT EXISTS idx_rec_status ON recordings(status);
 		CREATE INDEX IF NOT EXISTS idx_rec_started ON recordings(started_at);
 	`)
-	return err
+	if err != nil {
+		return err
+	}
+
+	// app_env was added after recordings first shipped; existing databases
+	// need this column backfilled. SQLite has no "ADD COLUMN IF NOT
+	// EXISTS", so check pragma_table_info first - re-running ADD COLUMN on
+	// a column that already exists is an error, not a no-op.
+	var hasAppEnv bool
+	row := s.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('recordings') WHERE name = 'app_env'`)
+	var count int
+	if err := row.Scan(&count); err != nil {
+		return fmt.Errorf("check app_env column: %w", err)
+	}
+	hasAppEnv = count > 0
+	if !hasAppEnv {
+		if _, err := s.db.Exec(`ALTER TABLE recordings ADD COLUMN app_env TEXT DEFAULT ''`); err != nil {
+			return fmt.Errorf("add app_env column: %w", err)
+		}
+	}
+
+	return nil
 }
 
 func (s *Store) Close() error {
@@ -78,7 +125,7 @@ func (s *Store) Close() error {
 
 // RecoverInterrupted marks recordings left running by a previous process as failed.
 func (s *Store) RecoverInterrupted() error {
-	_, err := s.db.Exec("UPDATE recordings SET status='error', stopped_at=? WHERE status='running'", time.Now().Format(time.RFC3339))
+	_, err := s.db.Exec("UPDATE recordings SET status='error', stopped_at=? WHERE status='running'", now().Format(time.RFC3339))
 	return err
 }
 
@@ -93,9 +140,9 @@ func (s *Store) Insert(r Record) error {
 
 	_, err = tx.Exec(`
 		INSERT OR REPLACE INTO recordings
-			(id, path, table_name, gc, game, format, status, started_at, stopped_at, duration, file_size, file_path)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		r.ID, r.Path, r.Table, r.GC, r.Game, r.Format, r.Status,
+			(id, path, table_name, gc, game, app_env, format, status, started_at, stopped_at, duration, file_size, file_path)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		r.ID, r.Path, r.Table, r.GC, r.Game, r.AppEnv, r.Format, r.Status,
 		r.StartedAt.Format(time.RFC3339),
 		nullTime(&r.StoppedAt),
 		r.Duration, r.FileSize, r.FilePath)
@@ -130,7 +177,7 @@ func (s *Store) Update(id string, status string, fileSize int64, duration int64)
 	_, err := s.db.Exec(`
 		UPDATE recordings SET status=?, stopped_at=?, file_size=?, duration=?
 		WHERE id=?`,
-		status, time.Now().Format(time.RFC3339), fileSize, duration, id)
+		status, now().Format(time.RFC3339), fileSize, duration, id)
 	return err
 }
 
@@ -141,19 +188,19 @@ func (s *Store) CompleteRound(id, gc, filePath string, fileSize, duration int64)
 	_, err := s.db.Exec(`
 		UPDATE recordings SET status='completed', stopped_at=?, gc=?, file_path=?, file_size=?, duration=?
 		WHERE id=?`,
-		time.Now().Format(time.RFC3339), gc, filePath, fileSize, duration, id)
+		now().Format(time.RFC3339), gc, filePath, fileSize, duration, id)
 	return err
 }
 
 // Get returns a single record by ID.
 func (s *Store) Get(id string) (*Record, error) {
-	row := s.db.QueryRow("SELECT id,path,table_name,gc,game,format,status,started_at,stopped_at,duration,file_size,file_path FROM recordings WHERE id=?", id)
+	row := s.db.QueryRow("SELECT id,path,table_name,gc,game,app_env,format,status,started_at,stopped_at,duration,file_size,file_path FROM recordings WHERE id=?", id)
 	return scanRecord(row)
 }
 
 // FindRunning returns the running recording for a path (if any).
 func (s *Store) FindRunning(path string) (*Record, error) {
-	row := s.db.QueryRow("SELECT id,path,table_name,gc,game,format,status,started_at,stopped_at,duration,file_size,file_path FROM recordings WHERE path=? AND status='running'", path)
+	row := s.db.QueryRow("SELECT id,path,table_name,gc,game,app_env,format,status,started_at,stopped_at,duration,file_size,file_path FROM recordings WHERE path=? AND status='running'", path)
 	return scanRecord(row)
 }
 
@@ -180,7 +227,7 @@ func (s *Store) List(path, status string, limit, offset int) ([]Record, int, err
 		return nil, 0, err
 	}
 
-	querySQL := "SELECT id,path,table_name,gc,game,format,status,started_at,stopped_at,duration,file_size,file_path FROM recordings " + where + " ORDER BY started_at DESC"
+	querySQL := "SELECT id,path,table_name,gc,game,app_env,format,status,started_at,stopped_at,duration,file_size,file_path FROM recordings " + where + " ORDER BY started_at DESC"
 	if limit > 0 {
 		querySQL += " LIMIT ?"
 		args = append(args, limit)
@@ -225,7 +272,7 @@ func scanRecord(scanner interface {
 }) (*Record, error) {
 	var r Record
 	var started, stopped sql.NullString
-	err := scanner.Scan(&r.ID, &r.Path, &r.Table, &r.GC, &r.Game,
+	err := scanner.Scan(&r.ID, &r.Path, &r.Table, &r.GC, &r.Game, &r.AppEnv,
 		&r.Format, &r.Status, &started, &stopped,
 		&r.Duration, &r.FileSize, &r.FilePath)
 	if err != nil {
@@ -234,7 +281,11 @@ func scanRecord(scanner interface {
 		}
 		return nil, err
 	}
-	r.StartedAt, _ = time.Parse(time.RFC3339, started.String)
-	r.StoppedAt, _ = time.Parse(time.RFC3339, stopped.String)
+	if t, err := time.Parse(time.RFC3339, started.String); err == nil {
+		r.StartedAt = t.In(shanghaiLocation)
+	}
+	if t, err := time.Parse(time.RFC3339, stopped.String); err == nil {
+		r.StoppedAt = t.In(shanghaiLocation)
+	}
 	return &r, nil
 }

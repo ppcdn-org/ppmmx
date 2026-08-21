@@ -240,6 +240,24 @@ type Path struct {
 	ForwardTencent          bool   `json:"forwardTencent"`
 	ForwardTencentStreamKey string `json:"forwardTencentStreamKey"` // defaults to the path name if empty
 
+	// Forward (mmx-to-mmx WHIP relay). Requires the account-level
+	// forwardMmxEnable switch (see Conf.ForwardMmxEnable) in addition to
+	// this per-path flag - same two-level pattern as forwardTencent.
+	// ForwardMmxURL is the target node's WHIP publish endpoint, either
+	// fixed (e.g. "http://mmx2-host:8889/live/table-view/whip") or a
+	// template containing the literal "{path}" placeholder (e.g.
+	// "http://mmx2-host:8889/{path}/whip"), substituted with this path's
+	// own name at (re)connect time - needed when this config is on a
+	// regexp/"all" path matching many different stream names, so each one
+	// forwards under its own name instead of colliding on one fixed
+	// target. ForwardMmxToken is sent as the WHIP publish Bearer token, so
+	// it must be the *target* node's own WHIP_WS_SECRET (see
+	// internal/servers/webrtc/http_server.go checkWHIPDeviceID) - not this
+	// node's.
+	ForwardMmx      bool   `json:"forwardMmx"`
+	ForwardMmxURL   string `json:"forwardMmxURL"`
+	ForwardMmxToken string `json:"forwardMmxToken"`
+
 	// Authentication (deprecated)
 	PublishUser *Credential `json:"publishUser,omitempty" deprecated:"true"`
 	PublishPass *Credential `json:"publishPass,omitempty" deprecated:"true"`
@@ -452,6 +470,37 @@ func (pconf *Path) validate(
 
 	if pconf.Source != "redirect" && pconf.SourceRedirect != "" {
 		return fmt.Errorf("'sourceRedirect' is useless when source is not 'redirect'")
+	}
+
+	// ingestThreadEnable and forwardTencent are mutually exclusive: ingest
+	// pulls a stream that (for cdnName "tencent") already lives on Tencent's
+	// CDN back down and republishes it locally, so forwarding it back to
+	// Tencent would just loop it back to where it came from (see
+	// docs/cdn-ingest-thread.md). Force it off rather than reject the config
+	// outright.
+	if conf.IngestThreadEnable && pconf.ForwardTencent {
+		l.Log(logger.Warn, "path '%s': 'forwardTencent' is disabled because 'ingestThreadEnable' is true", name)
+		pconf.ForwardTencent = false
+	}
+
+	// Same loop-avoidance reasoning as forwardTencent above applies to
+	// forwardMmx: a path fed by ingestThreadEnable shouldn't be forwarded
+	// back out.
+	if conf.IngestThreadEnable && pconf.ForwardMmx {
+		l.Log(logger.Warn, "path '%s': 'forwardMmx' is disabled because 'ingestThreadEnable' is true", name)
+		pconf.ForwardMmx = false
+	}
+
+	if pconf.ForwardMmx {
+		if !conf.ForwardMmxEnable {
+			return fmt.Errorf("path '%s': 'forwardMmx' requires the account-level 'forwardMmxEnable' to be true", name)
+		}
+		if pconf.ForwardMmxURL == "" {
+			return fmt.Errorf("path '%s': 'forwardMmxURL' must be set when forwardMmx is true", name)
+		}
+		if pconf.ForwardMmxToken == "" {
+			return fmt.Errorf("path '%s': 'forwardMmxToken' must be set when forwardMmx is true", name)
+		}
 	}
 
 	// General

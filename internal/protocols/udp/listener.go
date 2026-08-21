@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/bluenviron/gortsplib/v5/pkg/multicast"
-	"github.com/bluenviron/gortsplib/v5/pkg/readbuffer"
+	"github.com/bluenviron/mediamtx/internal/protocols/udpreadbuffer"
 	"github.com/bluenviron/mediamtx/internal/restrictnetwork"
 )
 
@@ -63,6 +63,11 @@ type Listener struct {
 	IntfName          string
 	UDPReadBufferSize int
 	ListenPacket      func(network, address string) (net.PacketConn, error)
+	// OnReadBufferWarn, if set, is called instead of failing Initialize()
+	// when the OS refuses the requested UDP read buffer size (e.g. because
+	// net.core.rmem_max is lower than UDPReadBufferSize). The socket keeps
+	// running with whatever buffer size the OS assigned.
+	OnReadBufferWarn func(format string, args ...any)
 
 	pc       packetConn
 	sourceIP net.IP
@@ -115,10 +120,9 @@ func (l *Listener) Initialize() error {
 	}
 
 	if l.UDPReadBufferSize != 0 {
-		err = readbuffer.SetReadBuffer(l.pc, l.UDPReadBufferSize)
-		if err != nil {
-			l.pc.Close()
-			return err
+		outcome := udpreadbuffer.Set(l.pc, l.UDPReadBufferSize)
+		if !outcome.OK() && l.OnReadBufferWarn != nil {
+			l.OnReadBufferWarn("%s", outcome.Describe())
 		}
 	}
 

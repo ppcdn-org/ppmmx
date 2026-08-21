@@ -24,7 +24,7 @@
   BANDWIDTH_TEST_URLS: [
     'NIOES8001.jpeg'
   ],
-  DEFAULT_FALLBACK_STREAM: '3drush-fwh_audio'
+  DEFAULT_FALLBACK_STREAM: 'table1-fwh_audio'
 };
 
 const UPGRADE_THRESHOLDS_KBPS = {
@@ -44,7 +44,7 @@ const QUALITY_ORDER = ['bottom', 'economic', 'standard', 'high'];
 
 console.log(`[ABR] script loaded: ${CONFIG.SCRIPT_VERSION}`);
 
-let currentSiteName = '3drush-fwv';
+let currentSiteName = 'table1-fwv';
 let STREAM_LADDER = buildStreamLadder(currentSiteName);
 
 function buildStreamLadder(siteName) {
@@ -82,12 +82,14 @@ function getAudioOnlyPlaybackStreamName(logicalStreamName) {
     return economic || logicalStreamName;
 }
 
+// streamName is already the real Tencent stream key (see
+// internal/forward/layers.go's layerSuffixes: ""/"_standard"/"_economic"/
+// "_lite" for high/standard/economic/bottom-adjacent layers respectively),
+// so no further suffix rewriting is needed here - just resolve the
+// audio-only alias to its real backing stream.
 function getPlaybackStreamForRequest(streamName) {
     if (isAudioOnlyStream(streamName, '')) return getAudioOnlyPlaybackStreamName(streamName);
-    const profile = getStreamProfile(streamName);
-    if (!profile || streamName.endsWith('_q0') || streamName.endsWith('_q1') || streamName.endsWith('_q2')) return streamName;
-    const layer = { high: 'q0', standard: 'q1', economic: 'q2' }[profile.key];
-    return layer ? `${streamName.replace(/_(high|standard|economic)$/, '')}_${layer}` : streamName;
+    return streamName;
 }
 
 let tcplayer = null;

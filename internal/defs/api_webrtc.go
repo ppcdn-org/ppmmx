@@ -44,6 +44,12 @@ type APIWebRTCSession struct {
 	OutboundRTPPackets        uint64                `json:"outboundRTPPackets"`
 	OutboundRTCPPackets       uint64                `json:"outboundRTCPPackets"`
 	OutboundFramesDiscarded   uint64                `json:"outboundFramesDiscarded"`
+	// OBSTimestampLatencyMs is the end-to-end publish latency (ms) computed
+	// from the most recent "obs-timestamp" WebRTC DataChannel message (see
+	// docs/obs-abs-timestamp-protocol.md in the OBS repo). Only populated
+	// for publish sessions from a patched OBS build that implements the
+	// protocol; nil otherwise.
+	OBSTimestampLatencyMs *float64 `json:"obsTimestampLatencyMs"`
 	// deprecated
 	BytesReceived       uint64  `json:"bytesReceived" deprecated:"true"`
 	BytesSent           uint64  `json:"bytesSent" deprecated:"true"`

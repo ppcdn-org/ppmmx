@@ -27,6 +27,14 @@ import (
 // ErrPathNotFound is returned when a path is not found.
 var ErrPathNotFound = errors.New("path not found")
 
+// DefaultWHIPWSSecret is a placeholder value used only by tests that need
+// some fixed string and don't care about its content. There is no insecure
+// built-in fallback for the real WHIP_WS_SECRET: Validate() requires it to
+// be set explicitly whenever webrtcDegradeEnable is true (see
+// docs/obs-mmx-degrade-protocol.md) - it must match whatever the OBS-side
+// executor is configured with.
+const DefaultWHIPWSSecret = "test-only-placeholder-not-a-real-secret"
+
 func sortedKeys(paths map[string]*OptionalPath) []string {
 	ret := make([]string, len(paths))
 	i := 0
@@ -398,6 +406,27 @@ type Conf struct {
 	SplitRecAuthSecret      string `json:"-"`
 	TXSecretKeyBack         string `json:"-"`
 
+	// WHIP degrade (OBS <-> mmx RTP-loss negotiation, see
+	// docs/obs-mmx-degrade-protocol.md): degrades simulcast layers then
+	// bitrate on sustained RTP loss, pushed to a per-path WS the OBS-side
+	// executor connects to at "/{path}" + WebRTCDegradeWSPathSuffix.
+	WebRTCDegradeEnable         bool    `json:"webrtcDegradeEnable"`
+	WebRTCDegradeWSPathSuffix   string  `json:"webrtcDegradeWSPathSuffix"`
+	WebRTCDegradeInstantLossPct float64 `json:"webrtcDegradeInstantLossPct"`
+	WebRTCDegradeAvgLossPct     float64 `json:"webrtcDegradeAvgLossPct"`
+	WebRTCDegradeObservationSec int     `json:"webrtcDegradeObservationSec"`
+	WebRTCDegradeWSSecret       string  `json:"-"`
+
+	// CDN ingest (pull external CDN sources, re-publish them locally over
+	// RTMP loopback so they're recorded/distributed like any other
+	// publisher). Defaults to false (see setDefaults) - opt in per
+	// deployment. Mutually exclusive with a path's forwardTencent (see
+	// Path.validate in path.go): enabling this forces forwardTencent off,
+	// since ingest would otherwise loop a Tencent-sourced stream straight
+	// back to Tencent.
+	IngestThreadEnable bool     `json:"ingestThreadEnable"`
+	IngestSources      []string `json:"ingestSources"`
+
 	// Net storage (recording upload): NetStorageEnv "prod" selects S3,
 	// anything else selects MinIO. Credentials come from bin/.env. There is
 	// no separate MinIO bucket setting: it's always the lowercased env name.
@@ -426,9 +455,37 @@ type Conf struct {
 	TencentWHIPSecretKey string `json:"tencentWHIPSecretKey"`
 	TencentWHIPTokenDays int    `json:"tencentWHIPTokenDays"`
 
+	// Forward (mmx-to-mmx WHIP relay): account-level total switch, mirroring
+	// TencentWHIPEnable above. The target URL/auth token are per-path (see
+	// Path.ForwardMmxURL/ForwardMmxToken) since each path can forward to a
+	// different downstream mmx node.
+	ForwardMmxEnable bool `json:"forwardMmxEnable"`
+
+	// Record cleaner: RecordMinFreeSpace is a floor on free disk space on
+	// the filesystem holding recordings, checked on every cleaner run
+	// alongside the existing per-path recordDeleteAfter age-based
+	// deletion. If free space is still below this after the age-based
+	// pass, the cleaner force-deletes the globally oldest recording
+	// segments (across all paths, oldest first) until back above it.
+	// This is a safety net for recordDeleteAfter windows too long (or
+	// bitrate too high) for the available disk - see
+	// docs/recorder-api.md for the incident this was added for (a 48G
+	// disk filling up well within the 24h recordDeleteAfter window).
+	//
+	// Never deletes a segment younger than 10 minutes, nor a path's
+	// single most recent segment (which may still be open/actively
+	// written to) - see recordcleaner.minFreeSpaceProtectedAge. Free
+	// space can stay below this floor if that's what it takes to avoid
+	// touching an in-progress recording.
+	RecordMinFreeSpace StringSize `json:"recordMinFreeSpace"`
+
 	// Admin web UI (integrated)
 	AdminAddress string `json:"adminAddress"`
 	AdminName    string `json:"adminName"`
+	// PlaySignatureTTL controls how long a signed /api/playUri (and
+	// /api/play(Tx)?Url) URL stays valid before its txTime/txSecret expire.
+	// Zero/unset defaults to 1h (see setDefaults).
+	PlaySignatureTTL Duration `json:"playSignatureTTL"`
 
 	// PPCDN control plane
 	MMXControl               bool     `json:"mmxControl"`
@@ -444,9 +501,9 @@ type Conf struct {
 	MMXABRNegotiationAddress string   `json:"mmxABRNegotiationAddress"`
 
 	// PPCDN recording sync (optional, only for origin nodes)
-	MMXRecordingSyncEnabled     bool     `json:"mmxRecordingSyncEnabled"`
-	MMXRecordingSyncURL         string   `json:"mmxRecordingSyncURL"`
-	MMXRecordingSyncBearerToken string   `json:"mmxRecordingSyncBearerToken"`
+	MMXRecordingSyncEnabled      bool     `json:"mmxRecordingSyncEnabled"`
+	MMXRecordingSyncURL          string   `json:"mmxRecordingSyncURL"`
+	MMXRecordingSyncBearerToken  string   `json:"mmxRecordingSyncBearerToken"`
 	MMXRecordingSyncPollInterval Duration `json:"mmxRecordingSyncPollInterval"`
 
 	WebRTCICEUDPMuxAddress  *string   `json:"webrtcICEUDPMuxAddress,omitempty" deprecated:"true"`
@@ -596,6 +653,18 @@ func (conf *Conf) setDefaults() {
 	conf.WebRTCABRWSPath = "/ws/control"
 	conf.WebRTCABRSwitchCooldown = 3000
 	conf.SplitRecAuthMode = "simple"
+	conf.WebRTCDegradeEnable = false
+	conf.WebRTCDegradeWSPathSuffix = "/ws/whip"
+	conf.WebRTCDegradeInstantLossPct = 5.0
+	conf.WebRTCDegradeAvgLossPct = 1.0
+	conf.WebRTCDegradeObservationSec = 60
+	// Default ingest source: pull mmx's own Tencent-forwarded backup domain
+	// back down and republish it locally. "tencent:" gets txSecret/txTime
+	// signed with TX_SECRET_KEY_BACK (see internal/ingest); other prefixes
+	// are pulled as-is. ingestThreadEnable defaults to false; opt in per
+	// yml with ingestThreadEnable: true.
+	conf.IngestThreadEnable = false
+	conf.IngestSources = []string{"tencent:rtmp://play.example.com/live/table1-fwh"}
 	conf.TencentWHIPEnable = false
 	// kept as a literal here (not internal/forward.DefaultTencentEndpoint) to
 	// avoid an import cycle: internal/forward depends on
@@ -605,7 +674,10 @@ func (conf *Conf) setDefaults() {
 	conf.TencentWHIPEndpoint = "webrtc://{domain}/{app}/{streamKey}" +
 		"?txSecret={txSecret}&txTime={txTime}"
 	conf.TencentWHIPTokenDays = 30
+	conf.ForwardMmxEnable = false
+	conf.RecordMinFreeSpace = 8 * 1024 * 1024 * 1024 // 8G
 	conf.AdminAddress = ":8080"
+	conf.PlaySignatureTTL = Duration(time.Hour)
 
 	// SRT server
 	conf.SRT = true
@@ -642,37 +714,37 @@ func Load(fpath string, defaultConfPaths []string, l logger.Writer) (*Conf, stri
 	if err != nil {
 		return nil, "", err
 	}
-	conf.TencentWHIPSecretKey = dotenvValue("TX_SecretKey")
-	conf.SplitRecAuthSecret = dotenvValue("SPLIT_REC_SECRET")
-	conf.TXSecretKeyBack = dotenvValue("TX_SecretKey_Back")
+	conf.TencentWHIPSecretKey = DotenvValue("TX_SECRET_KEY")
+	conf.SplitRecAuthSecret = DotenvValue("SPLIT_REC_SECRET")
+	conf.TXSecretKeyBack = DotenvValue("TX_SECRET_KEY_BACK")
+	conf.WebRTCDegradeWSSecret = DotenvValue("WHIP_WS_SECRET")
 	// bin/.env keys: "prod" selects S3, anything else selects MinIO.
-	conf.NetStorageEnv = dotenvValue("APP_ENV")
-	conf.NetStorageS3Bucket = dotenvValue("S3_BUCKET")
-	conf.NetStorageS3Region = dotenvValue("S3_REGION")
-	conf.NetStorageS3AccessKey = dotenvValue("S3_ACCESS_ID")
-	conf.NetStorageS3SecretKey = dotenvValue("S3_ACCESS_PASS")
-	conf.NetStorageS3Domain = dotenvValue("S3_HTTPS_DOMAIN")
+	conf.NetStorageEnv = DotenvValue("APP_ENV")
+	conf.NetStorageS3Bucket = DotenvValue("S3_BUCKET")
+	conf.NetStorageS3Region = DotenvValue("S3_REGION")
+	conf.NetStorageS3AccessKey = DotenvValue("S3_ACCESS_ID")
+	conf.NetStorageS3SecretKey = DotenvValue("S3_ACCESS_PASS")
+	conf.NetStorageS3Domain = DotenvValue("S3_HTTPS_DOMAIN")
 	// Nacos (optional): if BOOTSTRAP_JASYPT_ENCRYPTOR_PASSWORD is set, fetch
 	// MinIO settings from Nacos first; the MINIO_* env vars below still
 	// override on top when set, same precedence as the previous Go service.
 	applyNacosMinioConfig(conf, l)
-
-	if v := dotenvValue("MINIO_EP"); v != "" {
+	if v := DotenvValue("MINIO_EP"); v != "" {
 		conf.NetStorageMinioEndpoint = v
 	}
-	if v := dotenvValue("MINIO_AK"); v != "" {
+	if v := DotenvValue("MINIO_AK"); v != "" {
 		conf.NetStorageMinioAccessKey = v
 	}
-	if v := dotenvValue("MINIO_SK"); v != "" {
+	if v := DotenvValue("MINIO_SK"); v != "" {
 		conf.NetStorageMinioSecretKey = v
 	}
-	if v := dotenvValue("MINIO_USESSL"); v != "" {
+	if v := DotenvValue("MINIO_USESSL"); v != "" {
 		conf.NetStorageMinioUseSSL = v
 	}
-	if v := dotenvValue("MINIO_URL"); v != "" {
+	if v := DotenvValue("MINIO_URL"); v != "" {
 		conf.NetStorageMinioDomain = v
 	}
-	if v, err := strconv.Atoi(dotenvValue("PLAY_URI_RATE_LIMIT")); err == nil {
+	if v, err := strconv.Atoi(DotenvValue("PLAY_URI_RATE_LIMIT")); err == nil {
 		conf.PlayURIRateLimit = v
 	}
 
@@ -1146,9 +1218,13 @@ func (conf *Conf) Validate(l logger.Writer) error {
 				" 'webrtcLocalTCPAddress' or 'webrtcICEServers2' must be filled")
 		}
 
+		// webrtcAdditionalHosts empty with webrtcIPsFromInterfaces explicitly
+		// false is a redundant/contradictory combination (there'd be no way
+		// to discover any host candidate at all); silently fall back to
+		// discovering IPs from interfaces instead of refusing to start.
 		if conf.WebRTCLocalUDPAddress != "" || conf.WebRTCLocalTCPAddress != "" {
 			if !conf.WebRTCIPsFromInterfaces && len(conf.WebRTCAdditionalHosts) == 0 {
-				return fmt.Errorf("at least one between 'webrtcIPsFromInterfaces' or 'webrtcAdditionalHosts' must be filled")
+				conf.WebRTCIPsFromInterfaces = true
 			}
 		}
 	}
@@ -1159,6 +1235,10 @@ func (conf *Conf) Validate(l logger.Writer) error {
 	}
 	if conf.SplitRecAuthMode == "advance" && conf.SplitRecAuthSecret == "" {
 		return fmt.Errorf("SPLIT_REC_SECRET must be set when splitRecAuthMode is advance")
+	}
+
+	if conf.WebRTCDegradeEnable && conf.WebRTCDegradeWSSecret == "" {
+		return fmt.Errorf("WHIP_WS_SECRET must be set when webrtcDegradeEnable is true")
 	}
 
 	if conf.MMXControl {

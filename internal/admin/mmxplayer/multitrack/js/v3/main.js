@@ -15,8 +15,8 @@ const PREVIEW_GRID_CONNECTING_NOTICE_MS = 12000;
 const PREVIEW_GRID_HARD_TIMEOUT_MS = 45000;
 
 const SITE_OPTIONS = [
-  { value: 'studio_3drush' },
-  { value: 'studio_gsp2w' }
+  { value: 'studio_table1' },
+  { value: 'studio_table2' }
 ];
 
 const VIEW_OPTIONS = [
@@ -25,15 +25,15 @@ const VIEW_OPTIONS = [
 ];
 
 const DEFAULT_VIEW_BY_SITE = {
-  studio_3drush: 'fwh',
-  studio_gsp2w: 'fwv'
+  studio_table1: 'fwh',
+  studio_table2: 'fwv'
 };
 
 const SITE_BY_STREAM = {
-  '3drush-fwh': 'studio_3drush',
-  '3drush-fwv': 'studio_3drush',
-  'gsp2w-fwv': 'studio_gsp2w',
-  'gsp2w-fwh': 'studio_gsp2w',
+  'table1-fwh': 'studio_table1',
+  'table1-fwv': 'studio_table1',
+  'table2-fwv': 'studio_table2',
+  'table2-fwh': 'studio_table2',
 };
 
 const QUALITY_LEVELS = [
@@ -47,9 +47,9 @@ const QUALITY_LEVELS = [
 function normalizeSiteName(siteName) {
   const value = (siteName || '').trim();
   if (SITE_OPTIONS.some(site => site.value === value)) return value;
-  if (value === 'studio_gwp2w' || value === 'gwp2w') return 'studio_gsp2w';
+  if (value === 'studio_table2' || value === 'table2') return 'studio_table2';
   if (SITE_BY_STREAM[value]) return SITE_BY_STREAM[value];
-  // Handle stream variant names like "gsp2w-fwv_standard"
+  // Handle stream variant names like "table2-fwv_standard"
   for (const [stream, site] of Object.entries(SITE_BY_STREAM)) {
     if (value.startsWith(stream + '_')) return site;
   }
@@ -80,7 +80,7 @@ function streamBaseNameForSiteView(siteName, viewName) {
 
 function legacyStreamName(streamName) {
   const value = (streamName || '').trim();
-  const match = value.match(/^(3drush|gsp2w)_(fwh|fwv)(.*)$/);
+  const match = value.match(/^(table1|table2)_(fwh|fwv)(.*)$/);
   if (!match) return value;
   return `${match[1]}-${match[2]}${match[3]}`;
 }
@@ -225,10 +225,7 @@ function selectedQualityLevel() {
 function streamForQualityLevel(quality) {
   quality = normalizeQualityChoice(quality);
   if (quality === 'auto') return null;
-  if (quality === 'bottom') return getPreferredStreamForQuality('bottom') || CONFIG.DEFAULT_FALLBACK_STREAM;
-  const base = streamNamesFromSelection(pageSiteName, pageViewName).high;
-  const layer = { high: 'q0', standard: 'q1', economic: 'q2' }[quality];
-  return layer ? `${base}_${layer}` : base;
+  return getPreferredStreamForQuality(quality) || CONFIG.DEFAULT_FALLBACK_STREAM;
 }
 
 function previewGridStreamForQuality(quality) {

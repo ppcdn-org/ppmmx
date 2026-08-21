@@ -143,6 +143,78 @@ func TestTrackSelectorRejectInvalidTrack(t *testing.T) {
 	require.Error(t, err)
 }
 
+func TestTrackSelectorDimensionUpdateCallback(t *testing.T) {
+	sel := NewTrackSelector(nil, nil)
+	require.NoError(t, sel.LoadFromDescription(makeSimulcastDesc()))
+	updates := 0
+	sel.SetOnTracksChanged(func() { updates++ })
+
+	sel.SetTrackDimensions(0, 960, 540)
+	require.Equal(t, 1, updates)
+	require.Equal(t, 960, sel.GetTracks()[0].Width)
+	require.Equal(t, 540, sel.GetTracks()[0].Height)
+	require.Equal(t, "540p h264", sel.GetTracks()[0].Label)
+
+	sel.SetTrackDimensions(0, 1280, 720)
+	require.Equal(t, 1, updates)
+}
+
+// Reproduces the real-world bug: a 1280x720 publisher with 3 simulcast
+// layers (rid "0" = canvas 1280x720, rid "1" = 852x480 per OBS's own
+// widthStep*mult formula, rid "2" = 426x240) got mislabeled as "720P,
+// 720P, 360P" instead of "720P, 480P, 240P" because layerDefaults guesses
+// fixed absolute resolutions unrelated to the real canvas size, and only
+// the layer ABR actually selects gets its guess replaced by a real SPS.
+func TestTrackSelectorDimensionBackfillsUnresolvedLayers(t *testing.T) {
+	desc := makeSimulcastDesc()
+	sel := NewTrackSelector(nil, nil)
+	require.NoError(t, sel.LoadFromDescription(desc))
+
+	// Only rid "0" (trackID 0) ever gets a real SPS - the other two
+	// layers are never selected by ABR in this scenario.
+	sel.SetTrackDimensions(0, 1280, 720)
+
+	tracks := sel.GetTracks()
+	require.Equal(t, 1280, tracks[0].Width)
+	require.Equal(t, 720, tracks[0].Height)
+	require.Equal(t, "720p h264", tracks[0].Label)
+
+	// backfilled from OBS's proportional scaling formula, not the
+	// fixed layerDefaults guess (which would say 1280x720 for index 1)
+	require.Equal(t, 852, tracks[1].Width)
+	require.Equal(t, 480, tracks[1].Height)
+	require.Equal(t, "480p h264", tracks[1].Label)
+
+	require.Equal(t, 426, tracks[2].Width)
+	require.Equal(t, 240, tracks[2].Height)
+	require.Equal(t, "240p h264", tracks[2].Label)
+}
+
+// A layer that later resolves its own real SPS must keep that value, not
+// get clobbered by a backfill estimate computed from a different layer.
+func TestTrackSelectorDimensionOwnSPSNotOverwrittenByBackfill(t *testing.T) {
+	desc := makeSimulcastDesc()
+	sel := NewTrackSelector(nil, nil)
+	require.NoError(t, sel.LoadFromDescription(desc))
+
+	sel.SetTrackDimensions(0, 1280, 720)
+	require.Equal(t, 852, sel.GetTracks()[1].Width) // backfilled estimate
+
+	// rid "1" is later actually selected and its own SPS is decoded -
+	// suppose the real encoder happened to round slightly differently.
+	sel.SetTrackDimensions(1, 850, 478)
+	tracks := sel.GetTracks()
+	require.Equal(t, 850, tracks[1].Width)
+	require.Equal(t, 478, tracks[1].Height)
+
+	// a later backfill trigger (e.g. rid "2" resolving) must not touch
+	// track 1 anymore, since it's already dimsResolved from its own SPS.
+	sel.SetTrackDimensions(2, 426, 240)
+	tracks = sel.GetTracks()
+	require.Equal(t, 850, tracks[1].Width)
+	require.Equal(t, 478, tracks[1].Height)
+}
+
 func TestTrackSelectorSelectOverridesPending(t *testing.T) {
 	desc := makeSimulcastDesc()
 	sel := NewTrackSelector(nil, nil)

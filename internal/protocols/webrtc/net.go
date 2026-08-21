@@ -4,10 +4,11 @@ import (
 	"fmt"
 	"net"
 
-	"github.com/bluenviron/gortsplib/v5/pkg/readbuffer"
 	"github.com/pion/transport/v4"
 	"github.com/pion/transport/v4/stdnet"
 	"github.com/wlynxg/anet"
+
+	"github.com/bluenviron/mediamtx/internal/protocols/udpreadbuffer"
 )
 
 // Net is stdnet.Net with the following changes:
@@ -15,6 +16,11 @@ import (
 // - ListenUDP() is overridden to apply the configured read buffer size to the returned UDPConn.
 type Net struct {
 	UDPReadBufferSize int
+	// OnReadBufferWarn, if set, is called instead of failing ListenUDP()
+	// when the OS refuses the requested read buffer size (e.g. because
+	// net.core.rmem_max is lower than UDPReadBufferSize). The socket keeps
+	// running with whatever buffer size the OS assigned.
+	OnReadBufferWarn func(format string, args ...any)
 
 	stdnet.Net
 }
@@ -88,8 +94,9 @@ func (n *Net) ListenUDP(network string, laddr *net.UDPAddr) (transport.UDPConn, 
 	}
 
 	if n.UDPReadBufferSize != 0 {
-		if err = readbuffer.SetReadBuffer(conn, n.UDPReadBufferSize); err != nil {
-			return nil, err
+		outcome := udpreadbuffer.Set(conn, n.UDPReadBufferSize)
+		if !outcome.OK() && n.OnReadBufferWarn != nil {
+			n.OnReadBufferWarn("%s", outcome.Describe())
 		}
 	}
 

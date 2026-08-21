@@ -9,13 +9,21 @@
 /auto.key
 /internal/core/auto.crt
 /internal/core/auto.key
-*.exe
+/bin/*.exe
+/bin/.env
+/bin/data/
 /bin/logs/
-*.sock
-.env
+/bin/*.db
+/bin/*.db3
+/bin/*.db-shm
+/bin/*.db-wal
+/bin/server.crt
+/bin/server.key
+/.env
 .env.*
 *.env
 
 # local test-run artifacts, not upstream fixtures
 /internal/core/data/
 /internal/externalcmd/C*Usersgreg*
+*.sock

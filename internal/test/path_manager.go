@@ -6,15 +6,24 @@ import (
 
 // PathManager is a dummy path manager.
 type PathManager struct {
-	FindPathConfImpl func(req defs.PathFindPathConfReq) (*defs.PathFindPathConfRes, error)
-	DescribeImpl     func(req defs.PathDescribeReq) (*defs.PathDescribeRes, error)
-	AddPublisherImpl func(req defs.PathAddPublisherReq) (*defs.PathAddPublisherRes, error)
-	AddReaderImpl    func(req defs.PathAddReaderReq) (*defs.PathAddReaderRes, error)
+	FindPathConfImpl     func(req defs.PathFindPathConfReq) (*defs.PathFindPathConfRes, error)
+	IsPublishAllowedImpl func(pathName string) bool // nil defaults to true (allowed)
+	DescribeImpl         func(req defs.PathDescribeReq) (*defs.PathDescribeRes, error)
+	AddPublisherImpl     func(req defs.PathAddPublisherReq) (*defs.PathAddPublisherRes, error)
+	AddReaderImpl        func(req defs.PathAddReaderReq) (*defs.PathAddReaderRes, error)
 }
 
 // FindPathConf implements PathManager.
 func (pm *PathManager) FindPathConf(req defs.PathFindPathConfReq) (*defs.PathFindPathConfRes, error) {
 	return pm.FindPathConfImpl(req)
+}
+
+// IsPublishAllowed implements PathManager.
+func (pm *PathManager) IsPublishAllowed(pathName string) bool {
+	if pm.IsPublishAllowedImpl == nil {
+		return true
+	}
+	return pm.IsPublishAllowedImpl(pathName)
 }
 
 // Describe implements PathManager.

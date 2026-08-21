@@ -17,10 +17,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/bluenviron/gortsplib/v5/pkg/readbuffer"
-	"github.com/bluenviron/mediamtx/internal/logger"
 	"github.com/quic-go/quic-go/http3"
 	"github.com/quic-go/webtransport-go"
+
+	"github.com/bluenviron/mediamtx/internal/logger"
+	"github.com/bluenviron/mediamtx/internal/protocols/udpreadbuffer"
 )
 
 const (
@@ -102,10 +103,9 @@ func (s *Server) Initialize() error {
 	}
 
 	if s.UDPReadBufferSize != 0 {
-		err = readbuffer.SetReadBuffer(s.ln.(*net.UDPConn), int(s.UDPReadBufferSize))
-		if err != nil {
-			s.ln.Close()
-			return err
+		outcome := udpreadbuffer.Set(s.ln.(*net.UDPConn), int(s.UDPReadBufferSize))
+		if !outcome.OK() {
+			s.Parent.Log(logger.Warn, "%s", outcome.Describe())
 		}
 	}
 

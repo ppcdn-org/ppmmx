@@ -250,6 +250,7 @@ type InboundTrack struct {
 
 	track     *webrtc.TrackRemote
 	receiver  *webrtc.RTPReceiver
+	id        string
 	rid       string
 	writeRTCP func([]rtcp.Packet) error
 	log       logger.Writer
@@ -259,6 +260,8 @@ type InboundTrack struct {
 	inboundRTPPacketsDropped *counterdumper.Dumper
 	rtpReceiver              *rtpreceiver.Receiver
 	done                     chan struct{}
+	lastInputSequence        uint16
+	hasLastInputSequence     bool
 }
 
 func (t *InboundTrack) initialize() {
@@ -285,6 +288,16 @@ func (t *InboundTrack) stripTWCCExtension(pkt *rtp.Packet) {
 // Codec returns the track codec.
 func (t *InboundTrack) Codec() webrtc.RTPCodecParameters {
 	return t.track.Codec()
+}
+
+// Kind returns whether this is an audio or video track.
+func (t *InboundTrack) Kind() webrtc.RTPCodecType {
+	return t.track.Kind()
+}
+
+// Stats returns this track's RTP receive statistics.
+func (t *InboundTrack) Stats() *rtpreceiver.Stats {
+	return t.rtpReceiver.Stats()
 }
 
 // ClockRate returns the clock rate. Needed by rtptime.GlobalDecoder
@@ -376,9 +389,17 @@ func (t *InboundTrack) start() {
 	}
 
 	processPacket := func(pkt *rtp.Packet) {
+		previousSequence := t.lastInputSequence
+		hadPreviousSequence := t.hasLastInputSequence
+		t.lastInputSequence = pkt.SequenceNumber
+		t.hasLastInputSequence = true
 		packets, lost := t.rtpReceiver.ProcessPacket2(pkt, time.Now(), true)
 
 		if lost != 0 {
+			t.log.Log(logger.Warn,
+				"RTP loss diagnostic: lost=%d ssrc=%d rid=%q pt=%d previousInputSeq=%d currentSeq=%d timestamp=%d marker=%t hadPrevious=%t",
+				lost, pkt.SSRC, t.rid, pkt.PayloadType, previousSequence, pkt.SequenceNumber,
+				pkt.Timestamp, pkt.Marker, hadPreviousSequence)
 			t.inboundRTPPacketsLost.Add(lost)
 			// do not return
 		}

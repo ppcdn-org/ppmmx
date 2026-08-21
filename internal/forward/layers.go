@@ -56,10 +56,22 @@ func SplitLayers(streamKeyPrefix string, orig *description.Session) []Layer {
 		}
 
 		layers[i] = Layer{
-			StreamKey: fmt.Sprintf("%s_q%d", streamKeyPrefix, i),
+			StreamKey: streamKeyPrefix + layerSuffix(i),
 			Desc:      &description.Session{Medias: medias},
 		}
 	}
 
 	return layers
+}
+
+// layerSuffixes maps quality layer index (0 = highest resolution) to its
+// Tencent stream key suffix, per Tencent's naming convention. Layers beyond
+// index 3 (5th and later, not expected in practice) fall back to "_qN".
+var layerSuffixes = [...]string{"", "_standard", "_economic", "_lite"}
+
+func layerSuffix(i int) string {
+	if i < len(layerSuffixes) {
+		return layerSuffixes[i]
+	}
+	return fmt.Sprintf("_q%d", i)
 }

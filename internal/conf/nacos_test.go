@@ -4,9 +4,11 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
-
-	"github.com/bluenviron/mediamtx/internal/test"
 )
+
+// nilLogger (defined in conf.go) discards everything. internal/test.NilLogger
+// can't be used here: internal/test imports internal/auth, which imports
+// internal/conf, which would make this test file's import an import cycle.
 
 func TestJasyptDecryptRoundTrip(t *testing.T) {
 	salt := []byte{1, 2, 3, 4, 5, 6, 7, 8}
@@ -62,7 +64,7 @@ func TestApplyNacosMinioConfigNoopWithoutJasyptPassword(t *testing.T) {
 	conf.setDefaults()
 	before := *conf
 
-	applyNacosMinioConfig(conf, test.NilLogger)
+	applyNacosMinioConfig(conf, nilLogger{})
 	require.Equal(t, before.NetStorageMinioEndpoint, conf.NetStorageMinioEndpoint)
 	require.Equal(t, before.NetStorageMinioAccessKey, conf.NetStorageMinioAccessKey)
 }
@@ -78,7 +80,7 @@ func TestApplyNacosMinioConfigFallsBackOnFetchError(t *testing.T) {
 	conf.setDefaults()
 	before := *conf
 
-	applyNacosMinioConfig(conf, test.NilLogger)
+	applyNacosMinioConfig(conf, nilLogger{})
 	require.Equal(t, before.NetStorageMinioEndpoint, conf.NetStorageMinioEndpoint)
 }
 

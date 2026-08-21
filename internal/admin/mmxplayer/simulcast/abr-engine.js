@@ -77,7 +77,14 @@ class ABREngine {
 
     notifyManualSwitch(trackId) {
         this.isAutoMode = false;
-        this._updateCurrentTrack(trackId);
+        // Do NOT update currentTrackId here: it's still the *old* layer
+        // until the server confirms the switch (onLayerSwitched ->
+        // notifyLayerSwitched, once mmxplayer.js gets a LAYER_SWITCHED
+        // message back). Setting it eagerly to the target made every
+        // manual switch's very next switchMediaTrack() call see
+        // trackId === currentTrackId and treat it as a no-op "redundant"
+        // switch, silently dropping the actual controlClient.selectLayer
+        // call - manual quality selection never took effect.
         this._resetCounters();
         console.log(`[ABR] Manual switch detected. Auto Mode OFF.`);
     }

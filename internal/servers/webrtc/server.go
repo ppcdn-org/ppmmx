@@ -22,11 +22,11 @@ import (
 	"github.com/pion/logging"
 	pwebrtc "github.com/pion/webrtc/v4"
 
-	"github.com/bluenviron/gortsplib/v5/pkg/readbuffer"
 	"github.com/bluenviron/mediamtx/internal/conf"
 	"github.com/bluenviron/mediamtx/internal/defs"
 	"github.com/bluenviron/mediamtx/internal/externalcmd"
 	"github.com/bluenviron/mediamtx/internal/logger"
+	"github.com/bluenviron/mediamtx/internal/protocols/udpreadbuffer"
 	"github.com/bluenviron/mediamtx/internal/protocols/webrtc"
 	"github.com/bluenviron/mediamtx/internal/protocols/whip"
 	"github.com/bluenviron/mediamtx/internal/recording"
@@ -181,6 +181,7 @@ type serverMetrics interface {
 
 type serverPathManager interface {
 	FindPathConf(req defs.PathFindPathConfReq) (*defs.PathFindPathConfRes, error)
+	IsPublishAllowed(pathName string) bool
 	AddPublisher(req defs.PathAddPublisherReq) (*defs.PathAddPublisherRes, error)
 	AddReader(req defs.PathAddReaderReq) (*defs.PathAddReaderRes, error)
 }
@@ -222,6 +223,14 @@ type Server struct {
 	RecMgr       *recording.Manager
 	SplitHandler *recording.SplitRecHandler
 
+	// WHIP degrade protocol (see docs/obs-mmx-degrade-protocol.md)
+	DegradeEnable         bool
+	DegradeWSPathSuffix   string
+	DegradeInstantLossPct float64
+	DegradeAvgLossPct     float64
+	DegradeObservationSec int
+	DegradeWSSecret       string
+
 	ctx              context.Context
 	ctxCancel        func()
 	httpServer       *httpServer
@@ -232,6 +241,15 @@ type Server struct {
 	iceTCPMux        *webrtc.TCPMuxWrapper
 	sessions         map[*session]struct{}
 	sessionsBySecret map[uuid.UUID]*session
+
+	degradeStatesMu sync.Mutex
+	degradeStates   map[string]*degradeState
+
+	publishStatsMu sync.Mutex
+	publishStats   map[string]*publishReconnectStats
+
+	obsTimestampSubsOnce sync.Once
+	obsTimestampSubsVal  *obsTimestampSubs
 
 	// in
 	chNewSession           chan newSessionReq
@@ -255,6 +273,8 @@ func (s *Server) Initialize() error {
 	s.ctxCancel = ctxCancel
 	s.sessions = make(map[*session]struct{})
 	s.sessionsBySecret = make(map[uuid.UUID]*session)
+	s.degradeStates = make(map[string]*degradeState)
+	s.publishStats = make(map[string]*publishReconnectStats)
 	s.chNewSession = make(chan newSessionReq)
 	s.chCloseSession = make(chan *session)
 	s.chAddSessionCandidates = make(chan addSessionCandidatesReq)
@@ -284,7 +304,12 @@ func (s *Server) Initialize() error {
 		return err
 	}
 
-	s.net = &webrtc.Net{UDPReadBufferSize: int(s.UDPReadBufferSize)}
+	s.net = &webrtc.Net{
+		UDPReadBufferSize: int(s.UDPReadBufferSize),
+		OnReadBufferWarn: func(format string, args ...any) {
+			s.Log(logger.Warn, format, args...)
+		},
+	}
 
 	if s.LocalUDPAddress != "" {
 		s.udpMuxLn, err = net.ListenPacket(restrictnetwork.Restrict("udp", s.LocalUDPAddress))
@@ -295,12 +320,9 @@ func (s *Server) Initialize() error {
 		}
 
 		if s.UDPReadBufferSize != 0 {
-			err = readbuffer.SetReadBuffer(s.udpMuxLn.(*net.UDPConn), int(s.UDPReadBufferSize))
-			if err != nil {
-				s.udpMuxLn.Close()
-				s.httpServer.close()
-				ctxCancel()
-				return err
+			outcome := udpreadbuffer.Set(s.udpMuxLn.(*net.UDPConn), int(s.UDPReadBufferSize))
+			if !outcome.OK() {
+				s.Log(logger.Warn, "%s", outcome.Describe())
 			}
 		}
 

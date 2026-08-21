@@ -22,6 +22,7 @@ import (
 	pwebrtc "github.com/pion/webrtc/v4"
 	"github.com/stretchr/testify/require"
 
+	"github.com/bluenviron/mediamtx/internal/conf"
 	"github.com/bluenviron/mediamtx/internal/protocols/webrtc"
 	"github.com/bluenviron/mediamtx/internal/protocols/whip"
 	"github.com/bluenviron/mediamtx/internal/test"
@@ -389,6 +390,7 @@ moq_sessions_outbound_bytes 0
 				Log:            test.NilLogger,
 				Publish:        true,
 				OutboundTracks: []*webrtc.OutboundTrack{track},
+				DeviceID:       conf.DefaultWHIPWSSecret,
 			}
 
 			err2 = s.Initialize(context.Background())

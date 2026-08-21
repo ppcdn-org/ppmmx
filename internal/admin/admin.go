@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -19,6 +20,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"github.com/bluenviron/mediamtx/internal/conf"
 	"github.com/bluenviron/mediamtx/internal/logger"
 )
 
@@ -37,14 +39,38 @@ type Server struct {
 	Store           *Store
 	Parent          logger.Writer
 	TXSecretKeyBack string
-	// Version is reported by the health endpoints (e.g. "v1.19.1rc001").
+	// BackupPlayerDomain is the fallback backup player domain used when the
+	// admin store has none configured. Read from BACKUP_PLAYER_DOMAIN in
+	// Initialize() if this field is left empty; falls back to the main
+	// domain itself if neither is set.
+	BackupPlayerDomain string
+	// Version is reported by the health endpoints (e.g. "v1.19.1rc002").
 	Version string
 	// PlayURIRateLimit caps /api/playUri and /api/play(Tx)?Url requests per
 	// source IP per minute. Zero (the default) means 30.
 	PlayURIRateLimit int
+	// PlaySignatureTTL controls how long a signed play URL's txTime/txSecret
+	// stays valid. Zero (the default) means 1h.
+	PlaySignatureTTL time.Duration
+	// ConfPath is the currently loaded YAML config file, used to read and
+	// patch ingestSources. Deploy settings are unavailable if empty (e.g.
+	// no config file was found at startup).
+	ConfPath string
+	// RestartFunc, if set, is called to restart the backend process after
+	// a deploy-config change (ingestSources) that only takes effect on the
+	// next boot. Runs in a goroutine so the triggering HTTP response can
+	// be written first.
+	RestartFunc func()
 
 	httpServer *http.Server
+	// v3Handler, when set, serves the Control API /v3/* routes directly on
+	// the admin's gin engine instead of needing a separate :9997 listener.
+	v3Handler http.Handler
 }
+
+// SetV3Handler attaches a Control API handler to be mounted at /v3/* on
+// the admin port, removing the need for a standalone API HTTP listener.
+func (s *Server) SetV3Handler(h http.Handler) { s.v3Handler = h }
 
 func respOK(c *gin.Context, data any) {
 	c.JSON(http.StatusOK, gin.H{"code": http.StatusOK, "msg": "success", "data": data})
@@ -106,7 +132,7 @@ func rateLimitMiddleware(limit int, window time.Duration) gin.HandlerFunc {
 	}
 }
 
-const playSignatureTTL = 5 * time.Minute
+const defaultPlaySignatureTTL = time.Hour
 
 var playIdentifierPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
 
@@ -115,7 +141,11 @@ func validPlayIdentifier(value string) bool {
 }
 
 func (s *Server) signedPlayParams(stream string) string {
-	txTime := fmt.Sprintf("%X", time.Now().Add(playSignatureTTL).Unix())
+	ttl := s.PlaySignatureTTL
+	if ttl <= 0 {
+		ttl = defaultPlaySignatureTTL
+	}
+	txTime := fmt.Sprintf("%X", time.Now().Add(ttl).Unix())
 	txSecret := fmt.Sprintf("%x", md5.Sum([]byte(s.TXSecretKeyBack+stream+txTime)))
 	return fmt.Sprintf("txTime=%s&txSecret=%s", txTime, txSecret)
 }
@@ -269,10 +299,9 @@ func (s *Server) gameStatsHandler(c *gin.Context) {
 }
 
 func (s *Server) siteConfigHandler(c *gin.Context) {
-	mainDomain, backupDomain := s.defaultPlayerDomain(), "play.numericgame.ph"
+	mainDomain, backupDomain := s.mainPlayerDomain(c)
 	env := "test"
 	if s.Store != nil {
-		mainDomain, backupDomain = s.Store.PlayerConfig(mainDomain)
 		env = s.Store.VideoStatEnv()
 	}
 	global, _ := mmxGetAPI(s.MMXAPI, "/v3/config/global/get")
@@ -350,10 +379,7 @@ func (s *Server) siteStreamConfigSetHandler(c *gin.Context) {
 }
 
 func (s *Server) playerHandler(c *gin.Context) {
-	mainDomain, backupDomain := s.defaultPlayerDomain(), "play.numericgame.ph"
-	if s.Store != nil {
-		mainDomain, backupDomain = s.Store.PlayerConfig(mainDomain)
-	}
+	mainDomain, backupDomain := s.mainPlayerDomain(c)
 	respOK(c, gin.H{"players": []gin.H{
 		{"name": s.NodeName, "type": "primary", "host": mainDomain, "url": "/simulcast/", "desc": "Simulcast main-play-uri player"},
 		{"name": "backup", "type": "backup", "host": backupDomain, "url": "/multitrack/", "desc": "Tencent Cloud multitrack play"},
@@ -361,22 +387,16 @@ func (s *Server) playerHandler(c *gin.Context) {
 }
 
 func (s *Server) playerConfigGetHandler(c *gin.Context) {
-	mainDomain, backupDomain := s.defaultPlayerDomain(), "play.numericgame.ph"
+	mainDomain, backupDomain := s.mainPlayerDomain(c)
 	env := "test"
 	if s.Store != nil {
-		mainDomain, backupDomain = s.Store.PlayerConfig(mainDomain)
 		env = s.Store.VideoStatEnv()
 	}
 	respOK(c, gin.H{
 		"main_player_domain":   mainDomain,
 		"backup_player_domain": backupDomain,
-		"videostat_env":        env,
-		"videostat_environments": map[string]string{
-			"test": "https://lotto-videostat.gelotto-test.com/api/stat",
-			"uat":  "https://lotto-videostat.gelotto-uat.com/api/stat",
-			"stag": "https://lotto-videostat.numericgame.io/api/stat",
-			"prod": "https://lotto-videostat.numericgame.ph/api/stat",
-		},
+		"videostat_env":          env,
+		"videostat_environments": VideoStatEnvs,
 	})
 }
 
@@ -412,9 +432,78 @@ func (s *Server) downloadsHandler(c *gin.Context) {
 	respOK(c, gin.H{"obs": gin.H{
 		"name":    "OBS Studio 32.1.2 Patched",
 		"version": "32.1.2-patched",
-		"url":     "https://github.com/Elon666-ai/obs32.1.2patched/releases/latest",
-		"sha256":  "EC7E5A46E5EFEBBB365B9958EB4EF55E95AF9E96F09EC5C690D9426213DB0B6A",
+		"url":     "https://github.com/Elon666-ai/obs32.1.2patched/releases",
 	}})
+}
+
+func (s *Server) deployConfigGetHandler(c *gin.Context) {
+	var ingestSources []string
+	if s.ConfPath != "" {
+		var err error
+		ingestSources, err = conf.ReadIngestSources(s.ConfPath)
+		if err != nil {
+			respErr(c, http.StatusInternalServerError, err.Error(), "")
+			return
+		}
+	}
+	if ingestSources == nil {
+		ingestSources = []string{}
+	}
+	respOK(c, gin.H{
+		"ingest_sources": ingestSources,
+		"conf_path":      s.ConfPath,
+	})
+}
+
+func (s *Server) deployConfigSetHandler(c *gin.Context) {
+	var req struct {
+		IngestSources []string `json:"ingest_sources"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		respErr(c, http.StatusBadRequest, err.Error(), "")
+		return
+	}
+	for _, src := range req.IngestSources {
+		if strings.TrimSpace(src) == "" {
+			respErr(c, http.StatusBadRequest, "ingest_sources entries must not be blank", "")
+			return
+		}
+	}
+
+	if s.ConfPath == "" {
+		respErr(c, http.StatusServiceUnavailable, "no config file loaded, cannot save ingest_sources", "")
+		return
+	}
+	if err := conf.PatchIngestSources(s.ConfPath, req.IngestSources); err != nil {
+		respErr(c, http.StatusInternalServerError, err.Error(), "")
+		return
+	}
+
+	s.Parent.Log(logger.Info, "[admin] deploy config updated: ingest_sources=%v (restart required)", req.IngestSources)
+	respOK(c, gin.H{"message": "saved, restart required to take effect"})
+}
+
+func (s *Server) restartHandler(c *gin.Context) {
+	if s.RestartFunc == nil {
+		respErr(c, http.StatusServiceUnavailable, "restart is not supported on this deployment", "")
+		return
+	}
+	s.Parent.Log(logger.Info, "[admin] restart requested via admin API")
+	respOK(c, gin.H{"message": "restarting"})
+	go s.RestartFunc()
+}
+
+// tencentLayerLadder describes the fixed quality ladder returned by
+// txUrlHandler when given a bare stream name, in tencentLayerSuffixes
+// order (index 0 = highest resolution/"" suffix).
+var tencentLayerLadder = []struct {
+	Label   string
+	Bitrate int
+}{
+	{"1080p", 2600000},
+	{"720p", 1734000},
+	{"360p", 868000},
+	{"180p", 600000},
 }
 
 func (s *Server) txUrlHandler(c *gin.Context) {
@@ -427,32 +516,39 @@ func (s *Server) txUrlHandler(c *gin.Context) {
 		respErr(c, http.StatusBadRequest, "invalid stream parameter", "")
 		return
 	}
-	backupHost := "play.numericgame.ph"
+	backupHost := s.BackupPlayerDomain
 	if s.Store != nil {
-		_, backupHost = s.Store.PlayerConfig("")
+		_, backupHost = s.Store.PlayerConfig("", s.BackupPlayerDomain)
 	}
 	genUrl := func(streamKey string) string {
 		return "webrtc://" + backupHost + "/live/" + streamKey + "?" + s.signedPlayParams(streamKey)
 	}
-	// A quality stream is already a complete Tencent multitrack key.
-	if strings.HasSuffix(stream, "_q0") || strings.HasSuffix(stream, "_q1") || strings.HasSuffix(stream, "_q2") {
-		c.JSON(http.StatusOK, gin.H{"code": 0, "data": gin.H{"webrtc": genUrl(stream)}})
-		return
+	// A quality stream is already a complete Tencent multitrack key (see
+	// internal/forward/layers.go's layerSuffixes for the suffixes
+	// forwardTencent actually produces).
+	for _, suffix := range tencentLayerSuffixes {
+		if suffix != "" && strings.HasSuffix(stream, suffix) {
+			c.JSON(http.StatusOK, gin.H{"code": 0, "data": gin.H{"webrtc": genUrl(stream)}})
+			return
+		}
 	}
-	stream = strings.TrimSuffix(stream, "_standard")
-	stream = strings.TrimSuffix(stream, "_economic")
-	stream = strings.TrimSuffix(stream, "_audio")
-	if !strings.Contains(stream, "_q") {
-		streams := []gin.H{
-			{"id": 0, "label": "1080p", "rid": "q0", "bitrate": 2600000, "webrtc": genUrl(stream + "_q0")},
-			{"id": 1, "label": "720p", "rid": "q1", "bitrate": 1734000, "webrtc": genUrl(stream + "_q1")},
-			{"id": 2, "label": "360p", "rid": "q2", "bitrate": 868000, "webrtc": genUrl(stream + "_q2")},
+	base := strings.TrimSuffix(stream, "_audio")
+	if base == stream {
+		streams := make([]gin.H, len(tencentLayerLadder))
+		for i, layer := range tencentLayerLadder {
+			suffix := tencentLayerSuffix(i)
+			streams[i] = gin.H{
+				"id": i, "label": layer.Label, "rid": fmt.Sprintf("q%d", i),
+				"bitrate": layer.Bitrate, "webrtc": genUrl(stream + suffix),
+			}
 		}
 		c.JSON(http.StatusOK, gin.H{"code": 0, "data": gin.H{"streams": streams}})
 		return
 	}
 
-	uri := genUrl(stream)
+	// "_audio" is a logical audio-only alias, not a real Tencent stream
+	// key - fall back to the lowest-bandwidth real layer.
+	uri := genUrl(base + tencentLayerSuffix(len(tencentLayerLadder)-1))
 	c.JSON(http.StatusOK, gin.H{"code": 0, "data": gin.H{"webrtc": uri}})
 }
 
@@ -464,9 +560,61 @@ func (s *Server) videoStatEnvHandler(c *gin.Context) {
 	respOK(c, gin.H{"env": env, "baseUrl": VideoStatEnvs[env]})
 }
 
+// tencentLayerSuffixes maps quality layer index (0 = highest resolution) to
+// its Tencent stream key suffix, mirroring internal/forward/layers.go's
+// convention for the streams forwardTencent actually produces (kept as a
+// separate copy since importing internal/forward here would pull in its
+// WebRTC/WHIP client dependencies just for this one constant).
+var tencentLayerSuffixes = [...]string{"", "_standard", "_economic", "_lite"}
+
+func tencentLayerSuffix(i int) string {
+	if i < len(tencentLayerSuffixes) {
+		return tencentLayerSuffixes[i]
+	}
+	return fmt.Sprintf("_q%d", i)
+}
+
+// simulcastLayerCount asks mmx's own Control API how many H264 video layers
+// path currently has live (0 if the path doesn't exist or isn't online -
+// e.g. a table with no active publisher), and whether its matched path
+// configuration has forwardTencent enabled. Best-effort: any upstream
+// error is treated the same as "not currently live" (0 layers) rather than
+// failing the whole request, since a path just not being live yet/right
+// now is an expected, common case for this endpoint.
+func (s *Server) simulcastLayerCount(app, stream string) (layers int, forwardTencent bool) {
+	pathData, err := mmxGetAPI(s.MMXAPI, "/v3/paths/get/"+app+"/"+stream)
+	if err != nil {
+		return 0, false
+	}
+	tracks, _ := pathData["tracks2"].([]any)
+	for _, t := range tracks {
+		track, ok := t.(map[string]any)
+		if !ok {
+			continue
+		}
+		if codec, _ := track["codec"].(string); codec == "H264" {
+			layers++
+		}
+	}
+	if layers == 0 {
+		return 0, false
+	}
+
+	confName, _ := pathData["confName"].(string)
+	if confName == "" {
+		return layers, false
+	}
+	confData, err := mmxGetAPI(s.MMXAPI, "/v3/config/paths/get/"+confName)
+	if err != nil {
+		return layers, false
+	}
+	forwardTencent, _ = confData["forwardTencent"].(bool)
+	return layers, forwardTencent
+}
+
 func (s *Server) playUriHandler(c *gin.Context) {
 	if s.TXSecretKeyBack == "" {
-		respErr(c, http.StatusServiceUnavailable, "TX_SecretKey_Back is not configured", "")
+		respErr(c, http.StatusServiceUnavailable, "TX_SECRET_KEY_BACK is not configured", "")
 		return
 	}
 	app := c.DefaultQuery("app", "live")
@@ -480,16 +628,42 @@ func (s *Server) playUriHandler(c *gin.Context) {
 		return
 	}
 
-	mainDomain, backupHost := s.defaultPlayerDomain(), "play.numericgame.ph"
-	if s.Store != nil {
-		mainDomain, backupHost = s.Store.PlayerConfig(mainDomain)
+	mainDomain, backupHost := s.mainPlayerDomain(c)
+	layers, forwardTencent := s.simulcastLayerCount(app, stream)
+
+	// Main player is on the same LAN/trusted network as mmx (studio/local
+	// playback) and reaches it directly over WebRTC/HTTP, so it doesn't
+	// need the txTime/txSecret signature backup URLs (public-facing
+	// Tencent multitrack addresses) require; and it must always use
+	// webrtcAddress's port (see mainPlayerDomain), not whatever port the
+	// admin request itself came in on. All quality keys share the same
+	// URL: mmx's WHEP endpoint negotiates simulcast layers itself (the
+	// player switches layers over the ABR WebSocket control channel, not
+	// by requesting a different URL) - the point of returning multiple
+	// keys here is only to tell the player how many layers are available
+	// to choose from.
+	main := gin.H{}
+	backup := gin.H{}
+	if layers > 0 {
+		mainURI := fmt.Sprintf("http://%s/%s/%s/whep", mainDomain, app, stream)
+		for i := range layers {
+			main[fmt.Sprintf("q%d", i)] = mainURI
+		}
+
+		// backup (Tencent) URLs, in contrast, are one real streamKey per
+		// layer (forwardTencent forwards each simulcast layer to Tencent
+		// under its own suffixed key - see internal/forward/layers.go),
+		// so each quality key gets its own signed URL. Only present when
+		// this path is actually configured to forward to Tencent -
+		// otherwise there's nothing playable at any Tencent-side key.
+		if forwardTencent {
+			for i := range layers {
+				layerStream := stream + tencentLayerSuffix(i)
+				backup[fmt.Sprintf("q%d", i)] = fmt.Sprintf("webrtc://%s/%s/%s?%s",
+					backupHost, app, layerStream, s.signedPlayParams(layerStream))
+			}
+		}
 	}
-
-	txParams := s.signedPlayParams(stream)
-
-	mainURI := fmt.Sprintf("http://%s/%s/%s/whep?%s", mainDomain, app, stream, txParams)
-	backupURI := fmt.Sprintf("webrtc://%s/%s/%s?%s",
-		backupHost, app, stream, txParams)
 
 	videoStatAPI := VideoStatEnvs["test"]
 	if s.Store != nil {
@@ -498,19 +672,55 @@ func (s *Server) playUriHandler(c *gin.Context) {
 		}
 	}
 
-	respOK(c, gin.H{
-		"main_play_uri":   mainURI,
-		"backup_play_uri": backupURI,
-		"video_stat_api":  videoStatAPI,
-	})
+	data := gin.H{
+		"main":           main,
+		"video_stat_api": videoStatAPI,
+	}
+	if forwardTencent {
+		data["backup"] = backup
+	}
+	respOK(c, data)
 }
 
-func (s *Server) defaultPlayerDomain() string {
-	target, err := url.Parse(s.MMXBackend)
-	if err == nil && target.Host != "" {
-		return target.Host
+// webrtcPort extracts the port mmx's WebRTC/HTTP server (webrtcAddress in
+// origin.yml/record.yml) is actually listening on, from s.MMXBackend
+// ("http://127.0.0.1:<webrtcAddress port>", derived at startup - see
+// internal/core/core.go). Falls back to "8889" (the default webrtcAddress)
+// if MMXBackend is somehow unset/unparsable, so callers always get a port
+// rather than an empty string.
+func (s *Server) webrtcPort() string {
+	if target, err := url.Parse(s.MMXBackend); err == nil {
+		if _, port, err := net.SplitHostPort(target.Host); err == nil && port != "" {
+			return port
+		}
 	}
-	return "127.0.0.1:8889"
+	return "8889"
+}
+
+// mainPlayerDomain returns the "host:port" clients should use to reach mmx's
+// WebRTC/HTTP backend directly for main-player (studio/LAN) playback, plus
+// the backup (Tencent multitrack) domain. The host is either an admin-set
+// main_player_domain override or the current request's Host header; either
+// way its port, if any, is discarded and replaced with webrtcAddress's own
+// port (see webrtcPort) - never the port the admin request itself came in
+// on, since mmx's WHIP/WHEP endpoints live on a separate listener from the
+// admin API.
+func (s *Server) mainPlayerDomain(c *gin.Context) (mainDomain, backupDomain string) {
+	host := c.Request.Host
+	if host == "" {
+		host = "127.0.0.1"
+	}
+	backupDomain = s.BackupPlayerDomain
+	if s.Store != nil {
+		if stored := s.Store.Get("main_player_domain"); stored != "" {
+			host = stored
+		}
+		_, backupDomain = s.Store.PlayerConfig("", s.BackupPlayerDomain)
+	}
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	return host + ":" + s.webrtcPort(), backupDomain
 }
 
 func (s *Server) healthHandler(c *gin.Context) {
@@ -550,7 +760,18 @@ func adminDashboardHandler(c *gin.Context) {
 
 // Initialize builds the Gin router and starts listening.
 func (s *Server) Initialize() error {
-	auth, err := newAuthManager(s.Store)
+	// Third-party video-stat reporting is deployment-specific and off by
+	// default (see VideoStatEnvs) - populate from VIDEOSTAT_URL_<ENV> if set.
+	for env := range VideoStatEnvs {
+		if v := os.Getenv("VIDEOSTAT_URL_" + strings.ToUpper(env)); v != "" {
+			VideoStatEnvs[env] = v
+		}
+	}
+	if s.BackupPlayerDomain == "" {
+		s.BackupPlayerDomain = os.Getenv("BACKUP_PLAYER_DOMAIN")
+	}
+
+	auth, err := newAuthManager(s.Store, s.Parent)
 	if err != nil {
 		return fmt.Errorf("initialize admin authentication: %w", err)
 	}
@@ -597,6 +818,9 @@ func (s *Server) Initialize() error {
 	protected.GET("/player-config", s.playerConfigGetHandler)
 	protected.POST("/player-config", s.playerConfigSetHandler)
 	protected.GET("/downloads", s.downloadsHandler)
+	protected.GET("/deploy-config", s.deployConfigGetHandler)
+	protected.POST("/deploy-config", s.deployConfigSetHandler)
+	protected.POST("/restart", s.restartHandler)
 
 	// Play URI API
 	playURIRateLimit := s.PlayURIRateLimit
@@ -629,20 +853,37 @@ func (s *Server) Initialize() error {
 		c.Redirect(http.StatusMovedPermanently, "/multitrack/"+strings.TrimPrefix(c.Param("path"), "/"))
 	})
 
-	// Legacy
-	r.GET("/lotto/health", s.healthHandler)
+	// Legacy health-check path some deployments' load balancers/monitoring
+	// already point at. Off by default; set LEGACY_HEALTH_PATH (e.g.
+	// "/lotto/health") to register it without a code change.
+	if p := os.Getenv("LEGACY_HEALTH_PATH"); p != "" {
+		r.GET(p, s.healthHandler)
+	}
 	api.POST("/split-rec", func(c *gin.Context) { proxy.ServeHTTP(c.Writer, c.Request) })
 	r.GET("/test/token", func(c *gin.Context) {
 		c.String(http.StatusOK, "time=%d&token=not-implemented", time.Now().Unix()+180)
 	})
 	r.GET("/test/txUrl", func(c *gin.Context) { respOK(c, gin.H{}) })
 
+	// Mount the Control API (/v3/*) directly on the admin port when
+	// available, removing the need for a separate :9997 listener.
+	// v3Handler's own routes (RegisterV3Routes) are registered under a
+	// "/v3" group, so the incoming path must be forwarded as-is - not
+	// rewritten to strip the "/v3" prefix, which would leave v3Handler
+	// with no matching route (e.g. "/v3/info" would become "/info", but
+	// v3Handler only knows "/v3/info").
+	if s.v3Handler != nil {
+		r.Any("/v3/*path", func(c *gin.Context) {
+			s.v3Handler.ServeHTTP(c.Writer, c.Request)
+		})
+	}
+
 	// Catch-all → MMX
 	r.NoRoute(func(c *gin.Context) {
 		// Validate txTime/txSecret only on WHEP (playback), not WHIP (publish)
 		if strings.HasSuffix(c.Request.URL.Path, "/whep") {
 			if s.TXSecretKeyBack == "" {
-				respErr(c, http.StatusServiceUnavailable, "TX_SecretKey_Back is not configured", "")
+				respErr(c, http.StatusServiceUnavailable, "TX_SECRET_KEY_BACK is not configured", "")
 				return
 			}
 			txTime := c.Query("txTime")

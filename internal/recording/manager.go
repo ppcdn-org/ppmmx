@@ -82,7 +82,7 @@ func (m *Manager) Start(path string, opts Options, ctrl PathController) (*Record
 	}
 
 	id := fmt.Sprintf("rec_%x", md5.Sum([]byte(uuid.NewString()+path)))[:16]
-	now := time.Now()
+	startedAt := now()
 
 	r := Record{
 		ID:        id,
@@ -92,7 +92,7 @@ func (m *Manager) Start(path string, opts Options, ctrl PathController) (*Record
 		Game:      opts.Game,
 		Format:    opts.Format,
 		Status:    "running",
-		StartedAt: now,
+		StartedAt: startedAt,
 		FilePath:  filePath,
 	}
 	if err := m.store.Insert(r); err != nil {
@@ -104,7 +104,7 @@ func (m *Manager) Start(path string, opts Options, ctrl PathController) (*Record
 		ID:    id,
 		Path:  path,
 		opts:  opts,
-		start: now,
+		start: startedAt,
 		ctrl:  ctrl,
 	}
 	return &r, nil
@@ -151,7 +151,7 @@ func (m *Manager) stop(path, expectedID string) (*Record, error) {
 	}
 
 	r.Status = "completed"
-	r.StoppedAt = time.Now()
+	r.StoppedAt = now()
 	r.Duration = duration
 	r.FileSize = fileSize
 	if err := m.store.Update(job.ID, "completed", fileSize, duration); err != nil {

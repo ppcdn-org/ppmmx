@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"reflect"
 	"regexp"
@@ -26,12 +27,15 @@ import (
 	"github.com/bluenviron/mediamtx/internal/stream"
 	"github.com/bluenviron/mediamtx/internal/test"
 	"github.com/bluenviron/mediamtx/internal/unit"
+	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/pion/rtp"
 	"github.com/pion/sdp/v3"
 	pwebrtc "github.com/pion/webrtc/v4"
 	"github.com/stretchr/testify/require"
 )
+
+const testWHIPDeviceID = "test-whip-device-id"
 
 func whipAnswer(body []byte) *pwebrtc.SessionDescription {
 	return &pwebrtc.SessionDescription{
@@ -42,6 +46,36 @@ func whipAnswer(body []byte) *pwebrtc.SessionDescription {
 
 func checkClose(t *testing.T, closeFunc func() error) {
 	require.NoError(t, closeFunc())
+}
+
+func TestOfferH264SendTrackCount(t *testing.T) {
+	media := func(direction string, codec string) *sdp.MediaDescription {
+		attrs := []sdp.Attribute{{Key: "rtpmap", Value: "96 " + codec + "/90000"}}
+		if direction != "" {
+			attrs = append(attrs, sdp.Attribute{Key: direction})
+		}
+		return &sdp.MediaDescription{
+			MediaName:  sdp.MediaName{Media: "video", Port: sdp.RangedPort{Value: 9}},
+			Attributes: attrs,
+		}
+	}
+
+	medias := []*sdp.MediaDescription{
+		media("recvonly", "H264"),
+		media("sendrecv", "h264"),
+		media("sendonly", "H264"),
+		media("inactive", "H264"),
+		media("recvonly", "VP8"),
+	}
+	count, err := offerH264SendTrackCount(medias)
+	require.NoError(t, err)
+	require.Equal(t, 2, count)
+
+	_, err = offerH264SendTrackCount([]*sdp.MediaDescription{
+		media("recvonly", "H264"), media("recvonly", "H264"), media("recvonly", "H264"),
+		media("recvonly", "H264"), media("recvonly", "H264"),
+	})
+	require.EqualError(t, err, "multi-layer WHEP supports at most 4 H264 video tracks")
 }
 
 type dummyPath struct{}
@@ -411,6 +445,7 @@ func TestServerPublish(t *testing.T) {
 		TrackGatherTimeout:    conf.Duration(2 * time.Second),
 		PathManager:           pathManager,
 		Parent:                test.NilLogger,
+		DegradeWSSecret:       testWHIPDeviceID,
 	}
 	err := s.Initialize()
 	require.NoError(t, err)
@@ -436,6 +471,7 @@ func TestServerPublish(t *testing.T) {
 		URL:            su,
 		Publish:        true,
 		OutboundTracks: []*webrtc.OutboundTrack{track},
+		DeviceID:       testWHIPDeviceID,
 		Log:            test.NilLogger,
 	}
 
@@ -981,6 +1017,7 @@ func TestServerICERestart(t *testing.T) {
 		STUNGatherTimeout:     conf.Duration(5 * time.Second),
 		PathManager:           pathManager,
 		Parent:                test.NilLogger,
+		DegradeWSSecret:       testWHIPDeviceID,
 	}
 	err := s.Initialize()
 	require.NoError(t, err)
@@ -1006,6 +1043,7 @@ func TestServerICERestart(t *testing.T) {
 		URL:            su,
 		Publish:        true,
 		OutboundTracks: []*webrtc.OutboundTrack{track},
+		DeviceID:       testWHIPDeviceID,
 		Log:            test.NilLogger,
 	}
 
@@ -1098,7 +1136,7 @@ func TestServerICERestart(t *testing.T) {
 	<-dataReceived
 }
 
-func TestServerDeleteNotFound(t *testing.T) {
+func TestServerDeleteIsIdempotent(t *testing.T) {
 	s := initializeTestServer(t)
 	defer s.Close()
 
@@ -1114,7 +1152,7 @@ func TestServerDeleteNotFound(t *testing.T) {
 	require.NoError(t, err)
 	defer res.Body.Close()
 
-	require.Equal(t, http.StatusNotFound, res.StatusCode)
+	require.Equal(t, http.StatusOK, res.StatusCode)
 }
 
 func TestICEServerNoClientOnly(t *testing.T) {
@@ -1185,6 +1223,7 @@ func TestAuthError(t *testing.T) {
 						authFailed.Store(true)
 					}
 				}),
+				DegradeWSSecret: testWHIPDeviceID,
 			}
 			err := s.Initialize()
 			require.NoError(t, err)
@@ -1215,6 +1254,7 @@ func TestAuthError(t *testing.T) {
 				req, err = http.NewRequest(http.MethodPost, "http://127.0.0.1:8886/teststream/whip",
 					bytes.NewReader([]byte(offer.SDP)))
 				req.Header.Set("Content-Type", "application/sdp")
+				req.Header.Set("WHIP-Device-Id", testWHIPDeviceID)
 			}
 
 			require.NoError(t, err)
@@ -1249,6 +1289,7 @@ func TestAuthError(t *testing.T) {
 				req, err = http.NewRequest(http.MethodPost, "http://myuser:mypass@127.0.0.1:8886/teststream/whip",
 					bytes.NewReader([]byte(offer.SDP)))
 				req.Header.Set("Content-Type", "application/sdp")
+				req.Header.Set("WHIP-Device-Id", testWHIPDeviceID)
 			}
 
 			require.NoError(t, err)
@@ -1262,4 +1303,139 @@ func TestAuthError(t *testing.T) {
 			require.True(t, authFailed.Load())
 		})
 	}
+}
+
+// TestWHIPDeviceIDBearerTokenFallback verifies that checkWHIPDeviceID accepts
+// "Authorization: Bearer <secret>" when "WHIP-Device-Id" is absent. Real WHIP
+// clients (e.g. OBS's built-in WHIP output) can only send a Bearer Token via
+// their stream service settings and have no way to send a custom header, so
+// this is what lets them satisfy the device-id gate without an OBS patch.
+func TestWHIPDeviceIDBearerTokenFallback(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	s := &httpServer{parent: &Server{DegradeWSSecret: testWHIPDeviceID}}
+
+	for _, ca := range []struct {
+		name    string
+		headers map[string]string
+		allowed bool
+	}{
+		{
+			name:    "device id header",
+			headers: map[string]string{"WHIP-Device-Id": testWHIPDeviceID},
+			allowed: true,
+		},
+		{
+			name:    "bearer token fallback",
+			headers: map[string]string{"Authorization": "Bearer " + testWHIPDeviceID},
+			allowed: true,
+		},
+		{
+			name: "device id header takes priority over mismatched bearer",
+			headers: map[string]string{
+				"WHIP-Device-Id": testWHIPDeviceID,
+				"Authorization":  "Bearer wrong-secret",
+			},
+			allowed: true,
+		},
+		{
+			name:    "wrong bearer token",
+			headers: map[string]string{"Authorization": "Bearer wrong-secret"},
+			allowed: false,
+		},
+		{
+			name:    "no credentials",
+			headers: nil,
+			allowed: false,
+		},
+	} {
+		t.Run(ca.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/teststream/whip", nil)
+			for k, v := range ca.headers {
+				req.Header.Set(k, v)
+			}
+
+			rec := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(rec)
+			ctx.Request = req
+
+			require.Equal(t, ca.allowed, s.checkWHIPDeviceID(ctx))
+		})
+	}
+}
+
+// TestServerPublishRejectedByWhitelistBeforeAnswer reproduces a real report:
+// a disallowed publisher got a successful WHIP handshake and only had its
+// connection torn down afterward (AddPublisher ran the whitelist check
+// after the PeerConnection was already fully connected), so OBS kept
+// reconnecting instead of treating it as a rejection. runPublish now checks
+// IsPublishAllowed before building a PeerConnection at all, so the POST
+// gets a definitive 403 and AddPublisher (and therefore the whitelist
+// callback below) is never reached.
+func TestServerPublishRejectedByWhitelistBeforeAnswer(t *testing.T) {
+	pathManager := &test.PathManager{
+		FindPathConfImpl: func(req defs.PathFindPathConfReq) (*defs.PathFindPathConfRes, error) {
+			require.Equal(t, "live/table-view", req.AccessRequest.Name)
+			require.True(t, req.AccessRequest.Publish)
+			return &defs.PathFindPathConfRes{Conf: &conf.Path{}}, nil
+		},
+		IsPublishAllowedImpl: func(pathName string) bool {
+			require.Equal(t, "live/table-view", pathName)
+			return false
+		},
+		AddPublisherImpl: func(req defs.PathAddPublisherReq) (*defs.PathAddPublisherRes, error) {
+			t.Fatal("AddPublisher must not be called for a publish rejected by IsPublishAllowed")
+			return nil, nil
+		},
+	}
+
+	s := &Server{
+		Address:               "127.0.0.1:8996",
+		TrustedProxies:        conf.IPNetworks{},
+		ReadTimeout:           conf.Duration(10 * time.Second),
+		WriteTimeout:          conf.Duration(10 * time.Second),
+		LocalUDPAddress:       "127.0.0.1:8997",
+		LocalTCPAddress:       "127.0.0.1:8997",
+		IPsFromInterfaces:     true,
+		IPsFromInterfacesList: []string{},
+		AdditionalHosts:       []string{},
+		ICEServers:            []conf.WebRTCICEServer{},
+		STUNGatherTimeout:     conf.Duration(5 * time.Second),
+		HandshakeTimeout:      conf.Duration(10 * time.Second),
+		TrackGatherTimeout:    conf.Duration(2 * time.Second),
+		PathManager:           pathManager,
+		Parent:                test.NilLogger,
+		DegradeWSSecret:       testWHIPDeviceID,
+	}
+	err := s.Initialize()
+	require.NoError(t, err)
+	defer s.Close()
+
+	tr := &http.Transport{}
+	defer tr.CloseIdleConnections()
+	hc := &http.Client{Transport: tr}
+
+	su, err := url.Parse("http://localhost:8996/live/table-view/whip")
+	require.NoError(t, err)
+
+	track := &webrtc.OutboundTrack{
+		Caps: pwebrtc.RTPCodecCapability{
+			MimeType:    pwebrtc.MimeTypeH264,
+			ClockRate:   90000,
+			SDPFmtpLine: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=640033",
+		},
+	}
+
+	wc := &whip.Client{
+		HTTPClient:     hc,
+		URL:            su,
+		Publish:        true,
+		OutboundTracks: []*webrtc.OutboundTrack{track},
+		DeviceID:       testWHIPDeviceID,
+		Log:            test.NilLogger,
+	}
+
+	err = wc.Initialize(context.Background())
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "bad status code: 403")
 }

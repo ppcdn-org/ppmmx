@@ -88,14 +88,14 @@ type API struct {
 	mutex      sync.RWMutex
 }
 
-// Initialize initializes API.
-func (a *API) Initialize() error {
-	router := gin.New()
-	router.SetTrustedProxies(a.TrustedProxies.ToTrustedProxies()) //nolint:errcheck
-	router.Use(a.middlewarePreflightRequests)
-	router.Use(a.middlewareAuth)
+// RegisterV3Routes registers all /v3 API routes on the given Gin router
+// group WITHOUT starting a standalone HTTP listener. This lets the admin
+// server at :8080 host the Control API directly (no separate :9997 port).
+func (a *API) RegisterV3Routes(r gin.IRouter) {
+	r.Use(a.middlewarePreflightRequests)
+	r.Use(a.middlewareAuth)
 
-	group := router.Group("/v3")
+	group := r.Group("/v3")
 
 	group.GET("/info", a.onInfo)
 
@@ -174,6 +174,21 @@ func (a *API) Initialize() error {
 	group.GET("/recordings/list", a.onRecordingsList)
 	group.GET("/recordings/get/*name", a.onRecordingsGet)
 	group.DELETE("/recordings/deletesegment", a.onRecordingDeleteSegment)
+}
+
+// NewRouter builds a standalone Gin engine with the /v3 routes registered.
+func (a *API) NewRouter() *gin.Engine {
+	router := gin.New()
+	router.SetTrustedProxies(a.TrustedProxies.ToTrustedProxies()) //nolint:errcheck
+	a.RegisterV3Routes(router)
+	return router
+}
+
+// Initialize initializes API with a standalone HTTP listener. Prefer
+// RegisterV3Routes + mounting on the admin server for deployments where a
+// single port (:8080) is desired.
+func (a *API) Initialize() error {
+	router := a.NewRouter()
 
 	a.httpServer = &httpp.Server{
 		Address:           a.Address,
@@ -207,7 +222,12 @@ func (a *API) Initialize() error {
 // Close closes the API.
 func (a *API) Close() {
 	a.Log(logger.Info, "closing")
-	a.httpServer.Close()
+	// httpServer is nil when Initialize was never called - i.e. its /v3
+	// routes are mounted on the admin server instead (see core.go), so
+	// there's no standalone listener here to close.
+	if a.httpServer != nil {
+		a.httpServer.Close()
+	}
 }
 
 // Log implements logger.Writer.

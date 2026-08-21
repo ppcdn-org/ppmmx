@@ -90,6 +90,9 @@ func (s *Source) Run(params defs.StaticSourceRunParams) error {
 			Source:            params.Source,
 			IntfName:          params.IntfName,
 			UDPReadBufferSize: int(udpReadBufferSize),
+			OnReadBufferWarn: func(format string, args ...any) {
+				s.Log(logger.Warn, format, args...)
+			},
 		}
 
 		l.ListenPacket = func(network, address string) (net.PacketConn, error) {

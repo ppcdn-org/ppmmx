@@ -28,12 +28,14 @@ func advanceToken(secret, nonce string, req splitRecRequest) string {
 	return "HMAC-SHA256 " + hex.EncodeToString(mac.Sum(nil))
 }
 
-func TestSplitRecSimpleAuthCompatibility(t *testing.T) {
+func TestSplitRecSimpleAuth(t *testing.T) {
 	h := NewSplitRecHandler(nil, nil, test.NilLogger)
+	h.ConfigureAuth("simple", "test-secret")
 	req := splitRecRequest{Time: "2000000000", Table: "table", GC: "gc", Game: "game"}
-	legacy := fmt.Sprintf("%x", md5.Sum([]byte("lotto-dvr"+req.Time+req.Table+req.GC+req.Game)))
-	require.True(t, h.verifyToken(legacy, "", req))
-	require.True(t, h.verifyToken(legacy, "ignored-in-simple-mode", req))
+	token := fmt.Sprintf("%x", md5.Sum([]byte("test-secret"+req.Time+req.Table+req.GC+req.Game)))
+	require.True(t, h.verifyToken(token, "", req))
+	require.True(t, h.verifyToken(token, "ignored-in-simple-mode", req))
+	require.False(t, h.verifyToken(fmt.Sprintf("%x", md5.Sum([]byte("wrong-secret"+req.Time+req.Table+req.GC+req.Game))), "", req))
 	require.False(t, h.verifyToken(advanceToken("secret", "0123456789abcdef", req), "0123456789abcdef", req))
 }
 
@@ -56,7 +58,21 @@ func TestSplitRecAdvanceAuth(t *testing.T) {
 	require.False(t, h.verifyToken(token, "different-nonce-1", req))
 	require.False(t, h.verifyToken(advanceToken("wrong-secret", nonce, req), nonce, req))
 	require.False(t, h.verifyToken(token, "short", req))
-	require.False(t, h.verifyToken(fmt.Sprintf("%x", md5.Sum([]byte("lotto-dvr"+req.Time+req.Table+req.GC+req.Game))), nonce, req))
+	require.False(t, h.verifyToken(fmt.Sprintf("%x", md5.Sum([]byte("test-secret"+req.Time+req.Table+req.GC+req.Game))), nonce, req))
+}
+
+func TestSplitRecNoSecretConfiguredFailsClosed(t *testing.T) {
+	req := splitRecRequest{Time: "2000000000", Table: "table", GC: "gc", Game: "game"}
+
+	h := NewSplitRecHandler(nil, nil, test.NilLogger)
+	// authMode defaults to "simple" with no secret configured (ConfigureAuth
+	// never called) - the unkeyed MD5 token an outside caller could compute
+	// without knowing any secret must still be rejected.
+	unkeyed := fmt.Sprintf("%x", md5.Sum([]byte(req.Time+req.Table+req.GC+req.Game)))
+	require.False(t, h.verifyToken(unkeyed, "", req))
+
+	h.ConfigureAuth("advance", "")
+	require.False(t, h.verifyToken(advanceToken("", "0123456789abcdef", req), "0123456789abcdef", req))
 }
 
 func TestSplitRecAdvanceNonceReplay(t *testing.T) {

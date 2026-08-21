@@ -19,9 +19,9 @@ http://127.0.0.1:8080/
 常用 URL：
 
 ```text
-/?site=studio_3drush&view=fwh&quality=auto
-/?site=studio_gsp2w&view=fwv&quality=720P
-/?site=studio_3drush&view=fwh&quality=audio
+/?site=studio_table1&view=fwh&quality=auto
+/?site=studio_table2&view=fwv&quality=720P
+/?site=studio_table1&view=fwh&quality=audio
 ```
 
 页面默认不自动播放，用户需要点击播放按钮。`embedded=1&autoplay=1&preview=grid&muted=1` 用于 multipusher 的内嵌预览场景。
@@ -30,8 +30,8 @@ http://127.0.0.1:8080/
 
 | 参数 | 说明 |
 | --- | --- |
-| `site` | 支持 `studio_3drush`、`studio_gsp2w`，也可由流名推断。 |
-| `view` | 支持 `fwh`、`fwv`。`studio_3drush` 默认 `fwh`，`studio_gsp2w` 默认 `fwv`。 |
+| `site` | 支持 `studio_table1`、`studio_table2`，也可由流名推断。 |
+| `view` | 支持 `fwh`、`fwv`。`studio_table1` 默认 `fwh`，`studio_table2` 默认 `fwv`。 |
 | `quality` | 支持 `auto`、`1080P`、`720P`、`360P`、`audio`，内部归一化为 `auto`、`high`、`standard`、`economic`、`bottom`。 |
 | `bottom` / `economic` / `standard` / `standardHevc` / `high` | 可覆盖对应档位的精确流名，multipusher 预览链接会使用这些参数。 |
 | `embedded` | `1` 时进入内嵌模式。 |
@@ -53,8 +53,8 @@ http://127.0.0.1:8080/
   "msg": "OK",
   "data": {
     "env": "test",
-    "domain": "https://lotto-videostat.gelotto-test.com",
-    "baseUrl": "https://lotto-videostat.gelotto-test.com"
+    "domain": "https://videostat-test.example.com",
+    "baseUrl": "https://videostat-test.example.com"
   }
 }
 ```
@@ -63,10 +63,10 @@ http://127.0.0.1:8080/
 
 | env | StatAPI base URL |
 | --- | --- |
-| `test` | `https://lotto-videostat.gelotto-test.com` |
-| `uat` | `https://lotto-videostat.gelotto-uat.com` |
-| `stag` | `https://lotto-videostat.numericgame.io` |
-| `prod` | `https://lotto-videostat.numericgame.ph` |
+| `test` | `https://videostat-test.example.com` |
+| `uat` | `https://videostat-uat.example.com` |
+| `stag` | `https://videostat-stag.example.com` |
+| `prod` | `https://videostat-prod.example.com` |
 
 如果接口不可用或返回空域名，播放器会跳过埋点上报。当前 backend 不提供本地 `/api/stat/*` 兜底接口。
 
@@ -77,13 +77,13 @@ http://127.0.0.1:8080/
 调用方式一：按现场、视角和质量解析流名。
 
 ```text
-GET /api/play/txUrl?site=studio_3drush&view=fwh&quality=720P
+GET /api/play/txUrl?site=studio_table1&view=fwh&quality=720P
 ```
 
 调用方式二：按精确流名请求。
 
 ```text
-GET /api/play/txUrl?stream=3drush-fwh_standard_hevc
+GET /api/play/txUrl?stream=table1-fwh_standard_hevc
 ```
 
 `stream` 优先级高于 `site/view/quality`。`stream` 只允许字母、数字、`-`、`_`，最大 128 字符。
@@ -103,10 +103,10 @@ GET /api/play/txUrl?stream=3drush-fwh_standard_hevc
 
 | site | view | base |
 | --- | --- | --- |
-| `studio_3drush` | `fwh` | `3drush-fwh` |
-| `studio_3drush` | `fwv` | `3drush-fwv` |
-| `studio_gsp2w` | `fwh` | `gsp2w-fwh` |
-| `studio_gsp2w` | `fwv` | `gsp2w-fwv` |
+| `studio_table1` | `fwh` | `table1-fwh` |
+| `studio_table1` | `fwv` | `table1-fwv` |
+| `studio_table2` | `fwh` | `table2-fwh` |
+| `studio_table2` | `fwv` | `table2-fwv` |
 
 成功响应：
 
@@ -115,8 +115,8 @@ GET /api/play/txUrl?stream=3drush-fwh_standard_hevc
   "code": 0,
   "msg": "success",
   "data": {
-    "webrtc": "webrtc://play.numericgame.ph/live/3drush-fwh_standard_hevc?txTime=...&txSecret=...",
-    "stream": "3drush-fwh_standard_hevc",
+    "webrtc": "webrtc://play.example.com/live/table1-fwh_standard_hevc?txTime=...&txSecret=...",
+    "stream": "table1-fwh_standard_hevc",
     "site": "",
     "view": "",
     "quality": "stream",
@@ -131,7 +131,7 @@ GET /api/play/txUrl?stream=3drush-fwh_standard_hevc
 
 | 控件 | 当前值 |
 | --- | --- |
-| Site name | `studio_3drush`, `studio_gsp2w` |
+| Site name | `studio_table1`, `studio_table2` |
 | View name | `fwh`, `fwv` |
 | quality level | `auto`, `1080P`, `720P`, `360P`, `audio` |
 

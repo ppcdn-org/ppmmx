@@ -51,7 +51,7 @@
 
 <div id="controls">
     <label for="urlInput">WHEP URL:</label>
-    <input type="text" id="urlInput" value="http://localhost:8889/live/3drush-fwv/whep" placeholder="Enter Edge WHEP URL (http://edge:8890/live/whep)">
+    <input type="text" id="urlInput" value="http://localhost:8889/live/table-view/whep" placeholder="Enter Edge WHEP URL (http://edge:8890/live/whep)">
     
     <div style="display: flex; align-items: center; gap: 5px; margin-left: 10px;">
         <span id="wsStatus" class="ws-status" title="Signaling Status"></span>
@@ -84,13 +84,14 @@
   var url = params.get('url');
   var input = document.getElementById('urlInput');
   if (url) input.value = url;
-  else if (host) input.value = 'http://' + host + '/live/3drush-fwv/whep';
+  else if (host) input.value = 'http://' + host + '/live/table-view/whep';
 })();
 </script>
 
 <!-- Load libraries before application scripts. -->
 <script src="mmxplayer.js?v=20260722-multilayer1"></script>
 <script src="abr-engine.js?v=20260722-multilayer1"></script>
+<script src="sei-timestamp.js?v=20260811-1"></script>
 <script src="main.js?v=20260722-multilayer1"></script>
 
 </body>

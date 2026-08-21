@@ -14,51 +14,68 @@ import (
 )
 
 func TestUploadConfigIsProd(t *testing.T) {
-	require.True(t, UploadConfig{Env: "prod"}.isProd())
-	require.True(t, UploadConfig{Env: "PROD"}.isProd())
-	require.True(t, UploadConfig{Env: " prod "}.isProd())
-	require.False(t, UploadConfig{Env: "test"}.isProd())
-	require.False(t, UploadConfig{Env: "uat"}.isProd())
-	require.False(t, UploadConfig{Env: ""}.isProd())
+	require.True(t, UploadConfig{Env: "prod"}.isProd(""))
+	require.True(t, UploadConfig{Env: "PROD"}.isProd(""))
+	require.True(t, UploadConfig{Env: " prod "}.isProd(""))
+	require.False(t, UploadConfig{Env: "test"}.isProd(""))
+	require.False(t, UploadConfig{Env: "uat"}.isProd(""))
+	require.False(t, UploadConfig{Env: ""}.isProd(""))
+}
+
+// TestUploadConfigIsProdAppEnvOverride verifies the split-rec request's
+// "app_env" field takes priority over the process-wide APP_ENV (UploadConfig.Env)
+// when non-empty - this is what lets one process serve multiple game
+// environments, each round routed independently - and that an empty appEnv
+// (callers that don't send it) falls back to the process-wide value.
+func TestUploadConfigIsProdAppEnvOverride(t *testing.T) {
+	require.True(t, UploadConfig{Env: "test"}.isProd("prod"), "app_env overrides process-wide Env")
+	require.False(t, UploadConfig{Env: "prod"}.isProd("test"), "app_env overrides process-wide Env, other direction")
+	require.True(t, UploadConfig{Env: "prod"}.isProd(""), "empty app_env falls back to process-wide Env")
 }
 
 func TestUploadConfigConfigured(t *testing.T) {
-	require.False(t, UploadConfig{}.configured(), "nothing set")
+	require.False(t, UploadConfig{}.configured(""), "nothing set")
 
 	require.False(t, UploadConfig{
 		Env: "prod", S3Bucket: "b", S3AccessKey: "a",
-	}.configured(), "prod missing S3 secret key")
+	}.configured(""), "prod missing S3 secret key")
 
 	require.True(t, UploadConfig{
 		Env: "prod", S3Bucket: "b", S3AccessKey: "a", S3SecretKey: "s",
-	}.configured(), "prod with full S3 creds")
+	}.configured(""), "prod with full S3 creds")
 
 	require.False(t, UploadConfig{
 		Env: "prod", MinioEndpoint: "e", MinioAccessKey: "a", MinioSecretKey: "s",
-	}.configured(), "prod ignores MinIO-only config")
+	}.configured(""), "prod ignores MinIO-only config")
 
 	require.False(t, UploadConfig{
 		Env: "test", MinioEndpoint: "e", MinioAccessKey: "a",
-	}.configured(), "non-prod missing MinIO secret key")
+	}.configured(""), "non-prod missing MinIO secret key")
 
 	require.True(t, UploadConfig{
 		Env: "test", MinioEndpoint: "e", MinioAccessKey: "a", MinioSecretKey: "s",
-	}.configured(), "non-prod with full MinIO creds")
+	}.configured(""), "non-prod with full MinIO creds")
 
 	require.False(t, UploadConfig{
 		Env: "", S3Bucket: "b", S3AccessKey: "a", S3SecretKey: "s",
-	}.configured(), "empty env routes to MinIO, ignoring S3-only config")
+	}.configured(""), "empty env routes to MinIO, ignoring S3-only config")
 
 	require.False(t, UploadConfig{
 		Env: "", MinioEndpoint: "e", MinioAccessKey: "a", MinioSecretKey: "s",
-	}.configured(), "MinIO with no env set has no derivable bucket name")
+	}.configured(""), "MinIO with no env set has no derivable bucket name")
+
+	require.True(t, UploadConfig{
+		Env: "test", S3Bucket: "b", S3AccessKey: "a", S3SecretKey: "s",
+	}.configured("prod"), "app_env=prod overrides process-wide Env=test, routes to S3")
 }
 
 func TestUploadConfigMinioBucket(t *testing.T) {
-	require.Equal(t, "test", UploadConfig{Env: "test"}.minioBucket())
-	require.Equal(t, "uat", UploadConfig{Env: "UAT"}.minioBucket())
-	require.Equal(t, "stag", UploadConfig{Env: " stag "}.minioBucket())
-	require.Equal(t, "", UploadConfig{Env: ""}.minioBucket())
+	require.Equal(t, "test", UploadConfig{Env: "test"}.minioBucket(""))
+	require.Equal(t, "uat", UploadConfig{Env: "UAT"}.minioBucket(""))
+	require.Equal(t, "stag", UploadConfig{Env: " stag "}.minioBucket(""))
+	require.Equal(t, "", UploadConfig{Env: ""}.minioBucket(""))
+	require.Equal(t, "prod", UploadConfig{Env: "test"}.minioBucket("prod"), "app_env overrides process-wide Env")
+	require.Equal(t, "prod", UploadConfig{Env: "prod"}.minioBucket(""), "empty app_env falls back to process-wide Env")
 }
 
 func TestUploadConfigMinioSecure(t *testing.T) {
@@ -71,24 +88,24 @@ func TestUploadConfigMinioSecure(t *testing.T) {
 }
 
 func TestObjectKeyForUsesBaseName(t *testing.T) {
-	path := filepath.Join("recordings", "live", "3drush-fwv", "3drush-fwv-loto20250904109-p2w001.mp4")
-	require.Equal(t, "3drush-fwv-loto20250904109-p2w001.mp4", objectKeyFor(path))
+	path := filepath.Join("recordings", "live", "table1-fwv", "table1-fwv-rec20250904109-p2w001.mp4")
+	require.Equal(t, "table1-fwv-rec20250904109-p2w001.mp4", objectKeyFor(path))
 }
 
 func TestUploadAsyncNoopWhenNotConfigured(t *testing.T) {
 	// Should return immediately without attempting any network I/O and
 	// without panicking, for both an unconfigured uploader and a nil one.
 	u := newUploader(UploadConfig{}, test.NilLogger)
-	u.uploadAsync("/does/not/exist.mp4", "does-not-exist.mp4")
+	u.uploadAsync("/does/not/exist.mp4", "does-not-exist.mp4", "")
 
 	var nilUploader *uploader
-	nilUploader.uploadAsync("/does/not/exist.mp4", "does-not-exist.mp4")
+	nilUploader.uploadAsync("/does/not/exist.mp4", "does-not-exist.mp4", "")
 }
 
 func TestUploadConfigS3BucketName(t *testing.T) {
-	require.Equal(t, "ge-lotto-live", UploadConfig{S3Bucket: "s3://ge-lotto-live"}.s3BucketName(),
+	require.Equal(t, "example-bucket", UploadConfig{S3Bucket: "s3://example-bucket"}.s3BucketName(),
 		"S3_BUCKET is commonly configured with a s3:// prefix (AWS CLI style); the AWS SDK needs the bare name")
-	require.Equal(t, "ge-lotto-live", UploadConfig{S3Bucket: " s3://ge-lotto-live/ "}.s3BucketName())
+	require.Equal(t, "example-bucket", UploadConfig{S3Bucket: " s3://example-bucket/ "}.s3BucketName())
 	require.Equal(t, "plain-bucket", UploadConfig{S3Bucket: "plain-bucket"}.s3BucketName())
 	require.Equal(t, "", UploadConfig{}.s3BucketName())
 }
@@ -98,28 +115,37 @@ func TestPlaybackURLSuffix(t *testing.T) {
 	// needs a resolved bucket name - both S3's (as configured, minus any
 	// s3:// prefix) and MinIO's (the env name) - or it's omitted entirely.
 	prod := newUploader(UploadConfig{Env: "prod", S3Bucket: "s3://my-bucket", S3Domain: "cdn.example.com/"}, test.NilLogger)
-	require.Equal(t, ", url=https://cdn.example.com/my-bucket/key.mp4", prod.playbackURLSuffix("key.mp4"))
+	require.Equal(t, ", url=https://cdn.example.com/my-bucket/key.mp4", prod.playbackURLSuffix("key.mp4", ""))
 
 	prodNoDomain := newUploader(UploadConfig{Env: "prod", S3Bucket: "my-bucket"}, test.NilLogger)
-	require.Equal(t, "", prodNoDomain.playbackURLSuffix("key.mp4"))
+	require.Equal(t, "", prodNoDomain.playbackURLSuffix("key.mp4", ""))
 
 	prodNoBucket := newUploader(UploadConfig{Env: "prod", S3Domain: "cdn.example.com"}, test.NilLogger)
-	require.Equal(t, "", prodNoBucket.playbackURLSuffix("key.mp4"), "no bucket resolvable - omit rather than build a broken URL")
+	require.Equal(t, "", prodNoBucket.playbackURLSuffix("key.mp4", ""), "no bucket resolvable - omit rather than build a broken URL")
 
 	nonProd := newUploader(UploadConfig{Env: "test", S3Domain: "cdn.example.com"}, test.NilLogger)
-	require.Equal(t, "", nonProd.playbackURLSuffix("key.mp4"), "non-prod ignores S3Domain/S3Bucket")
+	require.Equal(t, "", nonProd.playbackURLSuffix("key.mp4", ""), "non-prod ignores S3Domain/S3Bucket")
 
 	nonProdWithMinioDomain := newUploader(UploadConfig{Env: "test", MinioDomain: "minio.example.com/"}, test.NilLogger)
-	require.Equal(t, ", url=https://minio.example.com/test/key.mp4", nonProdWithMinioDomain.playbackURLSuffix("key.mp4"))
+	require.Equal(t, ", url=https://minio.example.com/test/key.mp4", nonProdWithMinioDomain.playbackURLSuffix("key.mp4", ""))
 
 	// Both S3_HTTPS_DOMAIN and MINIO_URL are commonly configured
 	// as a full URL (scheme included) rather than a bare domain; the
 	// scheme must not be duplicated.
 	prodWithSchemeInDomain := newUploader(UploadConfig{Env: "prod", S3Bucket: "my-bucket", S3Domain: "https://cdn.example.com/"}, test.NilLogger)
-	require.Equal(t, ", url=https://cdn.example.com/my-bucket/key.mp4", prodWithSchemeInDomain.playbackURLSuffix("key.mp4"))
+	require.Equal(t, ", url=https://cdn.example.com/my-bucket/key.mp4", prodWithSchemeInDomain.playbackURLSuffix("key.mp4", ""))
 
 	nonProdWithSchemeInMinioDomain := newUploader(UploadConfig{Env: "test", MinioDomain: "https://minio.example.com"}, test.NilLogger)
-	require.Equal(t, ", url=https://minio.example.com/test/key.mp4", nonProdWithSchemeInMinioDomain.playbackURLSuffix("key.mp4"))
+	require.Equal(t, ", url=https://minio.example.com/test/key.mp4", nonProdWithSchemeInMinioDomain.playbackURLSuffix("key.mp4", ""))
+
+	// app_env overrides the process-wide Env for both which backend is used
+	// and, for MinIO, which bucket - a multi-environment process's log line
+	// must reflect the actual destination of each round's upload.
+	appEnvOverridesToProd := newUploader(UploadConfig{Env: "test", S3Bucket: "my-bucket", S3Domain: "cdn.example.com"}, test.NilLogger)
+	require.Equal(t, ", url=https://cdn.example.com/my-bucket/key.mp4", appEnvOverridesToProd.playbackURLSuffix("key.mp4", "prod"))
+
+	appEnvOverridesMinioBucket := newUploader(UploadConfig{Env: "test", MinioDomain: "minio.example.com"}, test.NilLogger)
+	require.Equal(t, ", url=https://minio.example.com/uat/key.mp4", appEnvOverridesMinioBucket.playbackURLSuffix("key.mp4", "uat"))
 }
 
 func TestFaststartRemuxSkipsGracefullyWhenFfmpegNotFound(t *testing.T) {

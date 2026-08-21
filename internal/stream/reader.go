@@ -22,6 +22,8 @@ type OnDataFilterFunc func(*unit.Unit) bool
 type Reader struct {
 	SkipOutboundBytes bool
 	Parent            logger.Writer
+	// MediaFilter runs before queueing and can independently filter medias.
+	MediaFilter func(*description.Media, *unit.Unit) bool
 
 	onDatas                 map[*description.Media]map[format.Format]OnDataFunc
 	onDataFilters           map[*description.Media]map[format.Format]OnDataFilterFunc
@@ -42,6 +44,17 @@ func (r *Reader) OnData(origMedia *description.Media, origFormat format.Format, 
 		r.onDatas[origMedia] = make(map[format.Format]OnDataFunc)
 	}
 	r.onDatas[origMedia][origFormat] = cb
+	if r.MediaFilter != nil {
+		if r.onDataFilters == nil {
+			r.onDataFilters = make(map[*description.Media]map[format.Format]OnDataFilterFunc)
+		}
+		if r.onDataFilters[origMedia] == nil {
+			r.onDataFilters[origMedia] = make(map[format.Format]OnDataFilterFunc)
+		}
+		r.onDataFilters[origMedia][origFormat] = func(u *unit.Unit) bool {
+			return r.MediaFilter(origMedia, u)
+		}
+	}
 }
 
 // OnDataFiltered registers a callback with a filter that runs before queueing.
@@ -52,6 +65,7 @@ func (r *Reader) OnDataFiltered(
 	cb OnDataFunc,
 ) {
 	r.OnData(origMedia, origFormat, cb)
+	mediaFilter := r.MediaFilter
 
 	if r.onDataFilters == nil {
 		r.onDataFilters = make(map[*description.Media]map[format.Format]OnDataFilterFunc)
@@ -59,7 +73,9 @@ func (r *Reader) OnDataFiltered(
 	if r.onDataFilters[origMedia] == nil {
 		r.onDataFilters[origMedia] = make(map[format.Format]OnDataFilterFunc)
 	}
-	r.onDataFilters[origMedia][origFormat] = filter
+	r.onDataFilters[origMedia][origFormat] = func(u *unit.Unit) bool {
+		return (mediaFilter == nil || mediaFilter(origMedia, u)) && filter(u)
+	}
 }
 
 // Formats returns all formats for which the reader has registered a OnData callback.

@@ -28,6 +28,7 @@ import (
 	pwebrtc "github.com/pion/webrtc/v4"
 	"github.com/stretchr/testify/require"
 
+	"github.com/bluenviron/mediamtx/internal/conf"
 	"github.com/bluenviron/mediamtx/internal/defs"
 	"github.com/bluenviron/mediamtx/internal/formatlabel"
 	"github.com/bluenviron/mediamtx/internal/protocols/webrtc"
@@ -1258,6 +1259,7 @@ func TestAPIProtocolKick(t *testing.T) {
 					Log:            test.NilLogger,
 					Publish:        true,
 					OutboundTracks: []*webrtc.OutboundTrack{track},
+					DeviceID:       conf.DefaultWHIPWSSecret,
 				}
 
 				err = c.Initialize(context.Background())

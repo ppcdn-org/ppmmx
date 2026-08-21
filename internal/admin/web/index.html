@@ -299,10 +299,9 @@ async function renderSiteConfig() {
         <tr><td>Main Player Domain</td><td><input id="mainPlayerDomain" class="config-input" value="${esc(data.main_player_domain||'')}" disabled></td></tr>
         <tr><td>Backup Player Domain</td><td><input id="backupPlayerDomain" class="config-input" value="${esc(data.backup_player_domain||'')}" disabled></td></tr>
         <tr><td>VideoStat Domain</td><td><select id="videoStatDomain" class="config-input" disabled>
-          <option value="test" ${data.videostat_env==='test'?'selected':''}>test: https://lotto-videostat.gelotto-test.com/api/stat</option>
-          <option value="uat" ${data.videostat_env==='uat'?'selected':''}>uat: https://lotto-videostat.gelotto-uat.com/api/stat</option>
-          <option value="stag" ${data.videostat_env==='stag'?'selected':''}>stag: https://lotto-videostat.numericgame.io/api/stat</option>
-          <option value="prod" ${data.videostat_env==='prod'?'selected':''}>prod: https://lotto-videostat.numericgame.ph/api/stat</option>
+          ${Object.entries(data.videostat_environments||{}).map(([env,url])=>
+            `<option value="${esc(env)}" ${data.videostat_env===env?'selected':''}>${esc(env)}: ${esc(url||'(not configured)')}</option>`
+          ).join('')}
         </select></td></tr>
       </table><div class="config-actions">
         <button class="btn-primary" id="editConfigBtn" onclick="editConfig()">Edit</button>

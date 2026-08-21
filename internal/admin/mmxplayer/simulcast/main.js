@@ -18,7 +18,7 @@ const wsStatusDot = document.getElementById('wsStatus');
         const inp = document.createElement('input');
         inp.id = 'webrtc';
         inp.type = 'text';
-        inp.value = 'http://localhost:8889/live/3drush-fwv/whep';
+        inp.value = 'http://localhost:8889/live/table1-fwv/whep';
         inp.style.display = 'none';
         document.body.appendChild(inp);
     }
@@ -26,6 +26,7 @@ const wsStatusDot = document.getElementById('wsStatus');
 
 let reader = null;
 let readerGeneration = 0;
+let seiReaderAttached = false;
 let controlClient = null;
 let statsInterval = null;
 let lastStats = { videoBytes: 0, audioBytes: 0, timestamp: 0 };
@@ -36,6 +37,41 @@ let statStartTime = 0;
 let statRound = 70000;
 let statLagStartedAt = 0;
 let lastLagReportAt = 0;
+
+// p2p delay: local render time minus the timestamp the OBS publisher
+// embedded when it sent the frame (see docs/obs-abs-timestamp-protocol.md
+// in the OBS repo). Two independent sources feed the same displayed value:
+//
+// 1. SEI (sei-timestamp.js): read directly out of the encoded H.264
+//    bitstream via WebCodecs Insertable Streams. Survives mmx-to-mmx
+//    cascading (no server-side relay needed) and is inherently correct
+//    for whatever layer is actually being decoded. Chromium-only.
+// 2. DataChannel relay (OBS_TIMESTAMP over the ABR control WebSocket, see
+//    obs_timestamp_broadcast.go in mmx): only valid for a direct
+//    OBS->mmx->player hop (no cascading), and needs manual rid matching
+//    since it carries every simulcast layer's messages. Kept as a
+//    fallback for non-Chromium browsers where SEI reading isn't available.
+//
+// SEI takes priority whenever both are reporting fresh values.
+let lastP2PDelayMs = null;
+let lastP2PDelayAt = 0;
+let lastP2PDelaySource = null; // 'sei' | 'datachannel'
+const P2P_DELAY_STALE_MS = 5000;
+// Measured delay is a floor (clock skew / rounding always trend it low,
+// never high) - pad it so displayed numbers don't read as falsely great.
+const P2P_DELAY_ERROR_MARGIN_MS = 50;
+
+function reportP2PDelay(timestampMs, source) {
+    // SEI is strictly more accurate (in-band, cascade-safe, no rid
+    // ambiguity) - once it's reporting, ignore stale DataChannel values.
+    if (source === 'datachannel' && lastP2PDelaySource === 'sei' &&
+        (Date.now() - lastP2PDelayAt) < P2P_DELAY_STALE_MS) {
+        return;
+    }
+    lastP2PDelayMs = Date.now() - Number(timestampMs) + P2P_DELAY_ERROR_MARGIN_MS;
+    lastP2PDelayAt = Date.now();
+    lastP2PDelaySource = source;
+}
 
 async function loadStatConfig() {
     if (statConfig) return statConfig;
@@ -272,6 +308,10 @@ function startStream() {
 
     statsContainer.innerHTML = '<div style="color: #00bcd4; text-align: center;">Connecting WHEP...</div>';
     previousTrackType = null;
+    lastP2PDelayMs = null;
+    lastP2PDelayAt = 0;
+    lastP2PDelaySource = null;
+    seiReaderAttached = false;
 
     reader = new MediaMTXWebRTCReader({
         url: url,
@@ -282,6 +322,13 @@ function startStream() {
                 if (video.srcObject !== evt.streams[0]) {
                     video.srcObject = evt.streams[0];
                 }
+            }
+            if (evt.track.kind === 'video' && !seiReaderAttached && evt.receiver &&
+                typeof window.attachSeiTimestampReader === 'function') {
+                seiReaderAttached = window.attachSeiTimestampReader(evt.receiver, (ts) => {
+                    reportP2PDelay(ts, 'sei');
+                });
+                if (seiReaderAttached) console.log('[SEI] abs-timestamp reader attached');
             }
         },
         onError: (err) => {
@@ -349,6 +396,17 @@ function initControlClient(whepUrl, sessionId) {
             if (!layerSelect.disabled){
                 updateLayerSelectUI(tracks, activeId);
             }
+        },
+        onObsTimestamp: (data) => {
+            // Fallback path (see comment above lastP2PDelayMs) - only used
+            // when SEI reading isn't available. Only count frames from the
+            // layer we're actually decoding: OBS tags each simulcast
+            // layer's frames with that layer's own rid, and
+            // frame_no/timestamp are meaningless if mismatched.
+            const activeTrack = abrEngine.trackRegistry[abrEngine.currentTrackId];
+            const activeRid = activeTrack ? String(activeTrack.rid) : null;
+            if (activeRid === null || String(data.rid) !== activeRid) return;
+            reportP2PDelay(data.timestamp, 'datachannel');
         },
         onLayerSwitched: (id) => {
             console.log("[UI] Received Track switch:", id);
@@ -602,10 +660,16 @@ async function updateStats() {
             let abrStatus = (abrEngine && abrEngine.isAutoMode) ? 'Auto' : 'Manual';
             if (abrEngine && abrEngine.abrCooldown > 0) abrStatus += ` (Cool ${abrEngine.abrCooldown})`;
 
+            const p2pFresh = lastP2PDelayMs !== null && (Date.now() - lastP2PDelayAt) < P2P_DELAY_STALE_MS;
+            const p2pLabel = p2pFresh
+                ? `${lastP2PDelayMs.toFixed(0)} ms (${lastP2PDelaySource === 'sei' ? 'SEI' : 'DC'})`
+                : 'N/A';
+
             html += renderStatGroup('Network', {
                 'RTT': `${(networkStats.currentRoundTripTime * 1000).toFixed(1)} ms`,
                 'Est. Bandwidth': bw,
-                'ABR State': abrStatus
+                'ABR State': abrStatus,
+                'P2P Delay': p2pLabel
             });
         }
 

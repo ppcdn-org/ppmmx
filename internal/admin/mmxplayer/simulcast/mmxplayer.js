@@ -143,6 +143,13 @@ class MMXControlClient {
                 if (this.callbacks.onMediaState) this.callbacks.onMediaState(data);
                 break;
 
+            case 'OBS_TIMESTAMP':
+                // Relayed from the WHIP publisher's "obs-timestamp" DataChannel
+                // (see docs/obs-abs-timestamp-protocol.md in the OBS repo).
+                // data: { frame_no, timestamp, rid }
+                if (this.callbacks.onObsTimestamp) this.callbacks.onObsTimestamp(data);
+                break;
+
             case 'ERROR':
                 const errMsg = data?.message || data?.error || 'Unknown Error';
                 const errCode = data?.code || 'N/A';
@@ -414,6 +421,12 @@ class MediaMTXWebRTCReader {
     this.pc = new RTCPeerConnection({
       iceServers,
       sdpSemantics: 'unified-plan',
+      // Enables RTCRtpReceiver.createEncodedStreams() (Chromium-only) so
+      // sei-timestamp.js can read the OBS abs-timestamp SEI directly out
+      // of the encoded bitstream, independent of the DataChannel relay
+      // and of any mmx-to-mmx cascading. Harmless on browsers that ignore
+      // this option (createEncodedStreams then simply isn't available).
+      encodedInsertableStreams: true,
     });
 
     const direction = 'recvonly';

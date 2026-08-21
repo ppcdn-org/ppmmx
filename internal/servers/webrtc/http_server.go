@@ -1,6 +1,7 @@
 package webrtc
 
 import (
+	"crypto/subtle"
 	_ "embed"
 	"errors"
 	"fmt"
@@ -21,7 +22,6 @@ import (
 	"github.com/bluenviron/mediamtx/internal/logger"
 	"github.com/bluenviron/mediamtx/internal/protocols/httpp"
 	"github.com/bluenviron/mediamtx/internal/protocols/whip"
-
 )
 
 //go:embed publish_index.html
@@ -100,7 +100,6 @@ func (s *httpServer) initialize() error {
 	}
 
 	router.Use(s.onRequest)
-
 
 	var proto string
 	if s.encryption {
@@ -198,7 +197,37 @@ func (s *httpServer) onWHIPOptions(ctx *gin.Context, pathName string, publish bo
 	ctx.Writer.WriteHeader(http.StatusNoContent)
 }
 
+// checkWHIPDeviceID verifies WHIP_WS_SECRET (conf.WebRTCDegradeWSSecret) for
+// publish requests. This is separate from, and in addition to,
+// checkAuthOutsideSession's username/password/IP checks.
+//
+// The canonical transport is the "WHIP-Device-Id" header. Stock WHIP clients
+// (including OBS's built-in WHIP output, even the mmx-degrade-patched build)
+// have no way to send an arbitrary header - their only configurable
+// credential is a "Bearer Token" field that goes out as a standard
+// Authorization header - so "Authorization: Bearer <secret>" is also
+// accepted, as a fallback checked only when "WHIP-Device-Id" is absent, so
+// it never collides with Basic/JWT credentials that a path's own publish
+// auth might also carry in Authorization.
+func (s *httpServer) checkWHIPDeviceID(ctx *gin.Context) bool {
+	deviceID := ctx.Request.Header.Get("WHIP-Device-Id")
+	if deviceID == "" {
+		if v := ctx.Request.Header.Get("Authorization"); strings.HasPrefix(v, "Bearer ") {
+			deviceID = strings.TrimPrefix(v, "Bearer ")
+		}
+	}
+	if deviceID == "" || subtle.ConstantTimeCompare([]byte(deviceID), []byte(s.parent.DegradeWSSecret)) != 1 {
+		s.writeErrorNoLog(ctx, http.StatusUnauthorized, fmt.Errorf("publish deviceID authentication failure!"))
+		return false
+	}
+	return true
+}
+
 func (s *httpServer) onWHIPPost(ctx *gin.Context, pathName string, publish bool) {
+	if publish && !s.checkWHIPDeviceID(ctx) {
+		return
+	}
+
 	contentType := httpp.ParseContentType(ctx.Request.Header.Get("Content-Type"))
 	if contentType != "application/sdp" {
 		s.writeErrorNoLog(ctx, http.StatusBadRequest, fmt.Errorf("invalid Content-Type"))
@@ -330,13 +359,21 @@ func (s *httpServer) onWHIPDelete(ctx *gin.Context, rawSecret string) {
 		s.writeErrorNoLog(ctx, http.StatusBadRequest, fmt.Errorf("invalid secret"))
 		return
 	}
+	s.Log(logger.Info, "WHIP/WHEP session delete requested by %s, secret=%s, user-agent=%q",
+		ctx.Request.RemoteAddr, rawSecret, ctx.Request.UserAgent())
 
 	err = s.parent.deleteSession(deleteSessionReq{
 		secret: secret,
 	})
 	if err != nil {
 		if errors.Is(err, ErrSessionNotFound) {
-			s.writeErrorNoLog(ctx, http.StatusNotFound, err)
+			// DELETE is idempotent. After a server restart, WHIP clients can
+			// retry deletion of a resource created by the previous process.
+			// Returning 404 makes OBS stop its reconnect sequence.
+			s.Log(logger.Info, "WHIP/WHEP session was already absent, accepting DELETE")
+			ctx.AbortWithStatusJSON(http.StatusOK, &defs.APIOK{
+				Status: defs.APIOKStatusOK,
+			})
 		} else {
 			s.writeErrorNoLog(ctx, http.StatusInternalServerError, err)
 		}
@@ -379,6 +416,21 @@ func (s *httpServer) middlewarePreflightRequests(ctx *gin.Context) {
 }
 
 func (s *httpServer) onRequest(ctx *gin.Context) {
+	// WHIP degrade-protocol control WebSocket (see
+	// docs/obs-mmx-degrade-protocol.md). Must be checked before
+	// reWHIPWHEPNoID below: a path ending in ".../ws/whip" would otherwise
+	// also match it (which only requires the last segment to be literally
+	// "whip"), misrouting this as a WHIP publish attempt for path ".../ws".
+	if s.parent.DegradeWSPathSuffix != "" &&
+		ctx.Request.Method == http.MethodGet &&
+		strings.HasSuffix(ctx.Request.URL.Path, s.parent.DegradeWSPathSuffix) &&
+		len(ctx.Request.URL.Path) > len(s.parent.DegradeWSPathSuffix)+1 {
+		pathName := strings.TrimSuffix(ctx.Request.URL.Path, s.parent.DegradeWSPathSuffix)
+		pathName = strings.TrimPrefix(pathName, "/")
+		s.handleWHIPDegradeWebSocket(ctx, pathName)
+		return
+	}
+
 	// WHIP/WHEP, outside session
 	if m := reWHIPWHEPNoID.FindStringSubmatch(ctx.Request.URL.Path); m != nil {
 		switch ctx.Request.Method {
@@ -409,8 +461,8 @@ func (s *httpServer) onRequest(ctx *gin.Context) {
 		return
 	}
 
-	// ABR WebSocket control endpoint
-	if s.parent.ABREnable && ctx.Request.URL.Path == s.parent.ABRWSPath &&
+	// WHEP media and ABR control endpoint.
+	if ctx.Request.URL.Path == s.parent.ABRWSPath &&
 		ctx.Request.Method == http.MethodGet {
 		s.handleABRWebSocket(ctx)
 		return

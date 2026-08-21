@@ -26,6 +26,8 @@ import (
 const (
 	webrtcStreamID   = "mediamtx"
 	twccExtensionURI = "http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01"
+	// MaxAutoVideoTracks is the number of video m-lines offered in automatic WHEP mode.
+	MaxAutoVideoTracks = 4
 )
 
 func interfaceIPs(interfaceList []string) ([]string, error) {
@@ -65,6 +67,15 @@ func interfaceIPs(interfaceList []string) ([]string, error) {
 func maxTrackCount(medias []*sdp.MediaDescription) int {
 	total := 0
 	for _, media := range medias {
+		// DataChannel (SCTP) m-lines (e.g. OBS's "obs-timestamp") are
+		// not media tracks and never have a corresponding track to
+		// gather — counting them throws off the expected track count
+		// in GatherInboundTracks, producing misleading "N of M tracks"
+		// warnings after successful gather.
+		if media.MediaName.Media == "application" {
+			continue
+		}
+
 		ridCount := 0
 
 		for _, attr := range media.Attributes {
@@ -115,32 +126,45 @@ func candidateLabel(c *webrtc.ICECandidate) string {
 		c.Address + "/" + strconv.FormatInt(int64(c.Port), 10)
 }
 
-// TracksAreValid checks whether tracks in the SDP are valid
-func TracksAreValid(medias []*sdp.MediaDescription) error {
-	videoTrack := false
-	audioTrack := false
+// TracksAreValid checks whether tracks in the SDP are valid.
+// expectedVideoTracks can be zero when an exact video count is not required.
+func TracksAreValid(medias []*sdp.MediaDescription, maxVideoTracks int, expectedVideoTracks int) error {
+	videoTracks := 0
+	audioTracks := 0
 
 	for _, media := range medias {
+		if !mediaCanSend(media) {
+			continue
+		}
+
 		switch media.MediaName.Media {
 		case "video":
-			if videoTrack {
-				return fmt.Errorf("only a single video and a single audio track are supported")
+			videoTracks++
+			if videoTracks > maxVideoTracks {
+				return fmt.Errorf("at most %d video track(s) and a single audio track are supported", maxVideoTracks)
 			}
-			videoTrack = true
 
 		case "audio":
-			if audioTrack {
-				return fmt.Errorf("only a single video and a single audio track are supported")
+			audioTracks++
+			if audioTracks > 1 {
+				return fmt.Errorf("at most %d video track(s) and a single audio track are supported", maxVideoTracks)
 			}
-			audioTrack = true
+
+		case "application":
+			// DataChannel (SCTP) - e.g. OBS's "obs-timestamp" channel
+			// (see docs/obs-abs-timestamp-protocol.md in the OBS repo).
+			// Not a media track; skip silently.
 
 		default:
 			return fmt.Errorf("unsupported media '%s'", media.MediaName.Media)
 		}
 	}
 
-	if !videoTrack && !audioTrack {
+	if videoTracks == 0 && audioTracks == 0 {
 		return fmt.Errorf("no valid tracks found")
+	}
+	if expectedVideoTracks != 0 && videoTracks != expectedVideoTracks {
+		return fmt.Errorf("expected %d video track(s), got %d", expectedVideoTracks, videoTracks)
 	}
 
 	return nil
@@ -163,16 +187,25 @@ type PeerConnection struct {
 	AdditionalHosts       []string
 	STUNGatherTimeout     time.Duration
 	Publish               bool
+	RecvOnlyVideoTracks   int
 	OutboundTracks        []*OutboundTrack
 	OutboundDataChannels  []*OutboundDataChannel
-	Log                   logger.Writer
+	// OnInboundDataChannel, when set, is called for every DataChannel the
+	// remote peer creates (only applies when Publish is false, i.e. this
+	// PeerConnection is receiving media - a WHIP publisher). Used e.g. by
+	// OBS's "obs-timestamp" DataChannel (see
+	// docs/obs-abs-timestamp-protocol.md in the OBS repo).
+	OnInboundDataChannel func(*webrtc.DataChannel)
+	Log                  logger.Writer
 
-	wr               *webrtc.PeerConnection
-	ctx              context.Context
-	ctxCancel        context.CancelFunc
-	readingStarted   atomic.Int64
-	inboundTracks    []*InboundTrack
-	statsInterceptor *statsInterceptor
+	wr                  *webrtc.PeerConnection
+	ctx                 context.Context
+	ctxCancel           context.CancelFunc
+	readingStarted      atomic.Int64
+	inboundTracksMutex  sync.RWMutex
+	inboundTracks       []*InboundTrack
+	inboundTracksClosed bool
+	statsInterceptor    *statsInterceptor
 
 	newLocalCandidate chan *webrtc.ICECandidateInit
 	inboundTrack      chan trackRecvPair
@@ -246,7 +279,18 @@ func (co *PeerConnection) Start() error {
 			})
 		}
 
-		for i, tr := range co.OutboundTracks {
+		// Simulcast encodings of the same OutboundTrack group (shared
+		// TrackID, RID set - see OutboundTrack's type doc) sit on one
+		// m-line and must share one payload type, not get one each - skip
+		// registering a codec again once the group's TrackID has one.
+		codecRegistered := make(map[string]bool)
+		nextPayloadType := webrtc.PayloadType(96)
+
+		for _, tr := range co.OutboundTracks {
+			if tr.RID != "" && codecRegistered[tr.TrackID] {
+				continue
+			}
+
 			var codecType webrtc.RTPCodecType
 			if tr.isVideo() {
 				codecType = webrtc.RTPCodecTypeVideo
@@ -256,10 +300,15 @@ func (co *PeerConnection) Start() error {
 
 			err := mediaEngine.RegisterCodec(webrtc.RTPCodecParameters{
 				RTPCodecCapability: tr.Caps,
-				PayloadType:        webrtc.PayloadType(96 + i),
+				PayloadType:        nextPayloadType,
 			}, codecType)
 			if err != nil {
 				return err
+			}
+			nextPayloadType++
+
+			if tr.RID != "" {
+				codecRegistered[tr.TrackID] = true
 			}
 		}
 
@@ -328,11 +377,41 @@ func (co *PeerConnection) Start() error {
 	co.chStartReading = make(chan struct{})
 
 	if co.Publish {
+		// Simulcast groups (shared TrackID, RID set - see OutboundTrack's
+		// type doc): the group's first track creates the sender via
+		// setup(), every later one joins it via addEncodingTo() instead of
+		// creating its own m-line/transceiver.
+		senderByTrackID := make(map[string]*webrtc.RTPSender)
+		baseByTrackID := make(map[string]*OutboundTrack)
+
 		for _, tr := range co.OutboundTracks {
-			err = tr.setup(co)
+			if tr.RID != "" {
+				if base, ok := baseByTrackID[tr.TrackID]; ok {
+					err = tr.addEncodingTo(co, base, senderByTrackID[tr.TrackID])
+					if err != nil {
+						co.wr.GracefulClose() //nolint:errcheck
+						return err
+					}
+					continue
+				}
+			}
+
+			var sender *webrtc.RTPSender
+			sender, err = tr.setup(co)
 			if err != nil {
 				co.wr.GracefulClose() //nolint:errcheck
 				return err
+			}
+
+			// incoming RTCP packets must always be read to make
+			// interceptors work - once per sender: later encodings of the
+			// same Simulcast group (RID set) reuse this one instead of
+			// creating their own.
+			drainSenderRTCP(sender)
+
+			if tr.RID != "" {
+				baseByTrackID[tr.TrackID] = tr
+				senderByTrackID[tr.TrackID] = sender
 			}
 		}
 
@@ -344,12 +423,18 @@ func (co *PeerConnection) Start() error {
 			}
 		}
 	} else {
-		_, err = co.wr.AddTransceiverFromKind(webrtc.RTPCodecTypeVideo, webrtc.RTPTransceiverInit{
-			Direction: webrtc.RTPTransceiverDirectionRecvonly,
-		})
-		if err != nil {
-			co.wr.GracefulClose() //nolint:errcheck
-			return err
+		if co.RecvOnlyVideoTracks == 0 {
+			co.RecvOnlyVideoTracks = 1
+		}
+
+		for range co.RecvOnlyVideoTracks {
+			_, err = co.wr.AddTransceiverFromKind(webrtc.RTPCodecTypeVideo, webrtc.RTPTransceiverInit{
+				Direction: webrtc.RTPTransceiverDirectionRecvonly,
+			})
+			if err != nil {
+				co.wr.GracefulClose() //nolint:errcheck
+				return err
+			}
 		}
 
 		_, err = co.wr.AddTransceiverFromKind(webrtc.RTPCodecTypeAudio, webrtc.RTPTransceiverInit{
@@ -366,6 +451,10 @@ func (co *PeerConnection) Start() error {
 			case <-co.ctx.Done():
 			}
 		})
+
+		if co.OnInboundDataChannel != nil {
+			co.wr.OnDataChannel(co.OnInboundDataChannel)
+		}
 	}
 
 	co.wr.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
@@ -424,9 +513,12 @@ func (co *PeerConnection) run() {
 	defer close(co.done)
 
 	defer func() {
+		co.inboundTracksMutex.Lock()
+		co.inboundTracksClosed = true
 		for _, track := range co.inboundTracks {
 			track.close()
 		}
+		co.inboundTracksMutex.Unlock()
 		for _, track := range co.OutboundTracks {
 			track.close()
 		}
@@ -443,15 +535,42 @@ func (co *PeerConnection) run() {
 	for {
 		select {
 		case <-co.chStartReading:
+			co.inboundTracksMutex.RLock()
 			for _, track := range co.inboundTracks {
 				track.start()
 			}
+			co.inboundTracksMutex.RUnlock()
 			co.readingStarted.Store(1)
 
 		case <-co.ctx.Done():
 			return
 		}
 	}
+}
+
+func (co *PeerConnection) addInboundTrack(pair trackRecvPair) *InboundTrack {
+	track := &InboundTrack{
+		track:     pair.track,
+		receiver:  pair.receiver,
+		id:        pair.track.ID(),
+		rid:       pair.track.RID(),
+		writeRTCP: co.wr.WriteRTCP,
+		log:       co.Log,
+	}
+	track.initialize()
+
+	co.inboundTracksMutex.Lock()
+	if co.inboundTracksClosed {
+		co.inboundTracksMutex.Unlock()
+		track.close()
+		return track
+	}
+	co.inboundTracks = append(co.inboundTracks, track)
+	if co.readingStarted.Load() == 1 {
+		track.start()
+	}
+	co.inboundTracksMutex.Unlock()
+	return track
 }
 
 func (co *PeerConnection) removeUnwantedCandidates(firstMedia *sdp.MediaDescription) error {
@@ -770,33 +889,27 @@ func (co *PeerConnection) GatherInboundTracks(timeout time.Duration) error {
 
 	t := time.NewTimer(timeout)
 	defer t.Stop()
+	gatheredTrackCount := 0
 
 	for {
 		select {
 		case <-t.C:
-			if len(co.inboundTracks) != 0 {
-				if len(co.inboundTracks) < maxTrackCount {
+			if gatheredTrackCount != 0 {
+				if gatheredTrackCount < maxTrackCount {
 					co.Log.Log(logger.Warn,
 						"track gathering timed out with %d of %d tracks declared in the SDP; "+
 							"late tracks will be ignored (webrtcTrackGatherTimeout can be raised)",
-						len(co.inboundTracks), maxTrackCount)
+						gatheredTrackCount, maxTrackCount)
 				}
 				return nil
 			}
 			return fmt.Errorf("deadline exceeded while waiting tracks")
 
 		case pair := <-co.inboundTrack:
-			t := &InboundTrack{
-				track:     pair.track,
-				receiver:  pair.receiver,
-				rid:       pair.track.RID(),
-				writeRTCP: co.wr.WriteRTCP,
-				log:       co.Log,
-			}
-			t.initialize()
-			co.inboundTracks = append(co.inboundTracks, t)
+			co.addInboundTrack(pair)
+			gatheredTrackCount++
 
-			if len(co.inboundTracks) >= maxTrackCount {
+			if gatheredTrackCount >= maxTrackCount {
 				return nil
 			}
 
@@ -902,7 +1015,9 @@ func (co *PeerConnection) GatheringDone() <-chan struct{} {
 
 // InboundTracks returns incoming tracks.
 func (co *PeerConnection) InboundTracks() []*InboundTrack {
-	return co.inboundTracks
+	co.inboundTracksMutex.RLock()
+	defer co.inboundTracksMutex.RUnlock()
+	return append([]*InboundTrack(nil), co.inboundTracks...)
 }
 
 // StartReading starts reading incoming tracks.
@@ -965,6 +1080,7 @@ func (co *PeerConnection) Stats() *Stats {
 	packetsLost := uint64(0)
 
 	if co.readingStarted.Load() == 1 {
+		co.inboundTracksMutex.RLock()
 		for _, tr := range co.inboundTracks {
 			if recvStats := tr.rtpReceiver.Stats(); recvStats != nil {
 				v += recvStats.Jitter
@@ -973,6 +1089,7 @@ func (co *PeerConnection) Stats() *Stats {
 				packetsLost += recvStats.Lost
 			}
 		}
+		co.inboundTracksMutex.RUnlock()
 	}
 
 	for _, tr := range co.OutboundTracks {
@@ -1004,6 +1121,7 @@ func (co *PeerConnection) Stats() *Stats {
 // requesting the remote peer to generate a keyframe immediately.
 func (co *PeerConnection) SendPLI() error {
 	var packets []rtcp.Packet
+	co.inboundTracksMutex.RLock()
 	for _, tr := range co.inboundTracks {
 		if tr.track != nil && tr.track.Kind() == webrtc.RTPCodecTypeVideo {
 			packets = append(packets, &rtcp.PictureLossIndication{
@@ -1011,6 +1129,7 @@ func (co *PeerConnection) SendPLI() error {
 			})
 		}
 	}
+	co.inboundTracksMutex.RUnlock()
 	if len(packets) == 0 {
 		return nil
 	}
@@ -1018,4 +1137,95 @@ func (co *PeerConnection) SendPLI() error {
 		co.wr.WriteRTCP([]rtcp.Packet{pkt})
 	}
 	return nil
+}
+
+// ActiveMediaCount returns the number of non-rejected, non-inactive media descriptions of a type.
+func ActiveMediaCount(medias []*sdp.MediaDescription, mediaType string) int {
+	count := 0
+	for _, media := range medias {
+		if media.MediaName.Media != mediaType || !mediaActive(media) {
+			continue
+		}
+		count++
+	}
+	return count
+}
+
+// InboundMediaCount returns the number of media descriptions on which the remote peer can send.
+func InboundMediaCount(medias []*sdp.MediaDescription, mediaType string) int {
+	count := 0
+	for _, media := range medias {
+		if media.MediaName.Media != mediaType || !mediaCanSend(media) {
+			continue
+		}
+		count++
+	}
+	return count
+}
+
+func mediaCanSend(media *sdp.MediaDescription) bool {
+	if !mediaActive(media) {
+		return false
+	}
+	for _, attr := range media.Attributes {
+		if attr.Key == "recvonly" {
+			return false
+		}
+	}
+	return true
+}
+
+func mediaActive(media *sdp.MediaDescription) bool {
+	if media.MediaName.Port.Value == 0 {
+		return false
+	}
+	for _, attr := range media.Attributes {
+		if attr.Key == "inactive" {
+			return false
+		}
+	}
+	return true
+}
+
+// GatherInboundTracksExact gathers exactly the requested video and audio tracks.
+func (co *PeerConnection) GatherInboundTracksExact(timeout time.Duration, expectedVideoTracks int, expectedAudioTracks int) error {
+	t := time.NewTimer(timeout)
+	defer t.Stop()
+
+	videoTracks := 0
+	audioTracks := 0
+	for {
+		select {
+		case <-t.C:
+			if videoTracks+audioTracks != 0 {
+				co.Log.Log(logger.Warn,
+					"track gathering timed out with %d video and %d audio tracks; expected %d video and %d audio; continuing with available tracks",
+					videoTracks, audioTracks, expectedVideoTracks, expectedAudioTracks)
+				return nil
+			}
+			return fmt.Errorf("deadline exceeded while waiting tracks")
+
+		case pair := <-co.inboundTrack:
+			co.addInboundTrack(pair)
+
+			if pair.track.Kind() == webrtc.RTPCodecTypeVideo {
+				videoTracks++
+			} else {
+				audioTracks++
+			}
+			if videoTracks > expectedVideoTracks || audioTracks > expectedAudioTracks {
+				return fmt.Errorf("received too many tracks: got %d video and %d audio, expected %d video and %d audio",
+					videoTracks, audioTracks, expectedVideoTracks, expectedAudioTracks)
+			}
+			if videoTracks == expectedVideoTracks && audioTracks == expectedAudioTracks {
+				return nil
+			}
+
+		case <-co.Failed():
+			return fmt.Errorf("peer connection closed")
+
+		case <-co.ctx.Done():
+			return fmt.Errorf("terminated")
+		}
+	}
 }

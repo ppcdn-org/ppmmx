@@ -4,6 +4,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bluenviron/gortsplib/v5/pkg/description"
 	"github.com/bluenviron/gortsplib/v5/pkg/format"
 	"github.com/bluenviron/mediamtx/internal/conf"
 	"github.com/bluenviron/mediamtx/internal/stream"
@@ -17,6 +18,35 @@ func TestToStreamNoSupportedCodecs(t *testing.T) {
 	pc := &PeerConnection{}
 	_, err := ToStream(pc, &conf.Path{}, nil, nil)
 	require.Equal(t, errNoSupportedCodecsTo, err)
+}
+
+func TestVideoTrackIndex(t *testing.T) {
+	index, ok := videoTrackIndex("video-2")
+	require.True(t, ok)
+	require.Equal(t, 2, index)
+
+	_, ok = videoTrackIndex("video")
+	require.False(t, ok)
+	_, ok = videoTrackIndex("video-x")
+	require.False(t, ok)
+}
+
+func TestSortMediaEntriesByTrackID(t *testing.T) {
+	video0 := &description.Media{Type: description.MediaTypeVideo}
+	video1 := &description.Media{Type: description.MediaTypeVideo}
+	video2 := &description.Media{Type: description.MediaTypeVideo}
+	audio := &description.Media{Type: description.MediaTypeAudio}
+	entries := []mediaEntry{
+		{medi: audio, id: "audio"},
+		{medi: video2, video: true, id: "video-2"},
+		{medi: video0, video: true, id: "video-0"},
+		{medi: video1, video: true, id: "video-1"},
+	}
+
+	sortMediaEntries(entries)
+	require.Equal(t, []*description.Media{video0, video1, video2, audio}, []*description.Media{
+		entries[0].medi, entries[1].medi, entries[2].medi, entries[3].medi,
+	})
 }
 
 // this is impossible to test since unsupported tracks cause an error

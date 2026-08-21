@@ -35,7 +35,9 @@ func gatherCodecs(tracks []*webrtc.InboundTrack) []pwebrtc.RTPCodecParameters {
 func TestClientRead(t *testing.T) {
 	for _, ca := range []string{
 		"audio",
+		"video",
 		"video+audio",
+		"video+audio partial",
 	} {
 		t.Run(ca, func(t *testing.T) {
 			var outboundTracks []*webrtc.OutboundTrack
@@ -50,7 +52,15 @@ func TestClientRead(t *testing.T) {
 					},
 				}}
 
-			case "video+audio":
+			case "video":
+				outboundTracks = []*webrtc.OutboundTrack{{
+					Caps: pwebrtc.RTPCodecCapability{
+						MimeType:  "video/H264",
+						ClockRate: 90000,
+					},
+				}}
+
+			case "video+audio", "video+audio partial":
 				outboundTracks = []*webrtc.OutboundTrack{
 					{
 						Caps: pwebrtc.RTPCodecCapability{
@@ -116,7 +126,10 @@ func TestClientRead(t *testing.T) {
 							err3 := pc.WaitUntilConnected(10 * time.Second)
 							require.NoError(t, err3)
 
-							for _, track := range outboundTracks {
+							for i, track := range outboundTracks {
+								if ca == "video+audio partial" && i == 1 {
+									continue
+								}
 								err3 = track.WriteRTP(&rtp.Packet{
 									Header: rtp.Header{
 										Version:        2,
@@ -160,9 +173,10 @@ func TestClientRead(t *testing.T) {
 			require.NoError(t, err)
 
 			cl := &Client{
-				URL:        u,
-				HTTPClient: &http.Client{},
-				Log:        test.NilLogger,
+				URL:                u,
+				HTTPClient:         &http.Client{},
+				TrackGatherTimeout: 200 * time.Millisecond,
+				Log:                test.NilLogger,
 			}
 			err = cl.Initialize(context.Background())
 			require.NoError(t, err)
@@ -186,6 +200,10 @@ func TestClientRead(t *testing.T) {
 						PayloadType: 111,
 					},
 				}, codecs)
+
+			case "video", "video+audio partial":
+				require.Len(t, codecs, 1)
+				require.Equal(t, pwebrtc.MimeTypeH264, codecs[0].MimeType)
 
 			case "video+audio":
 				sort.Slice(codecs, func(i, j int) bool {
@@ -215,8 +233,8 @@ func TestClientRead(t *testing.T) {
 				}, codecs)
 			}
 
-			recv := make([]chan struct{}, len(outboundTracks))
-			for i := range outboundTracks {
+			recv := make([]chan struct{}, len(cl.InboundTracks()))
+			for i := range recv {
 				recv[i] = make(chan struct{})
 			}
 

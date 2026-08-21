@@ -5,6 +5,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strconv"
 	"testing"
 	"time"
 
@@ -26,14 +27,25 @@ func whipOffer(body []byte) *pwebrtc.SessionDescription {
 }
 
 func TestSource(t *testing.T) {
-	outboundTracks := []*webrtc.OutboundTrack{{
+	outboundTracks := make([]*webrtc.OutboundTrack, 0, 4)
+	for i := range 3 {
+		outboundTracks = append(outboundTracks, &webrtc.OutboundTrack{
+			Caps: pwebrtc.RTPCodecCapability{
+				MimeType:    pwebrtc.MimeTypeH264,
+				ClockRate:   90000,
+				SDPFmtpLine: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f",
+			},
+			TrackID: "video-" + strconv.Itoa(i),
+		})
+	}
+	outboundTracks = append(outboundTracks, &webrtc.OutboundTrack{
 		Caps: pwebrtc.RTPCodecCapability{
 			MimeType:    "audio/opus",
 			ClockRate:   48000,
 			Channels:    2,
 			SDPFmtpLine: "minptime=10;useinbandfec=1;stereo=1;sprop-stereo=1",
 		},
-	}}
+	})
 
 	pc := &webrtc.PeerConnection{
 		LocalRandomUDP:    true,
@@ -81,18 +93,24 @@ func TestSource(t *testing.T) {
 					err3 := pc.WaitUntilConnected(10 * time.Second)
 					require.NoError(t, err3)
 
-					err3 = outboundTracks[0].WriteRTP(&rtp.Packet{
-						Header: rtp.Header{
-							Version:        2,
-							Marker:         true,
-							PayloadType:    111,
-							SequenceNumber: 1123,
-							Timestamp:      45343,
-							SSRC:           563424,
-						},
-						Payload: []byte{5, 2},
-					})
-					require.NoError(t, err3)
+					for i, track := range outboundTracks {
+						payload := []byte{0x65, 0x01}
+						if i == 3 {
+							payload = []byte{5, 2}
+						}
+						err3 = track.WriteRTP(&rtp.Packet{
+							Header: rtp.Header{
+								Version:        2,
+								Marker:         true,
+								PayloadType:    uint8(96 + i),
+								SequenceNumber: 1123,
+								Timestamp:      45343,
+								SSRC:           uint32(563424 + i),
+							},
+							Payload: payload,
+						})
+						require.NoError(t, err3)
+					}
 				}()
 
 			default:

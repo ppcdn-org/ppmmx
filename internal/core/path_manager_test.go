@@ -122,6 +122,55 @@ func TestPathManagerDynamicPathDescribeAndPublish(t *testing.T) {
 	require.NoError(t, err)
 }
 
+// disallowAllStreamChecker rejects every stream, simulating a
+// site_stream_configs whitelist that has nothing registered.
+type disallowAllStreamChecker struct{}
+
+func (disallowAllStreamChecker) IsStreamAllowed(string) (bool, error) {
+	return false, nil
+}
+
+// TestPathManagerIsPublishAllowed reproduces a real report: a publisher for
+// a stream not in the whitelist got a successful WHIP handshake and only
+// had its connection torn down afterward, so OBS kept reconnecting instead
+// of treating it as a rejection. IsPublishAllowed (called by runPublish
+// before any handshake work happens - see internal/servers/webrtc/
+// session.go) must report false up front, so the caller can reject with a
+// definitive HTTP status (403) before ever accepting the connection.
+// FindPathConf itself is unaffected by the whitelist - it's a separate
+// check now, so the WHIP OPTIONS preflight (which only calls FindPathConf)
+// doesn't need to know about it either: OPTIONS grants nothing by itself.
+func TestPathManagerIsPublishAllowed(t *testing.T) {
+	pathConfs := map[string]*conf.Path{
+		"all_others": {
+			Regexp: regexp.MustCompile("^.*$"),
+			Name:   "all_others",
+			Source: "publisher",
+		},
+	}
+
+	pm := &pathManager{
+		authManager: test.NilAuthManager,
+		adminStore:  disallowAllStreamChecker{},
+		pathConfs:   pathConfs,
+		parent:      test.NilLogger,
+	}
+	pm.initialize()
+	defer pm.close()
+
+	require.False(t, pm.IsPublishAllowed("mypath"))
+
+	// FindPathConf itself no longer enforces the whitelist for either
+	// direction - it's purely path-pattern-matching + auth now.
+	_, err := pm.FindPathConf(defs.PathFindPathConfReq{
+		AccessRequest: defs.PathAccessRequest{
+			Name:    "mypath",
+			Publish: true,
+		},
+	})
+	require.NoError(t, err)
+}
+
 func TestPathManagerConfigHotReload(t *testing.T) {
 	// Start MediaMTX with basic configuration
 	p, ok := newInstance(t, "api: yes\n"+
