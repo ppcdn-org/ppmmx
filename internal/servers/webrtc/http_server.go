@@ -1,7 +1,6 @@
 package webrtc
 
 import (
-	"crypto/subtle"
 	_ "embed"
 	"errors"
 	"fmt"
@@ -197,34 +196,42 @@ func (s *httpServer) onWHIPOptions(ctx *gin.Context, pathName string, publish bo
 	ctx.Writer.WriteHeader(http.StatusNoContent)
 }
 
-// checkWHIPDeviceID verifies WHIP_WS_SECRET (conf.WebRTCDegradeWSSecret) for
-// publish requests. This is separate from, and in addition to,
-// checkAuthOutsideSession's username/password/IP checks.
+// checkWHIPDeviceID authenticates a WHIP publish request as coming from
+// ppobs. It decrypts the bearer token with the shared WHIP_AUTH_KEY
+// (conf.WebRTCWHIPAuthKey / s.parent.WHIPAuthKey) - a token ppcenter issues
+// only after verifying the ppobs app's own appId/appSecret credentials, see
+// docs/obs-whip-publish-auth-protocol.md - and checks it hasn't expired and
+// was issued for this exact path. This is separate from, and in addition
+// to, checkAuthOutsideSession's username/password/IP checks.
 //
 // The canonical transport is the "WHIP-Device-Id" header. Stock WHIP clients
-// (including OBS's built-in WHIP output, even the mmx-degrade-patched build)
 // have no way to send an arbitrary header - their only configurable
 // credential is a "Bearer Token" field that goes out as a standard
-// Authorization header - so "Authorization: Bearer <secret>" is also
+// Authorization header - so "Authorization: Bearer <token>" is also
 // accepted, as a fallback checked only when "WHIP-Device-Id" is absent, so
 // it never collides with Basic/JWT credentials that a path's own publish
 // auth might also carry in Authorization.
-func (s *httpServer) checkWHIPDeviceID(ctx *gin.Context) bool {
-	deviceID := ctx.Request.Header.Get("WHIP-Device-Id")
-	if deviceID == "" {
+func (s *httpServer) checkWHIPDeviceID(ctx *gin.Context, pathName string) bool {
+	token := ctx.Request.Header.Get("WHIP-Device-Id")
+	if token == "" {
 		if v := ctx.Request.Header.Get("Authorization"); strings.HasPrefix(v, "Bearer ") {
-			deviceID = strings.TrimPrefix(v, "Bearer ")
+			token = strings.TrimPrefix(v, "Bearer ")
 		}
 	}
-	if deviceID == "" || subtle.ConstantTimeCompare([]byte(deviceID), []byte(s.parent.DegradeWSSecret)) != 1 {
-		s.writeErrorNoLog(ctx, http.StatusUnauthorized, fmt.Errorf("publish deviceID authentication failure!"))
+	if token == "" {
+		s.writeErrorNoLog(ctx, http.StatusForbidden, fmt.Errorf("publish deviceID authentication failure!"))
+		return false
+	}
+	claims, err := decryptWHIPToken(s.parent.WHIPAuthKey, token, time.Now())
+	if err != nil || claims.AppID+"/"+claims.Stream != pathName {
+		s.writeErrorNoLog(ctx, http.StatusForbidden, fmt.Errorf("publish deviceID authentication failure!"))
 		return false
 	}
 	return true
 }
 
 func (s *httpServer) onWHIPPost(ctx *gin.Context, pathName string, publish bool) {
-	if publish && !s.checkWHIPDeviceID(ctx) {
+	if publish && !s.checkWHIPDeviceID(ctx, pathName) {
 		return
 	}
 

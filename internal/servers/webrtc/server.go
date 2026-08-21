@@ -231,6 +231,13 @@ type Server struct {
 	DegradeObservationSec int
 	DegradeWSSecret       string
 
+	// WHIP publish auth (see docs/obs-whip-publish-auth-protocol.md): shared
+	// AES key used by checkWHIPDeviceID to decrypt the ppcenter-issued
+	// bearer token every ppobs publish request must carry. Distinct from
+	// DegradeWSSecret, which authenticates the degrade protocol's own WS
+	// control channel, not WHIP publish.
+	WHIPAuthKey string
+
 	ctx              context.Context
 	ctxCancel        func()
 	httpServer       *httpServer

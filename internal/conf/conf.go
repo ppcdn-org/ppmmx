@@ -417,6 +417,13 @@ type Conf struct {
 	WebRTCDegradeObservationSec int     `json:"webrtcDegradeObservationSec"`
 	WebRTCDegradeWSSecret       string  `json:"-"`
 
+	// WHIP publish auth (see docs/obs-whip-publish-auth-protocol.md): AES key
+	// checkWHIPDeviceID uses to decrypt the ppcenter-issued bearer token
+	// every WHIP publish request must carry. Independent of
+	// WebRTCDegradeWSSecret above (that one authenticates the degrade
+	// protocol's own WS channel, not WHIP publish).
+	WebRTCWHIPAuthKey string `json:"-"`
+
 	// CDN ingest (pull external CDN sources, re-publish them locally over
 	// RTMP loopback so they're recorded/distributed like any other
 	// publisher). Defaults to false (see setDefaults) - opt in per
@@ -718,6 +725,7 @@ func Load(fpath string, defaultConfPaths []string, l logger.Writer) (*Conf, stri
 	conf.SplitRecAuthSecret = DotenvValue("SPLIT_REC_SECRET")
 	conf.TXSecretKeyBack = DotenvValue("TX_SECRET_KEY_BACK")
 	conf.WebRTCDegradeWSSecret = DotenvValue("WHIP_WS_SECRET")
+	conf.WebRTCWHIPAuthKey = DotenvValue("WHIP_AUTH_KEY")
 	// bin/.env keys: "prod" selects S3, anything else selects MinIO.
 	conf.NetStorageEnv = DotenvValue("APP_ENV")
 	conf.NetStorageS3Bucket = DotenvValue("S3_BUCKET")

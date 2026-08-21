@@ -3,6 +3,11 @@ package webrtc
 import (
 	"bytes"
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -35,7 +40,36 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-const testWHIPDeviceID = "test-whip-device-id"
+const testWHIPAuthKey = "test-whip-auth-key"
+
+// makeTestWHIPToken builds a WHIP publish bearer token in the same
+// AES-256-GCM wire format ppcenter's EncryptWHIPToken produces (see
+// decryptWHIPToken in whip_token.go), so tests can exercise
+// checkWHIPDeviceID without depending on the ppcenter repo.
+func makeTestWHIPToken(t *testing.T, authKey, appID, stream string, exp time.Time) string {
+	t.Helper()
+	claims := whipTokenClaims{AppID: appID, Stream: stream, IAT: exp.Add(-time.Hour).Unix(), EXP: exp.Unix()}
+	plaintext, err := json.Marshal(claims)
+	require.NoError(t, err)
+
+	key := sha256.Sum256([]byte(authKey))
+	block, err := aes.NewCipher(key[:])
+	require.NoError(t, err)
+	gcm, err := cipher.NewGCM(block)
+	require.NoError(t, err)
+	nonce := make([]byte, gcm.NonceSize())
+	_, err = rand.Read(nonce)
+	require.NoError(t, err)
+	sealed := gcm.Seal(nonce, nonce, plaintext, nil)
+	return base64.RawURLEncoding.EncodeToString(sealed)
+}
+
+// validTestWHIPToken is a 1-hour-valid token for appID/stream, keyed with
+// testWHIPAuthKey.
+func validTestWHIPToken(t *testing.T, appID, stream string) string {
+	t.Helper()
+	return makeTestWHIPToken(t, testWHIPAuthKey, appID, stream, time.Now().Add(time.Hour))
+}
 
 func whipAnswer(body []byte) *pwebrtc.SessionDescription {
 	return &pwebrtc.SessionDescription{
@@ -378,14 +412,14 @@ func TestServerPublish(t *testing.T) {
 
 	pathManager := &test.PathManager{
 		FindPathConfImpl: func(req defs.PathFindPathConfReq) (*defs.PathFindPathConfRes, error) {
-			require.Equal(t, "teststream", req.AccessRequest.Name)
+			require.Equal(t, "testapp/teststream", req.AccessRequest.Name)
 			require.Equal(t, "param=value", req.AccessRequest.Query)
 			require.Equal(t, "myuser", req.AccessRequest.Credentials.User)
 			require.Equal(t, "mypass", req.AccessRequest.Credentials.Pass)
 			return &defs.PathFindPathConfRes{Conf: &conf.Path{}, User: req.AccessRequest.Credentials.User}, nil
 		},
 		AddPublisherImpl: func(req defs.PathAddPublisherReq) (*defs.PathAddPublisherRes, error) {
-			require.Equal(t, "teststream", req.AccessRequest.Name)
+			require.Equal(t, "testapp/teststream", req.AccessRequest.Name)
 			require.Equal(t, "param=value", req.AccessRequest.Query)
 			require.True(t, req.AccessRequest.SkipAuth)
 
@@ -445,7 +479,7 @@ func TestServerPublish(t *testing.T) {
 		TrackGatherTimeout:    conf.Duration(2 * time.Second),
 		PathManager:           pathManager,
 		Parent:                test.NilLogger,
-		DegradeWSSecret:       testWHIPDeviceID,
+		WHIPAuthKey:           testWHIPAuthKey,
 	}
 	err := s.Initialize()
 	require.NoError(t, err)
@@ -455,7 +489,7 @@ func TestServerPublish(t *testing.T) {
 	defer tr.CloseIdleConnections()
 	hc := &http.Client{Transport: tr}
 
-	su, err := url.Parse("http://myuser:mypass@localhost:8886/teststream/whip?param=value")
+	su, err := url.Parse("http://myuser:mypass@localhost:8886/testapp/teststream/whip?param=value")
 	require.NoError(t, err)
 
 	track := &webrtc.OutboundTrack{
@@ -471,7 +505,7 @@ func TestServerPublish(t *testing.T) {
 		URL:            su,
 		Publish:        true,
 		OutboundTracks: []*webrtc.OutboundTrack{track},
-		DeviceID:       testWHIPDeviceID,
+		DeviceID:       validTestWHIPToken(t, "testapp", "teststream"),
 		Log:            test.NilLogger,
 	}
 
@@ -503,7 +537,7 @@ func TestServerPublish(t *testing.T) {
 				Created:                   list.Items[0].Created,
 				RemoteAddr:                list.Items[0].RemoteAddr,
 				State:                     "publish",
-				Path:                      "teststream",
+				Path:                      "testapp/teststream",
 				Query:                     "param=value",
 				User:                      "myuser",
 				UserAgent:                 list.Items[0].UserAgent,
@@ -1017,7 +1051,7 @@ func TestServerICERestart(t *testing.T) {
 		STUNGatherTimeout:     conf.Duration(5 * time.Second),
 		PathManager:           pathManager,
 		Parent:                test.NilLogger,
-		DegradeWSSecret:       testWHIPDeviceID,
+		WHIPAuthKey:           testWHIPAuthKey,
 	}
 	err := s.Initialize()
 	require.NoError(t, err)
@@ -1027,7 +1061,7 @@ func TestServerICERestart(t *testing.T) {
 	defer tr.CloseIdleConnections()
 	hc := &http.Client{Transport: tr}
 
-	su, err := url.Parse("http://localhost:8886/teststream/whip")
+	su, err := url.Parse("http://localhost:8886/testapp/teststream/whip")
 	require.NoError(t, err)
 
 	track := &webrtc.OutboundTrack{
@@ -1043,7 +1077,7 @@ func TestServerICERestart(t *testing.T) {
 		URL:            su,
 		Publish:        true,
 		OutboundTracks: []*webrtc.OutboundTrack{track},
-		DeviceID:       testWHIPDeviceID,
+		DeviceID:       validTestWHIPToken(t, "testapp", "teststream"),
 		Log:            test.NilLogger,
 	}
 
@@ -1223,7 +1257,7 @@ func TestAuthError(t *testing.T) {
 						authFailed.Store(true)
 					}
 				}),
-				DegradeWSSecret: testWHIPDeviceID,
+				WHIPAuthKey: testWHIPAuthKey,
 			}
 			err := s.Initialize()
 			require.NoError(t, err)
@@ -1251,10 +1285,10 @@ func TestAuthError(t *testing.T) {
 				offer, err = pc.CreateOffer(nil)
 				require.NoError(t, err)
 
-				req, err = http.NewRequest(http.MethodPost, "http://127.0.0.1:8886/teststream/whip",
+				req, err = http.NewRequest(http.MethodPost, "http://127.0.0.1:8886/testapp/teststream/whip",
 					bytes.NewReader([]byte(offer.SDP)))
 				req.Header.Set("Content-Type", "application/sdp")
-				req.Header.Set("WHIP-Device-Id", testWHIPDeviceID)
+				req.Header.Set("WHIP-Device-Id", validTestWHIPToken(t, "testapp", "teststream"))
 			}
 
 			require.NoError(t, err)
@@ -1286,10 +1320,10 @@ func TestAuthError(t *testing.T) {
 				offer, err = pc.CreateOffer(nil)
 				require.NoError(t, err)
 
-				req, err = http.NewRequest(http.MethodPost, "http://myuser:mypass@127.0.0.1:8886/teststream/whip",
+				req, err = http.NewRequest(http.MethodPost, "http://myuser:mypass@127.0.0.1:8886/testapp/teststream/whip",
 					bytes.NewReader([]byte(offer.SDP)))
 				req.Header.Set("Content-Type", "application/sdp")
-				req.Header.Set("WHIP-Device-Id", testWHIPDeviceID)
+				req.Header.Set("WHIP-Device-Id", validTestWHIPToken(t, "testapp", "teststream"))
 			}
 
 			require.NoError(t, err)
@@ -1305,15 +1339,20 @@ func TestAuthError(t *testing.T) {
 	}
 }
 
-// TestWHIPDeviceIDBearerTokenFallback verifies that checkWHIPDeviceID accepts
-// "Authorization: Bearer <secret>" when "WHIP-Device-Id" is absent. Real WHIP
-// clients (e.g. OBS's built-in WHIP output) can only send a Bearer Token via
-// their stream service settings and have no way to send a custom header, so
-// this is what lets them satisfy the device-id gate without an OBS patch.
+// TestWHIPDeviceIDBearerTokenFallback verifies checkWHIPDeviceID's ppcenter
+// token decrypt+validate logic: header precedence ("WHIP-Device-Id" over the
+// "Authorization: Bearer" fallback, since real WHIP clients such as OBS's
+// built-in WHIP output can only send a Bearer Token and have no way to send
+// a custom header), expiry, and per-path binding (a token issued for one
+// appId/stream must not authenticate a publish to a different path).
 func TestWHIPDeviceIDBearerTokenFallback(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
-	s := &httpServer{parent: &Server{DegradeWSSecret: testWHIPDeviceID}}
+	s := &httpServer{parent: &Server{WHIPAuthKey: testWHIPAuthKey}}
+	validToken := validTestWHIPToken(t, "testapp", "teststream")
+	expiredToken := makeTestWHIPToken(t, testWHIPAuthKey, "testapp", "teststream", time.Now().Add(-time.Minute))
+	wrongPathToken := validTestWHIPToken(t, "testapp", "other-stream")
+	wrongKeyToken := makeTestWHIPToken(t, "wrong-auth-key", "testapp", "teststream", time.Now().Add(time.Hour))
 
 	for _, ca := range []struct {
 		name    string
@@ -1322,25 +1361,40 @@ func TestWHIPDeviceIDBearerTokenFallback(t *testing.T) {
 	}{
 		{
 			name:    "device id header",
-			headers: map[string]string{"WHIP-Device-Id": testWHIPDeviceID},
+			headers: map[string]string{"WHIP-Device-Id": validToken},
 			allowed: true,
 		},
 		{
 			name:    "bearer token fallback",
-			headers: map[string]string{"Authorization": "Bearer " + testWHIPDeviceID},
+			headers: map[string]string{"Authorization": "Bearer " + validToken},
 			allowed: true,
 		},
 		{
 			name: "device id header takes priority over mismatched bearer",
 			headers: map[string]string{
-				"WHIP-Device-Id": testWHIPDeviceID,
-				"Authorization":  "Bearer wrong-secret",
+				"WHIP-Device-Id": validToken,
+				"Authorization":  "Bearer garbage",
 			},
 			allowed: true,
 		},
 		{
-			name:    "wrong bearer token",
-			headers: map[string]string{"Authorization": "Bearer wrong-secret"},
+			name:    "garbage token",
+			headers: map[string]string{"Authorization": "Bearer garbage"},
+			allowed: false,
+		},
+		{
+			name:    "token sealed with the wrong key",
+			headers: map[string]string{"Authorization": "Bearer " + wrongKeyToken},
+			allowed: false,
+		},
+		{
+			name:    "expired token",
+			headers: map[string]string{"Authorization": "Bearer " + expiredToken},
+			allowed: false,
+		},
+		{
+			name:    "token issued for a different path",
+			headers: map[string]string{"Authorization": "Bearer " + wrongPathToken},
 			allowed: false,
 		},
 		{
@@ -1350,7 +1404,7 @@ func TestWHIPDeviceIDBearerTokenFallback(t *testing.T) {
 		},
 	} {
 		t.Run(ca.name, func(t *testing.T) {
-			req := httptest.NewRequest(http.MethodPost, "/teststream/whip", nil)
+			req := httptest.NewRequest(http.MethodPost, "/testapp/teststream/whip", nil)
 			for k, v := range ca.headers {
 				req.Header.Set(k, v)
 			}
@@ -1359,7 +1413,7 @@ func TestWHIPDeviceIDBearerTokenFallback(t *testing.T) {
 			ctx, _ := gin.CreateTestContext(rec)
 			ctx.Request = req
 
-			require.Equal(t, ca.allowed, s.checkWHIPDeviceID(ctx))
+			require.Equal(t, ca.allowed, s.checkWHIPDeviceID(ctx, "testapp/teststream"))
 		})
 	}
 }
@@ -1405,7 +1459,7 @@ func TestServerPublishRejectedByWhitelistBeforeAnswer(t *testing.T) {
 		TrackGatherTimeout:    conf.Duration(2 * time.Second),
 		PathManager:           pathManager,
 		Parent:                test.NilLogger,
-		DegradeWSSecret:       testWHIPDeviceID,
+		WHIPAuthKey:           testWHIPAuthKey,
 	}
 	err := s.Initialize()
 	require.NoError(t, err)
@@ -1431,7 +1485,7 @@ func TestServerPublishRejectedByWhitelistBeforeAnswer(t *testing.T) {
 		URL:            su,
 		Publish:        true,
 		OutboundTracks: []*webrtc.OutboundTrack{track},
-		DeviceID:       testWHIPDeviceID,
+		DeviceID:       validTestWHIPToken(t, "live", "table-view"),
 		Log:            test.NilLogger,
 	}
 
