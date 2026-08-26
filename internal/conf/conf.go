@@ -424,6 +424,13 @@ type Conf struct {
 	// protocol's own WS channel, not WHIP publish).
 	WebRTCWHIPAuthKey string `json:"-"`
 
+	// WebRTCForwardSecret is a static pre-shared secret checkWHIPDeviceID
+	// also accepts, for mmx-to-mmx forwardMmx pushes between your own
+	// trusted nodes (see Path.ForwardMmx*). Independent of both
+	// WebRTCWHIPAuthKey (external ppobs publishers) and
+	// WebRTCDegradeWSSecret (degrade WS channel).
+	WebRTCForwardSecret string `json:"-"`
+
 	// CDN ingest (pull external CDN sources, re-publish them locally over
 	// RTMP loopback so they're recorded/distributed like any other
 	// publisher). Defaults to false (see setDefaults) - opt in per
@@ -726,6 +733,7 @@ func Load(fpath string, defaultConfPaths []string, l logger.Writer) (*Conf, stri
 	conf.TXSecretKeyBack = DotenvValue("TX_SECRET_KEY_BACK")
 	conf.WebRTCDegradeWSSecret = DotenvValue("WHIP_WS_SECRET")
 	conf.WebRTCWHIPAuthKey = DotenvValue("WHIP_AUTH_KEY")
+	conf.WebRTCForwardSecret = DotenvValue("MMX_FORWARD_SECRET")
 	// bin/.env keys: "prod" selects S3, anything else selects MinIO.
 	conf.NetStorageEnv = DotenvValue("APP_ENV")
 	conf.NetStorageS3Bucket = DotenvValue("S3_BUCKET")

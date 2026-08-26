@@ -92,6 +92,27 @@ ppobs 要在自己发起的 `/v1/publish/requests` 请求里带上 `deviceId` �
 ppobs 侧实现见 `obs32.1.2patched` 仓库（独立仓库，不在本仓库内）的
 `plugins/obs-webrtc/ppobs-identity.h`/`.cpp`。
 
+## 八、mmx-to-mmx 转发（forwardMmx）不走 ppcenter token
+
+`checkWHIPDeviceID` 校验的是"WHIP publish 请求"这个动作本身，而 Origin 主动把整条流
+转推到另一个 mmx 节点的 `forwardMmx` 功能（见 [internal/forward/mmx.go](../internal/forward/mmx.go)、
+`Path.ForwardMmx*`）底层走的也是 WHIP POST，会命中同一个 `checkWHIPDeviceID`——但
+forwardMmx 是你自己运维的节点之间的基础设施流量，不是外部租户推流，没有
+`appId`/`appSecret`可言，也不适合用一个 24h 就过期的短期 token。
+
+因此 `checkWHIPDeviceID` 对这种场景单独开了一个口子：如果 token 解密失败，会再
+退一步用 `.env` 里的 `MMX_FORWARD_SECRET` 做**常量时间字符串比对**，两者任一通过
+即放行。用法：
+
+- 在参与转发的每个节点（发起转发的 Origin + 接收转发的目标节点）`.env` 里配上
+  **完全相同**的 `MMX_FORWARD_SECRET`。
+- 在 Origin 的 path 配置里，把这个值填进 `forwardMmxToken`（或
+  `forwardMmxTargets[].token`）。
+
+`MMX_FORWARD_SECRET` 和 `WHIP_AUTH_KEY`（外部 ppobs 用）、`WHIP_WS_SECRET`（降级协议
+WS 通道用）三者相互独立，**不要复用同一个值**——一旦复用，其中一个用途的密钥泄露
+会连带影响另外两个。
+
 ## 四、User-Agent / 身份标识
 
 ppobs 发出的所有 WHIP 相关 HTTP 请求（包括调用 ppcenter 的

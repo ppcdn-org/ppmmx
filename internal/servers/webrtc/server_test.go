@@ -1343,12 +1343,15 @@ func TestAuthError(t *testing.T) {
 // token decrypt+validate logic: header precedence ("WHIP-Device-Id" over the
 // "Authorization: Bearer" fallback, since real WHIP clients such as OBS's
 // built-in WHIP output can only send a Bearer Token and have no way to send
-// a custom header), expiry, and per-path binding (a token issued for one
-// appId/stream must not authenticate a publish to a different path).
+// a custom header), expiry, per-path binding (a token issued for one
+// appId/stream must not authenticate a publish to a different path), and
+// the separate static ForwardSecret accepted for mmx-to-mmx forwardMmx
+// pushes (see internal/forward/mmx.go).
 func TestWHIPDeviceIDBearerTokenFallback(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
-	s := &httpServer{parent: &Server{WHIPAuthKey: testWHIPAuthKey}}
+	const testForwardSecret = "test-mmx-forward-secret"
+	s := &httpServer{parent: &Server{WHIPAuthKey: testWHIPAuthKey, ForwardSecret: testForwardSecret}}
 	validToken := validTestWHIPToken(t, "testapp", "teststream")
 	expiredToken := makeTestWHIPToken(t, testWHIPAuthKey, "testapp", "teststream", time.Now().Add(-time.Minute))
 	wrongPathToken := validTestWHIPToken(t, "testapp", "other-stream")
@@ -1395,6 +1398,21 @@ func TestWHIPDeviceIDBearerTokenFallback(t *testing.T) {
 		{
 			name:    "token issued for a different path",
 			headers: map[string]string{"Authorization": "Bearer " + wrongPathToken},
+			allowed: false,
+		},
+		{
+			name:    "mmx-to-mmx forward secret via device id header",
+			headers: map[string]string{"WHIP-Device-Id": testForwardSecret},
+			allowed: true,
+		},
+		{
+			name:    "mmx-to-mmx forward secret via bearer fallback",
+			headers: map[string]string{"Authorization": "Bearer " + testForwardSecret},
+			allowed: true,
+		},
+		{
+			name:    "wrong forward secret",
+			headers: map[string]string{"Authorization": "Bearer wrong-forward-secret"},
 			allowed: false,
 		},
 		{

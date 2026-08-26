@@ -243,20 +243,21 @@ type Path struct {
 	// Forward (mmx-to-mmx WHIP relay). Requires the account-level
 	// forwardMmxEnable switch (see Conf.ForwardMmxEnable) in addition to
 	// this per-path flag - same two-level pattern as forwardTencent.
-	// ForwardMmxURL is the target node's WHIP publish endpoint, either
-	// fixed (e.g. "http://mmx2-host:8889/live/table-view/whip") or a
-	// template containing the literal "{path}" placeholder (e.g.
-	// "http://mmx2-host:8889/{path}/whip"), substituted with this path's
-	// own name at (re)connect time - needed when this config is on a
-	// regexp/"all" path matching many different stream names, so each one
-	// forwards under its own name instead of colliding on one fixed
-	// target. ForwardMmxToken is sent as the WHIP publish Bearer token, so
-	// it must be the *target* node's own WHIP_WS_SECRET (see
-	// internal/servers/webrtc/http_server.go checkWHIPDeviceID) - not this
-	// node's.
-	ForwardMmx      bool   `json:"forwardMmx"`
-	ForwardMmxURL   string `json:"forwardMmxURL"`
-	ForwardMmxToken string `json:"forwardMmxToken"`
+	//
+	// ForwardMmxURL/ForwardMmxToken forward to a single target and are kept
+	// working as-is for backward compatibility with configs predating
+	// ForwardMmxTargets. ForwardMmxTargets forwards to any number of
+	// targets simultaneously - one independent Forwarder, and one
+	// independent WHIP session, per target (see
+	// internal/core/path.go's startMmxForwarding), so one target being
+	// slow/down/rejecting never affects delivery to the others. If both are
+	// set, ForwardMmxURL/ForwardMmxToken counts as one more target
+	// alongside whatever's in ForwardMmxTargets rather than being ignored -
+	// see MmxTargets.
+	ForwardMmx        bool               `json:"forwardMmx"`
+	ForwardMmxURL     string             `json:"forwardMmxURL,omitempty"`
+	ForwardMmxToken   string             `json:"forwardMmxToken,omitempty"`
+	ForwardMmxTargets []ForwardMmxTarget `json:"forwardMmxTargets,omitempty"`
 
 	// Authentication (deprecated)
 	PublishUser *Credential `json:"publishUser,omitempty" deprecated:"true"`
@@ -495,11 +496,17 @@ func (pconf *Path) validate(
 		if !conf.ForwardMmxEnable {
 			return fmt.Errorf("path '%s': 'forwardMmx' requires the account-level 'forwardMmxEnable' to be true", name)
 		}
-		if pconf.ForwardMmxURL == "" {
-			return fmt.Errorf("path '%s': 'forwardMmxURL' must be set when forwardMmx is true", name)
+		targets := pconf.MmxTargets()
+		if len(targets) == 0 {
+			return fmt.Errorf("path '%s': 'forwardMmxURL' or 'forwardMmxTargets' must be set when forwardMmx is true", name)
 		}
-		if pconf.ForwardMmxToken == "" {
-			return fmt.Errorf("path '%s': 'forwardMmxToken' must be set when forwardMmx is true", name)
+		for i, t := range targets {
+			if t.URL == "" {
+				return fmt.Errorf("path '%s': forwardMmx target %d: 'url' must not be empty", name, i)
+			}
+			if t.Token == "" {
+				return fmt.Errorf("path '%s': forwardMmx target %d: 'token' must not be empty", name, i)
+			}
 		}
 	}
 
@@ -959,6 +966,35 @@ func (pconf *Path) validate(
 // Equal checks whether two Paths are equal.
 func (pconf *Path) Equal(other *Path) bool {
 	return reflect.DeepEqual(pconf, other)
+}
+
+// ForwardMmxTarget is one destination mmx node's WHIP publish endpoint to
+// forward a path's whole stream to - see Path.ForwardMmxTargets. Token is
+// sent as the WHIP publish Bearer token, so it must be the *target* node's
+// own credential (see internal/servers/webrtc/http_server.go
+// checkWHIPDeviceID) - not this node's own.
+type ForwardMmxTarget struct {
+	// URL is the target node's WHIP publish endpoint, either fixed (e.g.
+	// "http://mmx2-host:8889/live/table-view/whip") or a template
+	// containing the literal "{path}" placeholder (e.g.
+	// "http://mmx2-host:8889/{path}/whip"), substituted with this path's
+	// own name at (re)connect time - needed when this config is on a
+	// regexp/"all" path matching many different stream names, so each one
+	// forwards under its own name instead of colliding on one fixed target.
+	URL   string `json:"url"`
+	Token string `json:"token"`
+}
+
+// MmxTargets returns every forwardMmx destination configured on this path:
+// ForwardMmxURL/ForwardMmxToken (if set) as one target, plus every entry in
+// ForwardMmxTargets - see the doc comment on those fields.
+func (pconf *Path) MmxTargets() []ForwardMmxTarget {
+	targets := make([]ForwardMmxTarget, 0, len(pconf.ForwardMmxTargets)+1)
+	if pconf.ForwardMmxURL != "" {
+		targets = append(targets, ForwardMmxTarget{URL: pconf.ForwardMmxURL, Token: pconf.ForwardMmxToken})
+	}
+	targets = append(targets, pconf.ForwardMmxTargets...)
+	return targets
 }
 
 // HasStaticSource checks whether the path has a static source.

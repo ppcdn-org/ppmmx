@@ -37,6 +37,7 @@ func pathConfCanBeUpdated(oldPathConf *conf.Path, newPathConf *conf.Path) bool {
 	clone.ForwardMmx = newPathConf.ForwardMmx
 	clone.ForwardMmxURL = newPathConf.ForwardMmxURL
 	clone.ForwardMmxToken = newPathConf.ForwardMmxToken
+	clone.ForwardMmxTargets = newPathConf.ForwardMmxTargets
 
 	clone.RPICameraBrightness = newPathConf.RPICameraBrightness
 	clone.RPICameraContrast = newPathConf.RPICameraContrast

@@ -238,6 +238,12 @@ type Server struct {
 	// control channel, not WHIP publish.
 	WHIPAuthKey string
 
+	// ForwardSecret is a static pre-shared secret checkWHIPDeviceID also
+	// accepts, for mmx-to-mmx forwardMmx pushes between your own trusted
+	// nodes (see internal/forward/mmx.go) - distinct from WHIPAuthKey
+	// (external ppobs publishers) and DegradeWSSecret (degrade WS channel).
+	ForwardSecret string
+
 	ctx              context.Context
 	ctxCancel        func()
 	httpServer       *httpServer

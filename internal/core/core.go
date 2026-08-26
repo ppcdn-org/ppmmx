@@ -809,6 +809,7 @@ func (p *Core) createResources(initial bool) error {
 			DegradeObservationSec: p.conf.WebRTCDegradeObservationSec,
 			DegradeWSSecret:       p.conf.WebRTCDegradeWSSecret,
 			WHIPAuthKey:           p.conf.WebRTCWHIPAuthKey,
+			ForwardSecret:         p.conf.WebRTCForwardSecret,
 		}
 		err = i.Initialize()
 		if err != nil {
@@ -1224,6 +1225,7 @@ func (p *Core) closeResources(newConf *conf.Conf, calledByAPI bool) {
 		newConf.WebRTCDegradeObservationSec != p.conf.WebRTCDegradeObservationSec ||
 		newConf.WebRTCDegradeWSSecret != p.conf.WebRTCDegradeWSSecret ||
 		newConf.WebRTCWHIPAuthKey != p.conf.WebRTCWHIPAuthKey ||
+		newConf.WebRTCForwardSecret != p.conf.WebRTCForwardSecret ||
 		newConf.DumpPackets != p.conf.DumpPackets ||
 		closeMetrics ||
 		closePathManager ||

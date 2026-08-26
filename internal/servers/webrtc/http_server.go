@@ -1,6 +1,7 @@
 package webrtc
 
 import (
+	"crypto/subtle"
 	_ "embed"
 	"errors"
 	"fmt"
@@ -196,12 +197,24 @@ func (s *httpServer) onWHIPOptions(ctx *gin.Context, pathName string, publish bo
 	ctx.Writer.WriteHeader(http.StatusNoContent)
 }
 
-// checkWHIPDeviceID authenticates a WHIP publish request as coming from
-// ppobs. It decrypts the bearer token with the shared WHIP_AUTH_KEY
-// (conf.WebRTCWHIPAuthKey / s.parent.WHIPAuthKey) - a token ppcenter issues
-// only after verifying the ppobs app's own appId/appSecret credentials, see
-// docs/obs-whip-publish-auth-protocol.md - and checks it hasn't expired and
-// was issued for this exact path. This is separate from, and in addition
+// checkWHIPDeviceID authenticates a WHIP publish request. It accepts either
+// of two independent credentials:
+//
+//  1. A ppcenter-issued bearer token (decrypted with the shared WHIP_AUTH_KEY
+//     / s.parent.WHIPAuthKey) - issued only after ppcenter verifies a ppobs
+//     app's own appId/appSecret credentials, see
+//     docs/obs-whip-publish-auth-protocol.md. Checked for expiry and that it
+//     was issued for this exact path. This is the path every external ppobs
+//     publisher uses.
+//  2. A static shared secret (MMX_FORWARD_SECRET / s.parent.ForwardSecret)
+//     compared in constant time - for mmx-to-mmx forwardMmx pushes (see
+//     internal/forward/mmx.go), which are infrastructure traffic between
+//     trusted nodes you operate yourself, not an external tenant publish, so
+//     a pre-shared secret (rather than a per-tenant ppcenter token) is the
+//     right trust model. Independent of, and never reused as, WHIP_AUTH_KEY
+//     or the unrelated WHIP_WS_SECRET (degrade-protocol WS channel).
+//
+// Either credential is sufficient; this is separate from, and in addition
 // to, checkAuthOutsideSession's username/password/IP checks.
 //
 // The canonical transport is the "WHIP-Device-Id" header. Stock WHIP clients
@@ -221,6 +234,9 @@ func (s *httpServer) checkWHIPDeviceID(ctx *gin.Context, pathName string) bool {
 	if token == "" {
 		s.writeErrorNoLog(ctx, http.StatusForbidden, fmt.Errorf("publish deviceID authentication failure!"))
 		return false
+	}
+	if s.parent.ForwardSecret != "" && subtle.ConstantTimeCompare([]byte(token), []byte(s.parent.ForwardSecret)) == 1 {
+		return true
 	}
 	claims, err := decryptWHIPToken(s.parent.WHIPAuthKey, token, time.Now())
 	if err != nil || claims.AppID+"/"+claims.Stream != pathName {

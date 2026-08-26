@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -101,7 +102,7 @@ type path struct {
 	stream                         *stream.Stream
 	recorder                       *recorder.Recorder
 	tencentForwarders              []*forward.Forwarder
-	mmxForwarder                   *forward.Forwarder
+	mmxForwarders                  []*forward.Forwarder
 	availableTime                  time.Time
 	onlineTime                     time.Time
 	onUnDemandHook                 func(string)
@@ -430,14 +431,13 @@ func (pa *path) doReloadConf(newConf *conf.Path) {
 		pa.startTencentForwarding()
 	}
 
-	if pa.mmxForwarder != nil &&
+	if len(pa.mmxForwarders) > 0 &&
 		(newConf.ForwardMmx != oldConf.ForwardMmx ||
-			newConf.ForwardMmxURL != oldConf.ForwardMmxURL ||
-			newConf.ForwardMmxToken != oldConf.ForwardMmxToken) {
+			!slices.Equal(newConf.MmxTargets(), oldConf.MmxTargets())) {
 		pa.stopMmxForwarding()
 	}
 
-	if newConf.ForwardMmx && pa.forwardMmxEnable && pa.stream != nil && pa.mmxForwarder == nil {
+	if newConf.ForwardMmx && pa.forwardMmxEnable && pa.stream != nil && len(pa.mmxForwarders) == 0 {
 		pa.startMmxForwarding()
 	}
 }
@@ -1092,31 +1092,39 @@ func (pa *path) stopTencentForwarding() {
 }
 
 // startMmxForwarding pushes the path's whole stream (all Simulcast layers
-// in a single WHIP session - see forward.MmxConfig's doc comment for why
-// this differs from startTencentForwarding's one-Forwarder-per-layer
-// split) to another mmx node's WHIP publish endpoint. Mirrors
-// startTencentForwarding/startRecording.
+// in a single WHIP session per target - see forward.MmxConfig's doc comment
+// for why this differs from startTencentForwarding's one-Forwarder-per-layer
+// split) to every configured forwardMmx target simultaneously - one
+// independent Forwarder, and one independent WHIP session, per target (see
+// conf.Path.MmxTargets), so one target being slow/down/rejecting never
+// affects delivery to the others. Mirrors startTencentForwarding/
+// startRecording.
 func (pa *path) startMmxForwarding() {
-	f := &forward.Forwarder{
-		Mmx: forward.MmxConfig{
-			Enable:    true,
-			URL:       pa.conf.ForwardMmxURL,
-			AuthToken: pa.conf.ForwardMmxToken,
-		},
-		PathName: pa.name,
-		Desc:     pa.stream.OrigDesc,
-		Stream:   pa.stream,
-		Parent:   pa,
+	targets := pa.conf.MmxTargets()
+	pa.mmxForwarders = make([]*forward.Forwarder, len(targets))
+
+	for i, t := range targets {
+		f := &forward.Forwarder{
+			Mmx: forward.MmxConfig{
+				Enable:    true,
+				URL:       t.URL,
+				AuthToken: t.Token,
+			},
+			PathName: pa.name,
+			Desc:     pa.stream.OrigDesc,
+			Stream:   pa.stream,
+			Parent:   pa,
+		}
+		f.Initialize()
+		pa.mmxForwarders[i] = f
 	}
-	f.Initialize()
-	pa.mmxForwarder = f
 }
 
 func (pa *path) stopMmxForwarding() {
-	if pa.mmxForwarder != nil {
-		pa.mmxForwarder.Close()
-		pa.mmxForwarder = nil
+	for _, f := range pa.mmxForwarders {
+		f.Close()
 	}
+	pa.mmxForwarders = nil
 }
 
 func (pa *path) executeRemoveReader(r defs.Reader) {

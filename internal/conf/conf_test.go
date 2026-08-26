@@ -128,6 +128,7 @@ func TestConfFromFile(t *testing.T) {
 			SourceOnDemandCloseAfter:     10 * Duration(time.Second),
 			OverridePublisher:            true,
 			AlwaysAvailableTracks:        []AlwaysAvailableTrack{},
+			ForwardMmxTargets:            []ForwardMmxTarget{},
 			RecordPath:                   "./recordings/%path/%Y-%m-%d_%H-%M-%S-%f",
 			RecordFormat:                 RecordFormatFMP4,
 			RecordPartDuration:           Duration(1 * time.Second),
