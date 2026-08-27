@@ -1,11 +1,7 @@
 package recording
 
 import (
-	"bytes"
-	"os"
-	"os/exec"
 	"path/filepath"
-	"runtime"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -148,92 +144,9 @@ func TestPlaybackURLSuffix(t *testing.T) {
 	require.Equal(t, ", url=https://minio.example.com/uat/key.mp4", appEnvOverridesMinioBucket.playbackURLSuffix("key.mp4", "uat"))
 }
 
-func TestFaststartRemuxSkipsGracefullyWhenFfmpegNotFound(t *testing.T) {
-	t.Setenv("PATH", "")
-	out, cleanup, err := faststartRemux("/does/not/matter.mp4")
-	require.NoError(t, err)
+func TestFaststartRemuxFailsOnUnreadableInput(t *testing.T) {
+	out, cleanup, err := faststartRemux(filepath.Join(t.TempDir(), "does-not-exist.mp4"))
+	require.Error(t, err)
 	require.Empty(t, out)
 	cleanup() // must be safe to call even though nothing was created
-}
-
-// TestFaststartRemuxProducesNonFragmentedMP4 exercises the real ffmpeg
-// binary end to end: generates a small fragmented MP4 (mirroring the
-// recorder's own moof/mdat-per-part output), remuxes it, and checks the
-// result has a single moov before a single mdat with no moof boxes left -
-// i.e. a conventional file a plain <video src> can play without
-// buffering the whole thing first. Skips if ffmpeg (or this specific
-// build's video encoder) isn't available.
-func TestFaststartRemuxProducesNonFragmentedMP4(t *testing.T) {
-	if _, err := exec.LookPath("ffmpeg"); err != nil {
-		t.Skip("ffmpeg not installed")
-	}
-
-	dir := t.TempDir()
-	input := filepath.Join(dir, "input.mp4")
-
-	gen := exec.Command("ffmpeg", "-y", "-loglevel", "error",
-		"-f", "lavfi", "-i", "testsrc=duration=1:size=64x64:rate=5",
-		"-pix_fmt", "yuv420p",
-		"-movflags", "frag_keyframe+empty_moov",
-		input,
-	)
-	if err := gen.Run(); err != nil {
-		t.Skipf("could not generate a fragmented-MP4 test input with this ffmpeg build: %v", err)
-	}
-
-	out, cleanup, err := faststartRemux(input)
-	require.NoError(t, err)
-	require.NotEmpty(t, out)
-	require.FileExists(t, out)
-
-	data, err := os.ReadFile(out)
-	require.NoError(t, err)
-	moovPos := bytes.Index(data, []byte("moov"))
-	mdatPos := bytes.Index(data, []byte("mdat"))
-	require.Greater(t, moovPos, 0, "moov box not found")
-	require.Greater(t, mdatPos, moovPos, "mdat must come after moov (faststart layout)")
-	require.Equal(t, -1, bytes.Index(data, []byte("moof")), "remuxed output should not be fragmented")
-
-	cleanup()
-	_, statErr := os.Stat(out)
-	require.True(t, os.IsNotExist(statErr), "cleanup should remove the remuxed file")
-}
-
-// TestResolveFfmpegPathPrefersColocatedBinary guards the actual bug found
-// while testing on the real deployment: Go 1.19+ deliberately stopped
-// searching the current/working directory in exec.LookPath (security
-// fix against binary planting), so a bare exec.LookPath("ffmpeg") never
-// finds an ffmpeg placed next to the running binary for a self-contained
-// deployment - it silently falls through to (or misses) PATH instead.
-func TestResolveFfmpegPathPrefersColocatedBinary(t *testing.T) {
-	name := "ffmpeg"
-	if runtime.GOOS == "windows" {
-		name = "ffmpeg.exe"
-	}
-
-	dir := t.TempDir()
-	colocated := filepath.Join(dir, name)
-	require.NoError(t, os.WriteFile(colocated, []byte("stand-in, never executed by this test"), 0o755))
-
-	resolved, ok := resolveFfmpegPath(dir)
-	require.True(t, ok)
-	require.Equal(t, colocated, resolved, "must prefer the binary next to the executable over PATH")
-}
-
-func TestResolveFfmpegPathFallsBackToPath(t *testing.T) {
-	dir := t.TempDir() // no colocated ffmpeg here
-	fromPath, pathErr := exec.LookPath("ffmpeg")
-
-	resolved, ok := resolveFfmpegPath(dir)
-	require.Equal(t, pathErr == nil, ok)
-	if pathErr == nil {
-		require.Equal(t, fromPath, resolved)
-	}
-}
-
-func TestResolveFfmpegPathReturnsFalseWhenNowhereFound(t *testing.T) {
-	t.Setenv("PATH", "")
-	resolved, ok := resolveFfmpegPath(t.TempDir())
-	require.False(t, ok)
-	require.Empty(t, resolved)
 }

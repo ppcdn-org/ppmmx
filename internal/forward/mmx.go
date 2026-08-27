@@ -23,9 +23,9 @@ type MmxConfig struct {
 	// address (e.g. "http://mmx2-host:8889/live/table-view/whip") or a
 	// template containing the "{path}" placeholder (e.g.
 	// "http://mmx2-host:8889/{path}/whip"), substituted with this path's
-	// own name at (re)connect time - see mmxPathPlaceholder. Per-path (see
-	// conf.Path.ForwardMmxURL); there is no per-node/global default since
-	// the whole point is to name a specific remote path.
+	// own name at (re)connect time - see mmxPathPlaceholder. Comes from one
+	// entry of conf.Path.MmxTargets(); there is no per-node/global default
+	// since the whole point is to name a specific remote path.
 	URL string
 	// AuthToken is sent as "Authorization: Bearer <AuthToken>" - the same
 	// header mmx's own WHIP publish endpoint checks via checkWHIPDeviceID

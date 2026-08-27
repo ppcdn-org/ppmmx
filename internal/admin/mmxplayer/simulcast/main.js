@@ -60,6 +60,16 @@ const P2P_DELAY_STALE_MS = 5000;
 // Measured delay is a floor (clock skew / rounding always trend it low,
 // never high) - pad it so displayed numbers don't read as falsely great.
 const P2P_DELAY_ERROR_MARGIN_MS = 50;
+// The SEI/DataChannel measurement is `Date.now() - timestamp`, i.e. it's
+// only valid if the player's local clock is reasonably close to the OBS
+// publisher's NTP-calibrated clock. A player whose OS clock isn't NTP
+// synced can be off by hundreds of ms to seconds, producing measured
+// values that read as near-zero or negative (real p2p delay is never
+// under ~100ms in practice - encode+network+jitter buffer alone exceed
+// that). Below this floor, the measurement is clock skew, not delay, so
+// fall back to the RTT/jitter-buffer-based estimate instead of showing
+// a nonsensical number.
+const P2P_DELAY_CLOCK_SUSPECT_MS = 100;
 
 function reportP2PDelay(timestampMs, source) {
     // SEI is strictly more accurate (in-band, cascade-safe, no rid
@@ -613,6 +623,16 @@ async function updateStats() {
             abrEngine.update(videoKbps, audioKbps, fps, currentPacketLoss);
         }
 
+        // RTT/jitter-buffer-based rough p2p delay estimate. Used both as
+        // the LATENCY_REPORT payload's estimated_e2e_ms and, when the
+        // SEI/DataChannel measurement looks clock-skewed (see
+        // P2P_DELAY_CLOCK_SUSPECT_MS), as the displayed P2P Delay fallback.
+        const rttMs = networkStats?.currentRoundTripTime ? networkStats.currentRoundTripTime * 1000 : 0;
+        const jitterBufferMs = videoStats?.jitterBufferDelay && videoStats?.jitterBufferEmittedCount
+            ? (videoStats.jitterBufferDelay / videoStats.jitterBufferEmittedCount) * 1000
+            : 0;
+        const estimatedP2PDelayMs = rttMs / 2 + jitterBufferMs + 10;
+
         // --- 渲染 UI ---
         let html = '';
 
@@ -661,9 +681,16 @@ async function updateStats() {
             if (abrEngine && abrEngine.abrCooldown > 0) abrStatus += ` (Cool ${abrEngine.abrCooldown})`;
 
             const p2pFresh = lastP2PDelayMs !== null && (Date.now() - lastP2PDelayAt) < P2P_DELAY_STALE_MS;
-            const p2pLabel = p2pFresh
-                ? `${lastP2PDelayMs.toFixed(0)} ms (${lastP2PDelaySource === 'sei' ? 'SEI' : 'DC'})`
-                : 'N/A';
+            // A fresh measurement under P2P_DELAY_CLOCK_SUSPECT_MS almost
+            // certainly means the player's local clock isn't NTP-synced
+            // (see const comment above) rather than a real sub-100ms delay
+            // - fall back to the RTT/jitter-buffer estimate instead of
+            // showing a misleadingly tiny or negative number.
+            const p2pLabel = !p2pFresh
+                ? 'N/A'
+                : lastP2PDelayMs < P2P_DELAY_CLOCK_SUSPECT_MS
+                    ? `~${estimatedP2PDelayMs.toFixed(0)} ms (est.)`
+                    : `${lastP2PDelayMs.toFixed(0)} ms (${lastP2PDelaySource === 'sei' ? 'SEI' : 'DC'})`;
 
             html += renderStatGroup('Network', {
                 'RTT': `${(networkStats.currentRoundTripTime * 1000).toFixed(1)} ms`,
@@ -677,20 +704,15 @@ async function updateStats() {
 
         // ── LATENCY_REPORT: send e2e metrics to server every second ──
         if (controlClient && controlClient.ws && controlClient.ws.readyState === WebSocket.OPEN) {
-            const rtt = networkStats?.currentRoundTripTime ? networkStats.currentRoundTripTime * 1000 : 0;
-            const jb = videoStats?.jitterBufferDelay && videoStats?.jitterBufferEmittedCount
-                ? (videoStats.jitterBufferDelay / videoStats.jitterBufferEmittedCount) * 1000
-                : 0;
             const loss = currentPacketLoss;
             const fpsVal = videoStats?.framesPerSecond || 0;
-            const e2e = rtt / 2 + jb + 10; // rough estimate
 
             controlClient.sendLatencyReport({
-                rtt_ms: rtt,
-                jitter_buffer_ms: jb,
+                rtt_ms: rttMs,
+                jitter_buffer_ms: jitterBufferMs,
                 packets_lost: loss,
                 fps: fpsVal,
-                estimated_e2e_ms: e2e
+                estimated_e2e_ms: estimatedP2PDelayMs
             });
         }
 

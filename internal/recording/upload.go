@@ -4,9 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -131,12 +129,13 @@ func (u *uploader) uploadWithRetry(filePath, objectKey, appEnv string) {
 	// plain <video src="..."> / "download and double-click" workflow needs
 	// a conventional single-moov file to play without buffering the whole
 	// thing first. Remux (not re-encode) to faststart MP4 before uploading;
-	// if ffmpeg isn't available, upload the original file unchanged.
+	// if that fails for any reason, upload the original file unchanged
+	// rather than losing the recording.
 	uploadPath := filePath
 	remuxedPath, cleanup, remuxErr := faststartRemux(filePath)
 	if remuxErr != nil {
 		u.parent.Log(logger.Warn, "[upload] %s: faststart remux failed, uploading original file: %v", filePath, remuxErr)
-	} else if remuxedPath != "" {
+	} else {
 		uploadPath = remuxedPath
 		defer cleanup()
 	}
@@ -168,81 +167,6 @@ func (u *uploader) uploadWithRetry(filePath, objectKey, appEnv string) {
 	}
 	u.parent.Log(logger.Warn, "[upload] %s -> %s gave up after %d attempts: %v",
 		filePath, objectKey, maxAttempts, lastErr)
-}
-
-// faststartRemux stream-copies (no re-encoding) filePath into a sibling
-// "<name>.faststart.mp4" with a conventional single moov+mdat layout via
-// `ffmpeg -movflags +faststart`, so the uploaded file plays in a plain
-// <video src="..."> tag or any simple downloader/player without needing
-// the whole file first. The recorder's own output is fragmented MP4
-// (moov first, but sample data split across repeated moof/mdat pairs),
-// which not every player streams as gracefully.
-//
-// Returns ("", noop, nil) if ffmpeg can't be found - the caller falls back
-// to uploading the original file unremuxed rather than failing the upload
-// outright.
-func faststartRemux(filePath string) (string, func(), error) {
-	noop := func() {}
-
-	ffmpeg, ok := ffmpegPath()
-	if !ok {
-		return "", noop, nil
-	}
-
-	out := strings.TrimSuffix(filePath, filepath.Ext(filePath)) + ".faststart.mp4"
-	cleanup := func() { os.Remove(out) }
-
-	cmd := exec.Command(ffmpeg,
-		"-y", "-loglevel", "error",
-		"-i", filePath,
-		"-c", "copy",
-		"-movflags", "+faststart",
-		out,
-	)
-	var stderr strings.Builder
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		cleanup()
-		return "", noop, fmt.Errorf("ffmpeg: %w: %s", err, strings.TrimSpace(stderr.String()))
-	}
-	return out, cleanup, nil
-}
-
-// ffmpegPath prefers an ffmpeg binary placed next to the running
-// executable - a self-contained deployment shouldn't depend on a
-// system-wide install (the VPS this was tested on didn't have one) - and
-// falls back to PATH. Go 1.19+ deliberately no longer searches the
-// current/working directory for security reasons (binary planting), so a
-// bare exec.LookPath("ffmpeg") would silently miss a colocated ffmpeg.exe
-// even when it's sitting right next to the binary.
-func ffmpegPath() (string, bool) {
-	exeDir := ""
-	if exePath, err := os.Executable(); err == nil {
-		exeDir = filepath.Dir(exePath)
-	}
-	return resolveFfmpegPath(exeDir)
-}
-
-// resolveFfmpegPath is ffmpegPath's testable core: given the directory the
-// running executable lives in (possibly ""), it looks there first, then
-// falls back to PATH.
-func resolveFfmpegPath(exeDir string) (string, bool) {
-	name := "ffmpeg"
-	if runtime.GOOS == "windows" {
-		name = "ffmpeg.exe"
-	}
-
-	if exeDir != "" {
-		candidate := filepath.Join(exeDir, name)
-		if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
-			return candidate, true
-		}
-	}
-
-	if p, err := exec.LookPath("ffmpeg"); err == nil {
-		return p, true
-	}
-	return "", false
 }
 
 func (u *uploader) uploadS3(filePath, objectKey string) error {
