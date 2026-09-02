@@ -136,6 +136,35 @@ const defaultPlaySignatureTTL = time.Hour
 
 var playIdentifierPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
 
+// mmxMediaPathPattern matches the only request paths the catch-all is meant
+// to reach on the mmx backend: WHIP/WHEP outside a session ("/{path}/whip")
+// and inside one ("/{path}/whip/{id}").
+var mmxMediaPathPattern = regexp.MustCompile(`/(whip|whep)(/.+)?$`)
+
+// proxiesToMMXWebUI reports whether forwarding req to the mmx backend would
+// return one of mmx's built-in WebRTC pages (or the trailing-slash redirect
+// that leads to one) instead of media or control traffic.
+//
+// Those pages are never usable through the admin port: the reader they embed
+// has no way to sign the txTime/txSecret that the /whep guard below demands,
+// so its publish/play POST is rejected on every attempt and the page retries
+// in a loop. Because the catch-all treats any unmatched path as an mmx stream
+// name, a mistyped or stale admin URL renders as a player for a nonexistent
+// stream and then spins on those rejections. Answering with a plain 404 keeps
+// the catch-all to what it is for.
+//
+// Only GET reaches those pages: WHIP/WHEP uses POST, OPTIONS, PATCH or
+// DELETE, and both the ABR and the degrade channels are WebSocket upgrades.
+func proxiesToMMXWebUI(req *http.Request) bool {
+	if req.Method != http.MethodGet {
+		return false
+	}
+	if strings.EqualFold(req.Header.Get("Upgrade"), "websocket") {
+		return false
+	}
+	return !mmxMediaPathPattern.MatchString(req.URL.Path)
+}
+
 func validPlayIdentifier(value string) bool {
 	return playIdentifierPattern.MatchString(value)
 }
@@ -880,6 +909,10 @@ func (s *Server) Initialize() error {
 
 	// Catch-all → MMX
 	r.NoRoute(func(c *gin.Context) {
+		if proxiesToMMXWebUI(c.Request) {
+			respErr(c, http.StatusNotFound, "not found", "")
+			return
+		}
 		// Validate txTime/txSecret only on WHEP (playback), not WHIP (publish)
 		if strings.HasSuffix(c.Request.URL.Path, "/whep") {
 			if s.TXSecretKeyBack == "" {
