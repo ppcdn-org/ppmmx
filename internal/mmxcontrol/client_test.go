@@ -91,6 +91,39 @@ func TestClientSendsAuthorizationHeader(t *testing.T) {
 	}
 }
 
+// An unset AuthToken must leave the dial unauthenticated rather than send a
+// bare "Bearer ", so a control plane with no nodeAuth configured keeps working.
+func TestClientOmitsAuthorizationHeaderWithoutToken(t *testing.T) {
+	headers := make(chan string, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Non-blocking: the client redials once the handler returns, and a
+		// blocking send would wedge that second handler goroutine.
+		select {
+		case headers <- r.Header.Get("Authorization"):
+		default:
+		}
+		conn, err := (&websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}).Upgrade(w, r, nil)
+		require.NoError(t, err)
+		defer conn.Close()
+		_, _, _ = conn.ReadMessage()
+	}))
+	defer server.Close()
+
+	client := New(context.Background(), Config{
+		URL:  strings.Replace(server.URL, "http://", "ws://", 1),
+		Role: "NODE_ROLE_ORIGIN", NodeID: 1, Region: "Tokyo",
+		Capacity: 10, HeartbeatInterval: time.Second,
+	}, func() []string { return nil }, testLogger{})
+	defer client.Close()
+
+	select {
+	case got := <-headers:
+		require.Empty(t, got)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for dial")
+	}
+}
+
 func TestClientReconnects(t *testing.T) {
 	connections := make(chan struct{}, 2)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
