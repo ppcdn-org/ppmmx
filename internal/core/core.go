@@ -752,6 +752,7 @@ func (p *Core) createResources(initial bool) error {
 		if p.conf.MMXControl && p.mmxControl == nil {
 			p.mmxControl = mmxcontrol.New(p.ctx, mmxcontrol.Config{
 				URL:                   p.conf.MMXControlURL,
+				AuthToken:             p.conf.MMXControlToken,
 				Role:                  p.conf.MMXNodeRole,
 				NodeID:                int32(p.conf.MMXNodeID),
 				Version:               strings.TrimSpace(string(version)),
@@ -764,7 +765,7 @@ func (p *Core) createResources(initial bool) error {
 				PoolID:                p.conf.MMXNodePoolID,
 			}, func() []string { return nil }, p)
 			p.mmxControl.SetHTTPFallback(strings.Replace(strings.Replace(p.conf.MMXControlURL, "ws://", "http://", 1), "wss://", "https://", 1),
-				"", 10*time.Second)
+				p.conf.MMXControlToken, 10*time.Second)
 		}
 		if p.conf.MMXRecordingSyncEnabled && p.recordingSync == nil {
 			p.recordingSync = mmxcontrol.NewRecordingSyncClient(

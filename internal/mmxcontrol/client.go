@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"math/rand/v2"
+	"net/http"
 	"sort"
 	"strings"
 	"sync"
@@ -22,6 +23,7 @@ var errReconnectHint = errors.New("RECONNECT_HINT received")
 // Config contains the legacy ppcenter WorkerIndication identity.
 type Config struct {
 	URL                   string
+	AuthToken             string // sent as "Authorization: Bearer <token>" on both the WS dial and the HTTP fallback; must match ppcenter's nodeAuth.bearerToken (or a nodeAuth.nodeTokens entry)
 	Role                  string
 	NodeID                int32
 	Version               string
@@ -120,7 +122,11 @@ func (c *Client) run(ctx context.Context) {
 }
 
 func (c *Client) connect(ctx context.Context) error {
-	conn, _, err := websocket.DefaultDialer.DialContext(ctx, c.config.URL, nil)
+	var header http.Header
+	if c.config.AuthToken != "" {
+		header = http.Header{"Authorization": []string{"Bearer " + c.config.AuthToken}}
+	}
+	conn, _, err := websocket.DefaultDialer.DialContext(ctx, c.config.URL, header)
 	if err != nil {
 		return err
 	}
