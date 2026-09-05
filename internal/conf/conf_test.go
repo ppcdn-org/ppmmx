@@ -98,7 +98,7 @@ func TestConfMMXControlValidation(t *testing.T) {
 		"mmxNodeCapacity: 100\nmmxWebRTCBaseURL: https://edge.example\n"
 	for _, ca := range []struct{ name, override, clearEnv string }{
 		{name: "bad URL", override: "mmxControlURL: http://center.example\n"},
-		{name: "bad role", override: "mmxNodeRole: NODE_ROLE_RECORDER\n"},
+		{name: "bad role", override: "mmxNodeRole: NODE_ROLE_BOGUS\n"},
 		{name: "bad ID", override: "mmxNodeID: 0\n"},
 		{name: "bad capacity", override: "mmxNodeCapacity: 0\n"},
 		{name: "missing token", clearEnv: "MMX_CONTROL_TOKEN"},

@@ -1,0 +1,121 @@
+###############################################
+# mmx record node configuration 
+###############################################
+
+logLevel: info
+logDestinations: [stdout, file]
+logFile: logs/mmx-record.log
+
+# ── PPCDN control plane ───────────────────────
+# 只是为了在 ppcenter 管理后台看到这个节点的状态；record 不参与
+# origin/edge 那种"选一个健康节点"的路由(ppcenter 的 SelectOriginForPublish/
+# SelectOriginForStream 只查 NODE_ROLE_ORIGIN，不查 NODE_ROLE_RECORDER)，
+# 纯粹是心跳上报。
+mmxControl: true
+mmxControlURL: ws://127.0.0.1:18000/ws/mmx
+mmxNodeRole: NODE_ROLE_RECORDER
+mmxNodeID: 1
+mmxNodeRegion: local
+mmxNodeCapacity: 100
+mmxHeartbeatInterval: 10s
+mmxWebRTCBaseURL: http://127.0.0.1:8893
+
+readTimeout: 10s
+writeTimeout: 10s
+writeQueueSize: 512
+udpReadBufferSize: 0   # UDP 读缓冲 2MB，避免大关键帧 burst 丢包
+
+# ── Control API ──────────────────────────────
+# 仅供 admin 内部反代使用，不需要对外暴露端口。用 :10000 而不是默认的 :9997，
+# 避免和 origin.local.yml 的 apiAddress 冲突(本机同时跑三个节点时)。
+api: true
+apiAddress: :10000
+
+# ── Protocols ─────────────────────────────────
+rtsp: false
+# RTMP 已关闭(纯 WHIP 场景，不再接收 OBS Enhanced Broadcasting 多轨推流)。
+rtmp: false
+hls: false
+srt: false
+moq: false
+
+# ── WebRTC ────────────────────────────────────
+webrtc: true
+# :8890/:8190 已经被 edge.local.yml 占用，本机同时跑 origin+edge+record
+# 三个节点时会端口冲突，record 另开一段避开。
+webrtcAddress: :8893
+# 远程部署：监听所有接口，而不是 127.0.0.1（后者只适用于 OBS 与服务进程
+# 同机的场景，见 origin.local.yml）。
+webrtcLocalUDPAddress: :8193
+
+# 网卡上只看得到内网地址 172.24.155.66，不能靠自动探测；显式声明公网 IP，
+# 让 OBS/浏览器能连回这台机器的 ICE UDP 端口。
+webrtcIPsFromInterfaces: true
+webrtcAdditionalHosts: []
+
+webrtcAllowOrigins: ["*"]
+# Simulcast 推流端(如 OBS)冷启动时视频编码器可能晚于音频出包;
+# 默认 2s 窗口过短会导致只采集到音频(播放黑屏)。轨道齐了会提前返回。
+webrtcTrackGatherTimeout: 10s
+
+# ABR (Adaptive Bitrate)
+webrtcABREnable: true
+webrtcABRWSPath: /ws/control
+webrtcABRSwitchCooldown: 3000
+
+# WHIP degrade protocol (docs/obs-mmx-degrade-protocol.md). Secret comes
+# from .env (WHIP_WS_SECRET), not from this file.
+webrtcDegradeEnable: false
+webrtcDegradeWSPathSuffix: /ws/whip
+webrtcDegradeInstantLossPct: 5.0
+webrtcDegradeAvgLossPct: 1.0
+webrtcDegradeObservationSec: 60
+
+# ── Forward (腾讯云 WHIP 转推) ──────────────────
+# 默认关闭。开启前必须在下面填好账号级信息，且每条要转推的 path
+# 还要单独设置 forwardTencent: true (见下方 paths 示例)。
+# 见 doc/forward-tencent-design.md —— WHIP 地址的确切拼装方式和多层
+# stream key 命名规则还没有对照真实腾讯云账号验证过，先用默认模板试。
+tencentWHIPEnable: true
+tencentWHIPEndpoint: "webrtc://{domain}/{app}/{streamKey}?txSecret={txSecret}&txTime={txTime}"
+tencentWHIPDomain: publish.numericgame.ph
+tencentWHIPApp: live
+tencentWHIPTokenDays: 30
+
+# ── Admin Web UI ───────────────────────────
+adminAddress: ":8091"
+adminName: "record"
+playSignatureTTL: 1h          # /api/playUri 签名播放链接有效期,默认 1h
+
+# ── Paths ─────────────────────────────────────
+paths:
+  all:                          # 接受 origin 转推来的任意路径,不再主动去拉
+    # origin 主动推流过来(见 origin.local.yml 的 forwardMmxEnable/forwardMmx*),
+    # 本节点只是被动接受 WHIP 发布,鉴权走 Authorization: Bearer <token>,
+    # token 必须等于这台机器 .env 里的 MMX_FORWARD_SECRET(要跟 origin.local.yml
+    # 里那条 forwardMmxTargets[].token 配成一样的值；不是 WHIP_WS_SECRET，那个是
+    # 降级协议 WS 通道专用，见 docs/obs-whip-publish-auth-protocol.md 第八节)。
+    source: publisher
+    sourceOnDemand: false
+
+    forwardTencent: true
+    maxReaders: 30              # WHEP 拉流最大并发数，0=不限制
+    # forwardTencentStreamKey: my-stream-name    # 留空则默认用 path 名
+    record: yes                 # 收到 origin 推流即自动录像(fmp4),供 /api/split-rec 切分
+    recordPath: data/recordings/%Y%m%d/%path.%Y%m%d%H%M%S-%f
+    # Format of recorded segments.
+    # Available formats are "fmp4" (fragmented MP4) and "mpegts" (MPEG-TS).
+    recordFormat: fmp4
+    # fMP4 segments are concatenation of small MP4 files (parts), each with this duration.
+    # MPEG-TS segments are concatenation of 188-bytes packets, flushed to disk with this period.
+    # When a system failure occurs, the last part gets lost.
+    # Therefore, the part duration is equal to the RPO (recovery point objective).
+    recordPartDuration: 1s
+    # This prevents RAM exhaustion.
+    recordMaxPartSize: 600M
+    # Minimum duration of each segment.
+    recordSegmentDuration: 0.5h
+    # Delete segments after this timespan.
+    # Set to 0s to disable automatic deletion.
+    recordDeleteAfter: 24h
+

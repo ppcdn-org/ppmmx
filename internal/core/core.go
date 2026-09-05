@@ -749,31 +749,6 @@ func (p *Core) createResources(initial bool) error {
 				MinioDomain:    p.conf.NetStorageMinioDomain,
 			})
 		}
-		if p.conf.MMXControl && p.mmxControl == nil {
-			p.mmxControl = mmxcontrol.New(p.ctx, mmxcontrol.Config{
-				URL:                   p.conf.MMXControlURL,
-				AuthToken:             p.conf.MMXControlToken,
-				Role:                  p.conf.MMXNodeRole,
-				NodeID:                int32(p.conf.MMXNodeID),
-				Version:               strings.TrimSpace(string(version)),
-				Region:                p.conf.MMXNodeRegion,
-				Capacity:              int32(p.conf.MMXNodeCapacity),
-				HeartbeatInterval:     time.Duration(p.conf.MMXHeartbeatInterval),
-				WebRTCBaseURL:         p.conf.MMXWebRTCBaseURL,
-				PublishURL:            p.conf.MMXPublishURL,
-				ABRNegotiationAddress: p.conf.MMXABRNegotiationAddress,
-				PoolID:                p.conf.MMXNodePoolID,
-			}, func() []string { return nil }, p)
-			p.mmxControl.SetHTTPFallback(strings.Replace(strings.Replace(p.conf.MMXControlURL, "ws://", "http://", 1), "wss://", "https://", 1),
-				p.conf.MMXControlToken, 10*time.Second)
-		}
-		if p.conf.MMXRecordingSyncEnabled && p.recordingSync == nil {
-			p.recordingSync = mmxcontrol.NewRecordingSyncClient(
-				p.conf.MMXRecordingSyncURL,
-				p.conf.MMXRecordingSyncBearerToken,
-				time.Duration(p.conf.MMXRecordingSyncPollInterval),
-			)
-		}
 		i := &webrtc.Server{
 			Address:               p.conf.WebRTCAddress,
 			DumpPackets:           p.conf.DumpPackets,
@@ -817,6 +792,39 @@ func (p *Core) createResources(initial bool) error {
 			return err
 		}
 		p.webRTCServer = i
+	}
+
+	// mmxControl/recordingSync are independent long-lived clients, not tied to
+	// webRTCServer's own creation - gating them on p.webRTCServer == nil (as
+	// they used to be, nested in the block above) meant a reload that closes
+	// them unconditionally (see closeResources) but doesn't also recreate
+	// webRTCServer (e.g. no webrtc.* field changed) never recreated them,
+	// silently dropping mmxControl registration with ppcenter until the next
+	// full process restart.
+	if p.conf.WebRTC && p.conf.MMXControl && p.mmxControl == nil {
+		p.mmxControl = mmxcontrol.New(p.ctx, mmxcontrol.Config{
+			URL:                   p.conf.MMXControlURL,
+			AuthToken:             p.conf.MMXControlToken,
+			Role:                  p.conf.MMXNodeRole,
+			NodeID:                int32(p.conf.MMXNodeID),
+			Version:               strings.TrimSpace(string(version)),
+			Region:                p.conf.MMXNodeRegion,
+			Capacity:              int32(p.conf.MMXNodeCapacity),
+			HeartbeatInterval:     time.Duration(p.conf.MMXHeartbeatInterval),
+			WebRTCBaseURL:         p.conf.MMXWebRTCBaseURL,
+			PublishURL:            p.conf.MMXPublishURL,
+			ABRNegotiationAddress: p.conf.MMXABRNegotiationAddress,
+			PoolID:                p.conf.MMXNodePoolID,
+		}, func() []string { return nil }, p)
+		p.mmxControl.SetHTTPFallback(strings.Replace(strings.Replace(p.conf.MMXControlURL, "ws://", "http://", 1), "wss://", "https://", 1),
+			p.conf.MMXControlToken, 10*time.Second)
+	}
+	if p.conf.WebRTC && p.conf.MMXRecordingSyncEnabled && p.recordingSync == nil {
+		p.recordingSync = mmxcontrol.NewRecordingSyncClient(
+			p.conf.MMXRecordingSyncURL,
+			p.conf.MMXRecordingSyncBearerToken,
+			time.Duration(p.conf.MMXRecordingSyncPollInterval),
+		)
 	}
 
 	if p.conf.SRT &&

@@ -1264,8 +1264,8 @@ func (conf *Conf) Validate(l logger.Writer) error {
 		if err != nil || (u.Scheme != "ws" && u.Scheme != "wss") || u.Host == "" {
 			return fmt.Errorf("'mmxControlURL' must be a valid ws or wss URL")
 		}
-		if conf.MMXNodeRole != "NODE_ROLE_ORIGIN" && conf.MMXNodeRole != "NODE_ROLE_EDGE" {
-			return fmt.Errorf("'mmxNodeRole' must be NODE_ROLE_ORIGIN or NODE_ROLE_EDGE")
+		if conf.MMXNodeRole != "NODE_ROLE_ORIGIN" && conf.MMXNodeRole != "NODE_ROLE_EDGE" && conf.MMXNodeRole != "NODE_ROLE_RECORDER" {
+			return fmt.Errorf("'mmxNodeRole' must be NODE_ROLE_ORIGIN, NODE_ROLE_EDGE or NODE_ROLE_RECORDER")
 		}
 		if strings.TrimSpace(conf.MMXControlToken) == "" {
 			return fmt.Errorf("MMX_CONTROL_TOKEN must be set (in .env) when mmxControl is true")

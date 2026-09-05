@@ -1,8 +1,10 @@
 ###############################################
 # mmx edge node configuration
-# 边缘节点：按需从 Origin 回源，服务观众
+# 边缘节点：被动接收 Origin 的 forwardMmx 推流(见 origin.local.yml 的
+# forwardMmxEnable/paths.all.forwardMmxTargets)，服务观众
 #
-# 多 Edge 部署：每个 Edge 实例需不同的端口和日志文件
+# 多 Edge 部署：每个 Edge 实例需不同的端口和日志文件，且要把自己加进
+# origin.local.yml 的 forwardMmxTargets 列表里才能收到推流
 #   Edge-1: webrtcAddress=:8890, webrtcLocalUDPAddress=:8190, logFile=logs/mmx-edge1.log
 #   Edge-2: webrtcAddress=:8891, webrtcLocalUDPAddress=:8191, logFile=logs/mmx-edge2.log
 #   Edge-N: 以此类推
@@ -14,7 +16,7 @@ logFile: logs/mmx-edge.log
 
 # ── PPCDN control plane ───────────────────────
 mmxControl: true
-mmxControlURL: ws://127.0.0.1:8080/ws/mmx
+mmxControlURL: ws://127.0.0.1:18000/ws/mmx
 mmxNodeRole: NODE_ROLE_EDGE
 mmxNodeID: 1
 mmxNodeRegion: local
@@ -29,6 +31,16 @@ writeQueueSize: 512
 # ── Control API ──────────────────────────────
 api: true
 apiAddress: :9998
+
+# ── Admin 管理界面 ────────────────────────
+# 默认 :8080 已被 Apache 占用，且不能与 origin (:8081) 重复。
+# Edge-2 再开一个实例时改成 :8083。
+adminAddress: :8082
+# adminName 决定 admin store 的 sqlite 文件名(data/<adminName>.db3)，不设则
+# 默认落到 "origin"(见 internal/core/core.go)——本机同时跑 origin+edge 时会
+# 变成两个进程共用同一个 data/origin.db3，起初实测确实被静默共用了。
+# Edge-2 再开一个实例时要另外改成 edge2，避免反过来跟这个 edge 撞车。
+adminName: edge
 
 # ── Protocols ─────────────────────────────────
 rtsp: false
@@ -50,14 +62,9 @@ webrtcABRSwitchCooldown: 3000
 # ── Paths ─────────────────────────────────────
 paths:
   all:
-    # 按需从 Origin 拉流 (WHEP), $G1 替换为路径名
-    source: whep://127.0.0.1:8889/$G1/whep
-
-    sourceOnDemand: true
-    sourceOnDemandStartTimeout: 10s
-    sourceOnDemandCloseAfter: 10s
-
-    whepBearerToken: ""
-    whepSTUNGatherTimeout: 5s
-    whepHandshakeTimeout: 10s
-    whepTrackGatherTimeout: 5s
+    # 被动接受 Origin 的 forwardMmx 推流，不再按需回源拉流。鉴权走
+    # Authorization: Bearer <token>，必须等于本机 .env 的 MMX_FORWARD_SECRET
+    # (要跟 origin.local.yml 里那条 forwardMmxTargets[].token 配成一样的值，
+    # 见 docs/obs-whip-publish-auth-protocol.md 第八节)。
+    source: publisher
+    sourceOnDemand: false

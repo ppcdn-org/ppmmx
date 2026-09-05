@@ -29,3 +29,7 @@
 /internal/core/data/
 /internal/externalcmd/C*Usersgreg*
 *.sock
+bin/crash-stderr-record-utf8.log
+bin/crash-stderr-record.log
+bin/mmx.exe~
+

@@ -32,6 +32,33 @@ import (
 	"github.com/bluenviron/mediamtx/internal/stream"
 )
 
+// describeOfferMedias renders each m-line of an offer as
+// "<media>:port=<n>[,<direction>][,<attr>]", joined by "; ".
+//
+// It exists so a rejected WHIP offer says WHY it was rejected. TracksAreValid
+// only reports the verdict ("no valid tracks found"), which is unactionable on
+// its own: a publisher whose audio and video m-lines are all filtered out by
+// mediaCanSend - port 0, a=inactive or a=recvonly - looks identical to one that
+// sent no media at all. The direction and port are exactly the fields that
+// decide it, so they belong in the error the publisher and the log both see.
+func describeOfferMedias(medias []*sdp.MediaDescription) string {
+	if len(medias) == 0 {
+		return "none"
+	}
+	descs := make([]string, 0, len(medias))
+	for _, media := range medias {
+		desc := media.MediaName.Media + ":port=" + strconv.Itoa(media.MediaName.Port.Value)
+		for _, attr := range media.Attributes {
+			switch attr.Key {
+			case "sendonly", "recvonly", "sendrecv", "inactive", "bundle-only":
+				desc += "," + attr.Key
+			}
+		}
+		descs = append(descs, desc)
+	}
+	return strings.Join(descs, "; ")
+}
+
 func whipOffer(body []byte) *pwebrtc.SessionDescription {
 	return &pwebrtc.SessionDescription{
 		Type: pwebrtc.SDPTypeOffer,
@@ -570,12 +597,14 @@ func (s *session) runPublish(req *initialRequestReq) (int, error) {
 
 	err = webrtc.TracksAreValid(sdp.MediaDescriptions, 1, 0)
 	if err != nil {
+		s.Log(logger.Debug, "rejected WHIP offer: %s", offer.SDP)
 		// RFC draft-ietf-wish-whip
 		// if the number of audio and or video
 		// tracks or number streams is not supported by the WHIP Endpoint, it
 		// MUST reject the HTTP POST request with a "406 Not Acceptable" error
 		// response.
-		return http.StatusNotAcceptable, err
+		return http.StatusNotAcceptable, fmt.Errorf("%w (offer m-lines: %s)",
+			err, describeOfferMedias(sdp.MediaDescriptions))
 	}
 
 	// Simulcast layer count is decided by the publisher (OBS), not mmx -

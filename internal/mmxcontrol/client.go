@@ -45,6 +45,16 @@ type Client struct {
 	done     chan struct{}
 	once     sync.Once
 	fallback *HTTPFallbackClient
+
+	// outageLogged suppresses the "connection lost" / "falling back to
+	// HTTP" / "fallback heartbeat|poll failed" lines on retries after the
+	// first one for an ongoing outage. Without this, a downed ppcenter
+	// makes run() log the same triplet every backoff cycle (capped at
+	// 30s) for as long as it stays down, saying nothing the first
+	// occurrence didn't already say. Reset to false in connect() on a
+	// successful dial, so the next outage logs again. Only ever touched
+	// from the single goroutine run() spawns, so no lock needed.
+	outageLogged bool
 }
 
 // New starts a control-plane client.
@@ -81,20 +91,28 @@ func (c *Client) run(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
-		c.parent.Log(logger.Warn, "MMX control connection lost: %v", err)
+		if !c.outageLogged {
+			c.parent.Log(logger.Warn, "MMX control connection lost: %v", err)
+		}
 
 		if c.fallback != nil {
-			c.parent.Log(logger.Info, "MMX control falling back to HTTP")
+			if !c.outageLogged {
+				c.parent.Log(logger.Info, "MMX control falling back to HTTP")
+			}
 			for {
 				if ctx.Err() != nil {
 					return
 				}
 				if hbErr := c.fallback.Heartbeat(ctx); hbErr != nil {
-					c.parent.Log(logger.Warn, "MMX HTTP fallback heartbeat failed: %v", hbErr)
+					if !c.outageLogged {
+						c.parent.Log(logger.Warn, "MMX HTTP fallback heartbeat failed: %v", hbErr)
+					}
 					break
 				}
 				if _, pollErr := c.fallback.PollCommands(ctx); pollErr != nil {
-					c.parent.Log(logger.Warn, "MMX HTTP fallback poll failed: %v", pollErr)
+					if !c.outageLogged {
+						c.parent.Log(logger.Warn, "MMX HTTP fallback poll failed: %v", pollErr)
+					}
 					break
 				}
 				select {
@@ -104,6 +122,7 @@ func (c *Client) run(ctx context.Context) {
 				}
 			}
 		}
+		c.outageLogged = true
 
 		if !errors.Is(err, errReconnectHint) {
 			delay := backoff + time.Duration(rand.Int64N(int64(backoff/2)+1))
@@ -132,6 +151,7 @@ func (c *Client) connect(ctx context.Context) error {
 	}
 	defer conn.Close()
 	c.parent.Log(logger.Info, "MMX control connected to %s", c.config.URL)
+	c.outageLogged = false
 
 	readErr := make(chan error, 1)
 	go func() {

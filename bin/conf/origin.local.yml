@@ -9,13 +9,20 @@ logFile: logs/mmx-origin.log
 
 # ── PPCDN control plane ───────────────────────
 mmxControl: true
-mmxControlURL: ws://127.0.0.1:8080/ws/mmx
+mmxControlURL: ws://127.0.0.1:18000/ws/mmx
 mmxNodeRole: NODE_ROLE_ORIGIN
 mmxNodeID: 1
 mmxNodeRegion: local
 mmxNodeCapacity: 100
 mmxHeartbeatInterval: 10s
 mmxWebRTCBaseURL: http://127.0.0.1:8889
+# origin 上下线时，ppcenter 会把这个地址转发给已注册的 NODE_ROLE_PUBLISHER
+# 节点(ppcenter internal/manager/node_manager.go 的 notifyPublishersOriginStatus)。
+# 不填就跳过通知(打 WARN "empty publishUrl")；跟实际签发 WHIP 地址的
+# /v1/publish/requests 流程无关，那边走的是 mmxWebRTCBaseURL。本地目前没有
+# NODE_ROLE_PUBLISHER 节点注册，填了也暂时没人接收，先跟 mmxWebRTCBaseURL
+# 保持一致。
+mmxPublishURL: http://127.0.0.1:8889
 
 readTimeout: 10s
 writeTimeout: 10s
@@ -26,13 +33,20 @@ udpReadBufferSize: 2097152            # UDP 读缓冲 2MB，避免大关键帧 b
 api: true
 apiAddress: :9997
 
+# ── Admin 管理界面 ────────────────────────
+# 不设则默认 :8080，本机该端口已被 Apache (httpd.exe) 占用。
+# Windows 上 Go 绑的是 IPv6 通配 [::]:8080，不会报错，但访问
+# http://127.0.0.1:8080 会落到 Apache 而不是 mmx。
+adminAddress: :8081
+# adminName 决定 admin store 的 sqlite 文件名(data/<adminName>.db3)。不设则
+# 默认落到 "origin"——这里显式写出来，纯粹是为了跟 edge/record 保持对称、
+# 防止以后改了默认值反而误伤；真正踩过的坑见 edge.local.yml 的同一处注释。
+adminName: origin
+
 # ── Protocols ─────────────────────────────────
 rtsp: false
-# RTMP: 用于接收 OBS Enhanced Broadcasting (Multitrack Video)，
-# 4 路视频以 Enhanced RTMP 私有多轨扩展在同一条 RTMP 连接内下发，
-# gortmplib 已原生支持解析 (OneTrack 子模式，与 OBS 实际发送格式一致)。
-rtmp: true
-rtmpAddress: :1935
+# RTMP 已关闭：不再接收 OBS Enhanced Broadcasting (Multitrack Video) 推流。
+rtmp: false
 hls: false
 srt: false
 # srtAddress: :8890  # disabled: conflicts with Edge WHEP port
@@ -64,6 +78,13 @@ tencentWHIPApp: live
 tencentWHIPSecretKey: ""
 tencentWHIPTokenDays: 30
 
+# ── Forward (mmx-to-mmx 转推) ──────────────────
+# 账号级总开关；每条要转推的 path 还要单独设置 forwardMmx: true 并在
+# forwardMmxTargets 里列出目标节点(见下方 paths 示例)。token 必须和目标
+# 节点 .env 里的 MMX_FORWARD_SECRET 完全一致；三个字段相互独立，不要复用
+# WHIP_AUTH_KEY/WHIP_WS_SECRET(见 docs/obs-whip-publish-auth-protocol.md 第八节)。
+forwardMmxEnable: true
+
 # ── Paths ─────────────────────────────────────
 paths:
   all:                          # 接受任意路径的推流
@@ -72,3 +93,13 @@ paths:
     maxReaders: 30              # WHEP 拉流最大并发数，0=不限制
     forwardTencent: false                      # 该 path 是否转推腾讯云
     # forwardTencentStreamKey: my-stream-name    # 留空则默认用 path 名
+
+    # 本地联调：同时转推给 record 和 edge 两个节点(见上方 forwardMmxEnable)。
+    # {path} 会被替换成实际的推流路径名，让 "all" 通配的每条流各自转发到
+    # 目标节点上同名的 path，不会互相覆盖。
+    forwardMmx: true
+    forwardMmxTargets:
+      - url: http://127.0.0.1:8893/{path}/whip   # record (webrtcAddress :8893)
+        token: f04411ff0db0752e3c4ad166de3f6ae7c0a8c7ec95831b60
+      - url: http://127.0.0.1:8890/{path}/whip   # edge (webrtcAddress :8890)
+        token: f04411ff0db0752e3c4ad166de3f6ae7c0a8c7ec95831b60
