@@ -7,6 +7,7 @@ import (
 	"errors"
 	"math/rand/v2"
 	"net/http"
+	"net/url"
 	"sort"
 	"strings"
 	"sync"
@@ -78,6 +79,29 @@ func (c *Client) SetHTTPFallback(baseURL, token string, timeout time.Duration) {
 	if baseURL != "" {
 		c.fallback = NewHTTPFallbackClient(baseURL, token, timeout, c.indication, c.parent)
 	}
+}
+
+// DeriveFallbackURL builds the HTTP fallback base URL from the WS control
+// URL's scheme and host. ppcenter serves the fallback trio at
+// /internal/mmx/v1 (see registerNodeFallbackRoutes in ppcenter's route.go),
+// not under the WS path, so the control URL's own path is discarded rather
+// than reused. Returns "" if controlURL doesn't parse, which leaves the
+// fallback client unset (SetHTTPFallback treats "" as "no fallback").
+func DeriveFallbackURL(controlURL string) string {
+	u, err := url.Parse(controlURL)
+	if err != nil {
+		return ""
+	}
+	switch u.Scheme {
+	case "ws":
+		u.Scheme = "http"
+	case "wss":
+		u.Scheme = "https"
+	}
+	u.Path = "/internal/mmx/v1"
+	u.RawQuery = ""
+	u.Fragment = ""
+	return u.String()
 }
 
 func (c *Client) run(ctx context.Context) {

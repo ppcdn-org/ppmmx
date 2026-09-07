@@ -146,6 +146,12 @@ func TestClientReconnects(t *testing.T) {
 	awaitConnection(t, connections)
 }
 
+func TestDeriveFallbackURL(t *testing.T) {
+	require.Equal(t, "http://127.0.0.1:18090/internal/mmx/v1", DeriveFallbackURL("ws://127.0.0.1:18090/ws/mmx"))
+	require.Equal(t, "https://api.pp-cdn.org/internal/mmx/v1", DeriveFallbackURL("wss://api.pp-cdn.org/ws/mmx"))
+	require.Empty(t, DeriveFallbackURL("://not-a-url"))
+}
+
 func awaitMessage(t *testing.T, messages <-chan []byte) []byte {
 	t.Helper()
 	select {

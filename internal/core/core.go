@@ -816,7 +816,7 @@ func (p *Core) createResources(initial bool) error {
 			ABRNegotiationAddress: p.conf.MMXABRNegotiationAddress,
 			PoolID:                p.conf.MMXNodePoolID,
 		}, func() []string { return nil }, p)
-		p.mmxControl.SetHTTPFallback(strings.Replace(strings.Replace(p.conf.MMXControlURL, "ws://", "http://", 1), "wss://", "https://", 1),
+		p.mmxControl.SetHTTPFallback(mmxcontrol.DeriveFallbackURL(p.conf.MMXControlURL),
 			p.conf.MMXControlToken, 10*time.Second)
 	}
 	if p.conf.WebRTC && p.conf.MMXRecordingSyncEnabled && p.recordingSync == nil {
