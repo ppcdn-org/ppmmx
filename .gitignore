@@ -11,6 +11,7 @@
 /internal/core/auto.key
 /bin/*.exe
 /bin/mmx
+/bin/mmx-*
 /bin/.env
 /bin/data/
 /bin/logs/
