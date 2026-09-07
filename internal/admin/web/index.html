@@ -77,8 +77,6 @@ code{background:var(--bg);padding:3px 7px;border-radius:5px;font-size:12px;color
       <a href="#" data-page="statistics">Statistics</a>
       <a href="#" data-page="siteConfig">Configuration</a>
       <a href="#" data-page="mainPlayer">Main Player</a>
-      <a href="#" data-page="backupPlayer">Backup Player</a>
-      <a href="#" data-page="downloads">Downloads</a>
     </nav>
     <div class="header-actions"><button onclick="resetPassword()">Reset Password</button><button class="btn-danger" onclick="logout()">Logout</button></div>
   </div>
@@ -100,9 +98,7 @@ document.querySelectorAll('nav a').forEach(a => {
     else if (p === 'statistics') renderStatistics();
     else if (p === 'siteConfig') renderSiteConfig();
     else if (p === 'sessions') renderSessions();
-    else if (p === 'mainPlayer') renderPlayer('primary');
-    else if (p === 'backupPlayer') renderPlayer('backup');
-    else if (p === 'downloads') renderDownloads();
+    else if (p === 'mainPlayer') renderPlayer();
   });
 });
 
@@ -297,7 +293,7 @@ async function renderSiteConfig() {
       <h2>Configuration</h2>
       <div class="card"><h3>Player Domains</h3><table>
         <tr><td>Main Player Domain</td><td><input id="mainPlayerDomain" class="config-input" value="${esc(data.main_player_domain||'')}" disabled></td></tr>
-        <tr><td>Backup Player Domain</td><td><input id="backupPlayerDomain" class="config-input" value="${esc(data.backup_player_domain||'')}" disabled></td></tr>
+        <input type="hidden" id="backupPlayerDomain" value="${esc(data.backup_player_domain||'')}">
         <tr><td>VideoStat Domain</td><td><select id="videoStatDomain" class="config-input" disabled>
           ${Object.entries(data.videostat_environments||{}).map(([env,url])=>
             `<option value="${esc(env)}" ${data.videostat_env===env?'selected':''}>${esc(env)}: ${esc(url||'(not configured)')}</option>`
@@ -454,17 +450,17 @@ async function kickSession(uuid) {
 }
 
 // ── Player ────────────────────────────────────────────────────
-async function renderPlayer(playerType) {
+async function renderPlayer() {
   const main = document.getElementById('content');
   main.innerHTML = '<div class="loading">Loading...</div>';
   try {
     const data = await api('/player');
     const players = data.players || [];
-    const selected = players.filter(p => p.type === playerType);
-    let html = `<h2>${playerType === 'backup' ? 'Backup Player' : 'Main Player'}</h2><div class="player-stack">`;
+    const selected = players.filter(p => p.type !== 'backup');
+    let html = `<h2>Main Player</h2><div class="player-stack">`;
     selected.forEach(p => {
-      const badge = p.type === 'backup' ? 'badge-reader' : 'badge-on';
-      const label = p.type === 'backup' ? 'Backup' : p.name;
+      const badge = 'badge-on';
+      const label = p.name;
       html += `<div class="card">
         <h3><span class="badge ${badge}">${label}</span></h3>
         <table>
@@ -477,27 +473,6 @@ async function renderPlayer(playerType) {
     if (!selected.length) html += '<div class="card"><p class="status">Player configuration is unavailable.</p></div>';
     html += '</div>';
     main.innerHTML = html;
-  } catch(e) { main.innerHTML = `<div class="error">Error: ${e.message}</div>`; }
-}
-
-// ── Downloads ──────────────────────────────────────────────────
-async function renderDownloads() {
-  const main = document.getElementById('content');
-  main.innerHTML = '<div class="loading">Loading...</div>';
-  try {
-    const data = await api('/downloads');
-    const obs = data.obs;
-    main.innerHTML = `
-      <h2>Downloads</h2>
-      <div class="card">
-        <h3>${esc(obs.name)}</h3>
-        <table>
-          <tr><td>Version</td><td><code>${esc(obs.version)}</code></td></tr>
-          <tr><td>Platform</td><td>${esc(obs.platform)}</td></tr>
-          <tr><td>Download</td><td><a class="dl-link" href="${esc(obs.url)}" target="_blank">${esc(obs.url)}</a></td></tr>
-          <tr><td>SHA-256</td><td><code style="font-size:11px">${esc(obs.sha256)}</code></td></tr>
-        </table>
-      </div>`;
   } catch(e) { main.innerHTML = `<div class="error">Error: ${e.message}</div>`; }
 }
 

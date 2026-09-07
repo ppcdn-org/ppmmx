@@ -457,14 +457,6 @@ func (s *Server) playerConfigSetHandler(c *gin.Context) {
 	respOK(c, gin.H{"message": "ok"})
 }
 
-func (s *Server) downloadsHandler(c *gin.Context) {
-	respOK(c, gin.H{"obs": gin.H{
-		"name":    "OBS Studio 32.1.2 Patched",
-		"version": "32.1.2-patched",
-		"url":     "https://github.com/Elon666-ai/obs32.1.2patched/releases",
-	}})
-}
-
 func (s *Server) deployConfigGetHandler(c *gin.Context) {
 	var ingestSources []string
 	if s.ConfPath != "" {
@@ -846,7 +838,6 @@ func (s *Server) Initialize() error {
 	protected.GET("/player", s.playerHandler)
 	protected.GET("/player-config", s.playerConfigGetHandler)
 	protected.POST("/player-config", s.playerConfigSetHandler)
-	protected.GET("/downloads", s.downloadsHandler)
 	protected.GET("/deploy-config", s.deployConfigGetHandler)
 	protected.POST("/deploy-config", s.deployConfigSetHandler)
 	protected.POST("/restart", s.restartHandler)
