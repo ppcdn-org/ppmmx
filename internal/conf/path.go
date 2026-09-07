@@ -254,6 +254,16 @@ type Path struct {
 	// set, ForwardMmxURL/ForwardMmxToken counts as one more target
 	// alongside whatever's in ForwardMmxTargets rather than being ignored -
 	// see MmxTargets.
+	//
+	// Neither token field belongs in the YAML: every forward target is a
+	// node you operate yourself and they all share one pre-shared secret,
+	// so the token is taken from MMX_FORWARD_SECRET in .env (see
+	// Conf.WebRTCForwardSecret) and filled in by validate(). Keeping the
+	// secret out of the config file keeps it out of version control and
+	// out of anything that renders the config. The fields stay writable so
+	// an existing config that still carries a token keeps working, and so
+	// a deployment that genuinely needs a per-target token can override
+	// the shared default.
 	ForwardMmx        bool               `json:"forwardMmx"`
 	ForwardMmxURL     string             `json:"forwardMmxURL,omitempty"`
 	ForwardMmxToken   string             `json:"forwardMmxToken,omitempty"`
@@ -496,6 +506,21 @@ func (pconf *Path) validate(
 		if !conf.ForwardMmxEnable {
 			return fmt.Errorf("path '%s': 'forwardMmx' requires the account-level 'forwardMmxEnable' to be true", name)
 		}
+
+		// Fill every target that didn't spell out its own token from the
+		// deployment-wide MMX_FORWARD_SECRET, so the secret lives only in
+		// .env. Done in-place before MmxTargets() is read anywhere else
+		// (core's startMmxForwarding, and the reload comparison in
+		// core/path.go) so those all see the resolved token.
+		if pconf.ForwardMmxToken == "" {
+			pconf.ForwardMmxToken = conf.WebRTCForwardSecret
+		}
+		for i := range pconf.ForwardMmxTargets {
+			if pconf.ForwardMmxTargets[i].Token == "" {
+				pconf.ForwardMmxTargets[i].Token = conf.WebRTCForwardSecret
+			}
+		}
+
 		targets := pconf.MmxTargets()
 		if len(targets) == 0 {
 			return fmt.Errorf("path '%s': 'forwardMmxURL' or 'forwardMmxTargets' must be set when forwardMmx is true", name)
@@ -505,7 +530,7 @@ func (pconf *Path) validate(
 				return fmt.Errorf("path '%s': forwardMmx target %d: 'url' must not be empty", name, i)
 			}
 			if t.Token == "" {
-				return fmt.Errorf("path '%s': forwardMmx target %d: 'token' must not be empty", name, i)
+				return fmt.Errorf("path '%s': forwardMmx target %d: no token: set MMX_FORWARD_SECRET in .env", name, i)
 			}
 		}
 	}
@@ -969,10 +994,7 @@ func (pconf *Path) Equal(other *Path) bool {
 }
 
 // ForwardMmxTarget is one destination mmx node's WHIP publish endpoint to
-// forward a path's whole stream to - see Path.ForwardMmxTargets. Token is
-// sent as the WHIP publish Bearer token, so it must be the *target* node's
-// own credential (see internal/servers/webrtc/http_server.go
-// checkWHIPDeviceID) - not this node's own.
+// forward a path's whole stream to - see Path.ForwardMmxTargets.
 type ForwardMmxTarget struct {
 	// URL is the target node's WHIP publish endpoint, either fixed (e.g.
 	// "http://mmx2-host:8889/live/table-view/whip") or a template
@@ -981,7 +1003,17 @@ type ForwardMmxTarget struct {
 	// own name at (re)connect time - needed when this config is on a
 	// regexp/"all" path matching many different stream names, so each one
 	// forwards under its own name instead of colliding on one fixed target.
-	URL   string `json:"url"`
+	URL string `json:"url"`
+
+	// Token is sent as the WHIP publish Bearer token, so it must be the
+	// credential the *target* node accepts (see
+	// internal/servers/webrtc/http_server.go checkWHIPDeviceID).
+	//
+	// Normally left out of the YAML: all forward targets are nodes you
+	// operate and they share one pre-shared secret, so Path.validate
+	// fills this in from MMX_FORWARD_SECRET in .env, keeping the secret
+	// out of the config file. Set it explicitly only to override that
+	// shared default for one target.
 	Token string `json:"token"`
 }
 

@@ -78,3 +78,41 @@ func TestIsValidPathName(t *testing.T) {
 		})
 	}
 }
+
+// A forwardMmx target normally carries no token in the config file: every
+// target is a node the same operator runs and they share one pre-shared
+// secret, so validate fills each empty token from MMX_FORWARD_SECRET
+// (Conf.WebRTCForwardSecret) and the secret stays in .env only.
+func TestPathForwardMmxTokenFromSharedSecret(t *testing.T) {
+	newPath := func(targets []ForwardMmxTarget, singleURL, singleToken string) *Path {
+		path := &Path{}
+		path.setDefaults()
+		path.ForwardMmx = true
+		path.ForwardMmxURL = singleURL
+		path.ForwardMmxToken = singleToken
+		path.ForwardMmxTargets = targets
+		return path
+	}
+	conf := &Conf{ForwardMmxEnable: true, WebRTCForwardSecret: "shared-secret"}
+
+	path := newPath([]ForwardMmxTarget{
+		{URL: "http://node-a:8889/{path}/whip"},
+		{URL: "http://node-b:8889/{path}/whip", Token: "per-target-token"},
+	}, "", "")
+	require.NoError(t, path.validate(conf, "test", false, nil))
+	require.Equal(t, "shared-secret", path.ForwardMmxTargets[0].Token)
+	require.Equal(t, "per-target-token", path.ForwardMmxTargets[1].Token,
+		"an explicitly configured token must survive the shared-secret fill")
+
+	// The legacy single-target fields resolve the same way.
+	path = newPath(nil, "http://node-a:8889/{path}/whip", "")
+	require.NoError(t, path.validate(conf, "test", false, nil))
+	require.Equal(t, "shared-secret", path.ForwardMmxToken)
+
+	// With no secret configured anywhere, the error names the env var to
+	// set rather than a 'token' field that is no longer meant to appear in
+	// the config file at all.
+	path = newPath([]ForwardMmxTarget{{URL: "http://node-a:8889/{path}/whip"}}, "", "")
+	require.EqualError(t, path.validate(&Conf{ForwardMmxEnable: true}, "test", false, nil),
+		"path 'test': forwardMmx target 0: no token: set MMX_FORWARD_SECRET in .env")
+}

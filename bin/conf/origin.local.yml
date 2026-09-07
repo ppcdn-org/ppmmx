@@ -88,9 +88,13 @@ tencentWHIPTokenDays: 30
 
 # ── Forward (mmx-to-mmx 转推) ──────────────────
 # 账号级总开关；每条要转推的 path 还要单独设置 forwardMmx: true 并在
-# forwardMmxTargets 里列出目标节点(见下方 paths 示例)。token 必须和目标
-# 节点 .env 里的 MMX_FORWARD_SECRET 完全一致；三个字段相互独立，不要复用
-# WHIP_AUTH_KEY/WHIP_WS_SECRET(见 docs/obs-whip-publish-auth-protocol.md 第八节)。
+# forwardMmxTargets 里列出目标节点(见下方 paths 示例)。
+#
+# token 不写在本文件里：所有转发目标都是自己的节点、共用同一个预共享密钥，
+# 所以统一取 .env 的 MMX_FORWARD_SECRET(见 conf.Path.validate)，避免密钥进
+# 版本库。本节点的 MMX_FORWARD_SECRET 必须和每个目标节点的完全一致。该密钥
+# 与 WHIP_AUTH_KEY/WHIP_WS_SECRET 相互独立，不要复用(见
+# docs/obs-whip-publish-auth-protocol.md 第八节)。
 forwardMmxEnable: true
 
 # ── Paths ─────────────────────────────────────
@@ -108,6 +112,4 @@ paths:
     forwardMmx: true
     forwardMmxTargets:
       - url: http://127.0.0.1:8893/{path}/whip   # record (webrtcAddress :8893)
-        token: f04411ff0db0752e3c4ad166de3f6ae7c0a8c7ec95831b60
       - url: http://127.0.0.1:8890/{path}/whip   # edge (webrtcAddress :8890)
-        token: f04411ff0db0752e3c4ad166de3f6ae7c0a8c7ec95831b60
