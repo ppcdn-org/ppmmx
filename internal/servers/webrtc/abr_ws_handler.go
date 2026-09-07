@@ -257,11 +257,21 @@ func sendTracksInfo(conn *websocket.ServerConn, selector *webrtcproto.TrackSelec
 }
 
 func tracksInfoMessage(selector *webrtcproto.TrackSelector) abrMessage {
-	if selector == nil {
-		return abrMessage{}
+	// selector is nil for multi-track/simulcast WHEP sessions (see
+	// session.go's videoTrackCount>1 branch, which never sets
+	// s.trackSelector - that delivery mode lets the client pick a layer
+	// locally from the tracks it already received, so there's nothing to
+	// report here). Still send a well-formed TRACKS_INFO with an empty list
+	// rather than a zero-value abrMessage: the latter has Type=="", which
+	// the client can't match against any case and leaves its Quality
+	// dropdown stuck on "Loading..." forever instead of settling on
+	// "Auto (ABR)" with no manual layers to offer.
+	tracks := []webrtcproto.TrackInfo{}
+	activeID := -1
+	if selector != nil {
+		tracks = selector.GetTracks()
+		activeID = selector.ActiveTrackID()
 	}
-	tracks := selector.GetTracks()
-	activeID := selector.ActiveTrackID()
 
 	msg := abrMessage{
 		Type: "TRACKS_INFO",
