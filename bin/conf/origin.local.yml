@@ -66,6 +66,14 @@ webrtcABREnable: true
 webrtcABRWSPath: /ws/control
 webrtcABRSwitchCooldown: 3000
 
+# WHIP degrade protocol (docs/obs-mmx-degrade-protocol.md). Secret comes
+# from .env (WHIP_WS_SECRET), not from this file.
+webrtcDegradeEnable: true
+webrtcDegradeWSPathSuffix: /ws/whip
+webrtcDegradeInstantLossPct: 5.0
+webrtcDegradeAvgLossPct: 1.0
+webrtcDegradeObservationSec: 60
+
 # ── Forward (腾讯云 WHIP 转推) ──────────────────
 # 默认关闭。开启前必须在下面填好账号级信息，且每条要转推的 path
 # 还要单独设置 forwardTencent: true (见下方 paths 示例)。

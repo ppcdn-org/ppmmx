@@ -76,7 +76,7 @@ webrtcDegradeObservationSec: 60
 # 还要单独设置 forwardTencent: true (见下方 paths 示例)。
 # 见 doc/forward-tencent-design.md —— WHIP 地址的确切拼装方式和多层
 # stream key 命名规则还没有对照真实腾讯云账号验证过，先用默认模板试。
-tencentWHIPEnable: true
+tencentWHIPEnable: false
 tencentWHIPEndpoint: "webrtc://{domain}/{app}/{streamKey}?txSecret={txSecret}&txTime={txTime}"
 tencentWHIPDomain: publish.numericgame.ph
 tencentWHIPApp: live
@@ -98,7 +98,7 @@ paths:
     source: publisher
     sourceOnDemand: false
 
-    forwardTencent: true
+    forwardTencent: false
     maxReaders: 30              # WHEP 拉流最大并发数，0=不限制
     # forwardTencentStreamKey: my-stream-name    # 留空则默认用 path 名
     record: yes                 # 收到 origin 推流即自动录像(fmp4),供 /api/split-rec 切分
