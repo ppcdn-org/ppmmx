@@ -19,6 +19,36 @@ import (
 	"github.com/bluenviron/mediamtx/internal/logger"
 )
 
+// SplitRecFileReporter is the narrow interface uploader uses to tell
+// ppcenter about one finished, uploaded split-rec round file, so it lands
+// in ppcenter's MySQL (see ppcenter's
+// POST /internal/mmx/v1/records/split-rec-files) alongside the S3/MinIO
+// object itself. Satisfied by *internal/mmxcontrol.RecordingSyncClient;
+// kept as a narrow interface here so this package doesn't need to import
+// mmxcontrol. A nil reporter (SetSplitRecFileReporter never called, or
+// mmxControl disabled) just means round files are never reported - the
+// upload itself is unaffected either way.
+type SplitRecFileReporter interface {
+	ReportSplitRecFile(ctx context.Context, file SplitRecFileInfo) error
+}
+
+// SplitRecFileInfo carries one finished round file's identity/metadata for
+// SplitRecFileReporter - a package-local mirror of
+// mmxcontrol.SplitRecFileMetadata so this package doesn't need to import
+// mmxcontrol just for a struct literal.
+type SplitRecFileInfo struct {
+	TableID         string
+	GameID          string
+	GameRound       string
+	AppEnv          string
+	StreamPath      string
+	FileName        string
+	ObjectKey       string
+	PlaybackURL     string
+	DurationSeconds int64
+	SizeBytes       int64
+}
+
 // UploadConfig carries net-storage settings for uploading finished round
 // recordings. It is sourced from environment variables / bin/.env (see
 // internal/conf), never from the YAML.
@@ -47,7 +77,7 @@ type UploadConfig struct {
 }
 
 // resolveEnv returns the environment to use for this upload: appEnv (from
-// the split-rec request's optional "app_env" field) takes priority when
+// the split-rec request's optional "appEnv" field) takes priority when
 // non-empty, so a single process serving multiple game environments routes
 // each round's upload independently; an empty appEnv (older callers that
 // don't send it) falls back to c.Env, the process-wide APP_ENV - the
@@ -99,8 +129,9 @@ func (c UploadConfig) configured(appEnv string) bool {
 // environments) in the background, with retries. Uploading is best-effort:
 // a failure never affects the recording/split-rec response.
 type uploader struct {
-	cfg    UploadConfig
-	parent logger.Writer
+	cfg      UploadConfig
+	parent   logger.Writer
+	reporter SplitRecFileReporter
 }
 
 func newUploader(cfg UploadConfig, parent logger.Writer) *uploader {
@@ -108,20 +139,24 @@ func newUploader(cfg UploadConfig, parent logger.Writer) *uploader {
 }
 
 // uploadAsync uploads filePath under objectKey in the background. appEnv is
-// the split-rec request's optional "app_env" field: when non-empty it picks
+// the split-rec request's optional "appEnv" field: when non-empty it picks
 // which environment's bucket/backend this round's file goes to, taking
 // priority over the process-wide APP_ENV (see UploadConfig.resolveEnv) -
 // this is what lets one process serve multiple game environments without
 // their recordings landing in the same bucket. It is a no-op if net storage
-// isn't configured for the resolved environment.
-func (u *uploader) uploadAsync(filePath, objectKey, appEnv string) {
+// isn't configured for the resolved environment. info carries the
+// tableId/gameId/gameRound identity (and appEnv again, for the reported
+// row) used to tell ppcenter about the file once the upload succeeds - see
+// SplitRecFileReporter; a zero-value info is fine when no reporter is
+// wired in.
+func (u *uploader) uploadAsync(filePath, objectKey, appEnv string, info SplitRecFileInfo) {
 	if u == nil || !u.cfg.configured(appEnv) {
 		return
 	}
-	go u.uploadWithRetry(filePath, objectKey, appEnv)
+	go u.uploadWithRetry(filePath, objectKey, appEnv, info)
 }
 
-func (u *uploader) uploadWithRetry(filePath, objectKey, appEnv string) {
+func (u *uploader) uploadWithRetry(filePath, objectKey, appEnv string, info SplitRecFileInfo) {
 	const maxAttempts = 10
 
 	// The recorder writes fragmented MP4 (moov first, but data split across
@@ -159,6 +194,7 @@ func (u *uploader) uploadWithRetry(filePath, objectKey, appEnv string) {
 		if err == nil {
 			u.parent.Log(logger.Info, "[upload] %s -> %s succeeded (attempt %d/%d)%s",
 				filePath, objectKey, attempt, maxAttempts, u.playbackURLSuffix(objectKey, appEnv))
+			u.reportSplitRecFile(objectKey, appEnv, info)
 			return
 		}
 		lastErr = err
@@ -167,6 +203,26 @@ func (u *uploader) uploadWithRetry(filePath, objectKey, appEnv string) {
 	}
 	u.parent.Log(logger.Warn, "[upload] %s -> %s gave up after %d attempts: %v",
 		filePath, objectKey, maxAttempts, lastErr)
+}
+
+// reportSplitRecFile tells ppcenter about a round file once its upload has
+// succeeded - see SplitRecFileReporter. Best-effort and synchronous in the
+// caller's own background goroutine (uploadWithRetry's), same as the
+// upload itself: a failure here only logs a warning, since the file is
+// already safely uploaded by this point and the split-rec HTTP response
+// returned long ago.
+func (u *uploader) reportSplitRecFile(objectKey, appEnv string, info SplitRecFileInfo) {
+	if u.reporter == nil {
+		return
+	}
+	info.ObjectKey = objectKey
+	info.AppEnv = appEnv
+	info.PlaybackURL = u.playbackURL(objectKey, appEnv)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := u.reporter.ReportSplitRecFile(ctx, info); err != nil {
+		u.parent.Log(logger.Warn, "[upload] %s -> %s: report to ppcenter failed: %v", objectKey, appEnv, err)
+	}
 }
 
 func (u *uploader) uploadS3(filePath, objectKey string) error {
@@ -221,11 +277,12 @@ func objectKeyFor(filePath string) string {
 	return filepath.Base(filePath)
 }
 
-// playbackURLSuffix returns ", url=<...>" when a playback domain is
-// configured for the active backend, for a friendlier success log line.
-// The URL is path-style (domain/bucket/key): both the S3 and MinIO
-// endpoints in use here serve objects that way, not virtual-hosted-style.
-func (u *uploader) playbackURLSuffix(objectKey, appEnv string) string {
+// playbackURL returns the public playback URL for objectKey on the active
+// backend (S3 for prod, MinIO otherwise), or "" if no playback domain is
+// configured for it. The URL is path-style (domain/bucket/key): both the
+// S3 and MinIO endpoints in use here serve objects that way, not
+// virtual-hosted-style.
+func (u *uploader) playbackURL(objectKey, appEnv string) string {
 	domain := u.cfg.S3Domain
 	bucket := u.cfg.s3BucketName()
 	if !u.cfg.isProd(appEnv) {
@@ -243,7 +300,17 @@ func (u *uploader) playbackURLSuffix(objectKey, appEnv string) string {
 	if !strings.Contains(domain, "://") {
 		domain = "https://" + domain
 	}
-	return fmt.Sprintf(", url=%s/%s/%s", domain, bucket, objectKey)
+	return fmt.Sprintf("%s/%s/%s", domain, bucket, objectKey)
+}
+
+// playbackURLSuffix returns ", url=<...>" for a friendlier success log
+// line - see playbackURL.
+func (u *uploader) playbackURLSuffix(objectKey, appEnv string) string {
+	url := u.playbackURL(objectKey, appEnv)
+	if url == "" {
+		return ""
+	}
+	return ", url=" + url
 }
 
 // uploadTimeout scales with file size: 60s base + 15s per 10MB, capped at 15m.

@@ -199,13 +199,13 @@ func TestExecuteStartAndStopDriveIngest(t *testing.T) {
 	}}
 	h.SetIngestManager(fake)
 
-	startReq := splitRecRequest{Time: "9999999999", Table: "table1", Game: "game1"}
+	startReq := splitRecRequest{Time: "9999999999", TableID: "table1", GameID: "game1"}
 	c := newSplitRecGinContext()
 	require.NoError(t, h.execute(c, startReq))
 	require.Equal(t, []string{path}, fake.starts(), "round start with no existing publisher must trigger ingest")
 	require.Empty(t, fake.stops())
 
-	stopReq := splitRecRequest{Time: "9999999999", Table: "table1", Game: "game1", GC: "round1"}
+	stopReq := splitRecRequest{Time: "9999999999", TableID: "table1", GameID: "game1", GameRound: "round1"}
 	c = newSplitRecGinContext()
 	require.NoError(t, h.execute(c, stopReq))
 	require.Equal(t, []string{path}, fake.stops(), "round end must stop ingest for the path")
@@ -222,7 +222,7 @@ func TestExecuteStopAlwaysCallsStopByPathEvenWithoutIngest(t *testing.T) {
 	fake := &fakeIngestManager{} // never asked to start anything - path was already live
 	h.SetIngestManager(fake)
 
-	startReq := splitRecRequest{Time: "9999999999", Table: "direct-publish", Game: "game1"}
+	startReq := splitRecRequest{Time: "9999999999", TableID: "direct-publish", GameID: "game1"}
 	// tableToPath default is "live/<table>-fwh"; override via mapping so
 	// this test's "direct-publish" table resolves to our pre-started path.
 	SetTablePathMapping(map[string]string{"direct-publish": path})
@@ -232,7 +232,7 @@ func TestExecuteStopAlwaysCallsStopByPathEvenWithoutIngest(t *testing.T) {
 	require.NoError(t, h.execute(c, startReq))
 	require.Empty(t, fake.starts(), "path was already live, ingest must not be touched")
 
-	stopReq := splitRecRequest{Time: "9999999999", Table: "direct-publish", Game: "game1", GC: "round1"}
+	stopReq := splitRecRequest{Time: "9999999999", TableID: "direct-publish", GameID: "game1", GameRound: "round1"}
 	c = newSplitRecGinContext()
 	require.NoError(t, h.execute(c, stopReq))
 	require.Equal(t, []string{path}, fake.stops(), "StopByPath is called unconditionally on round end; it's a no-op if ingest wasn't involved")

@@ -34,6 +34,25 @@ type SegmentMetadata struct {
 	Checksum   string `json:"checksum,omitempty"`
 }
 
+// SplitRecFileMetadata describes one finished, uploaded split-rec round
+// file (see internal/recording/split.go and upload.go) reported to
+// ppcenter's POST /internal/mmx/v1/records/split-rec-files. Distinct from
+// SegmentMetadata: split-rec has no appId/streamPath/roundId/sequence
+// concept at all, it identifies a file by tableId/gameId/gameRound.
+type SplitRecFileMetadata struct {
+	TableID         string `json:"tableId"`
+	GameID          string `json:"gameId"`
+	GameRound       string `json:"gameRound"`
+	AppEnv          string `json:"appEnv,omitempty"`
+	StreamPath      string `json:"streamPath,omitempty"`
+	FileName        string `json:"fileName"`
+	ObjectKey       string `json:"objectKey,omitempty"`
+	PlaybackURL     string `json:"playbackUrl,omitempty"`
+	DurationSeconds int64  `json:"durationSeconds,omitempty"`
+	SizeBytes       int64  `json:"sizeBytes,omitempty"`
+	NodeID          int    `json:"nodeId,omitempty"`
+}
+
 type RecordingSyncClient struct {
 	baseURL string
 	token   string
@@ -87,6 +106,29 @@ func (c *RecordingSyncClient) ReportSegment(ctx context.Context, segment Segment
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
 		return fmt.Errorf("recording segment report returned status %d", response.StatusCode)
+	}
+	return nil
+}
+
+// ReportSplitRecFile reports one finished, uploaded split-rec round file to
+// ppcenter. Best-effort: the caller (uploader.uploadWithRetry) treats a
+// failure here as non-fatal, since the round file itself has already been
+// uploaded successfully by the time this runs.
+func (c *RecordingSyncClient) ReportSplitRecFile(ctx context.Context, file SplitRecFileMetadata) error {
+	if file.TableID == "" || file.GameID == "" || file.GameRound == "" || file.FileName == "" {
+		return fmt.Errorf("invalid split-rec file metadata")
+	}
+	request, err := c.request(ctx, http.MethodPost, "/records/split-rec-files", file)
+	if err != nil {
+		return err
+	}
+	response, err := c.client.Do(request)
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return fmt.Errorf("split-rec file report returned status %d", response.StatusCode)
 	}
 	return nil
 }

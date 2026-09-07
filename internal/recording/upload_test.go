@@ -92,10 +92,10 @@ func TestUploadAsyncNoopWhenNotConfigured(t *testing.T) {
 	// Should return immediately without attempting any network I/O and
 	// without panicking, for both an unconfigured uploader and a nil one.
 	u := newUploader(UploadConfig{}, test.NilLogger)
-	u.uploadAsync("/does/not/exist.mp4", "does-not-exist.mp4", "")
+	u.uploadAsync("/does/not/exist.mp4", "does-not-exist.mp4", "", SplitRecFileInfo{})
 
 	var nilUploader *uploader
-	nilUploader.uploadAsync("/does/not/exist.mp4", "does-not-exist.mp4", "")
+	nilUploader.uploadAsync("/does/not/exist.mp4", "does-not-exist.mp4", "", SplitRecFileInfo{})
 }
 
 func TestUploadConfigS3BucketName(t *testing.T) {

@@ -827,6 +827,26 @@ func (p *Core) createResources(initial bool) error {
 		)
 	}
 
+	// splitRecFileReporter tells ppcenter about a finished split-rec round
+	// file once its upload succeeds (see recording.SplitRecFileReporter and
+	// ppcenter's POST /internal/mmx/v1/records/split-rec-files). Reuses
+	// mmxControl's own endpoint/credential (MMXControlURL +
+	// MMXControlToken, the same node auth every other node-to-ppcenter
+	// call already uses) rather than the separate, opt-in
+	// mmxRecordingSyncEnabled path above: every deployment that has
+	// mmxControl on (which split-rec's record nodes already do) gets
+	// reporting for free, with no extra config to provision. Wired in
+	// whenever splitHandler exists, independent of whether webRTCServer
+	// itself was (re)created this pass - same reasoning as
+	// mmxControl/recordingSync above.
+	if p.conf.WebRTC && p.conf.MMXControl && p.splitHandler != nil {
+		p.splitHandler.SetSplitRecFileReporter(splitRecFileReporterAdapter{client: mmxcontrol.NewRecordingSyncClient(
+			mmxcontrol.DeriveFallbackURL(p.conf.MMXControlURL),
+			p.conf.MMXControlToken,
+			10*time.Second,
+		)})
+	}
+
 	if p.conf.SRT &&
 		p.srtServer == nil {
 		i := &srt.Server{

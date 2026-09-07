@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
@@ -51,22 +52,23 @@ const waitForIngestPath = 10 * time.Second
 
 // SplitRecHandler handles POST /api/split-rec requests.
 type SplitRecHandler struct {
-	mgr          *Manager
-	pathFinder   PathFinder
-	parent       logger.Writer
-	mu           sync.Mutex
-	rateLim      map[string]*rateLimitEntry // per-IP rate limiting
-	authMode     string
-	authSecret   []byte
-	nonces       map[string]time.Time
-	uploader     *uploader
-	ingestMgr    IngestStarter
-	viewResolver TableViewResolver
+	mgr                  *Manager
+	pathFinder           PathFinder
+	parent               logger.Writer
+	mu                   sync.Mutex
+	rateLim              map[string]*rateLimitEntry // per-IP rate limiting
+	authMode             string
+	authSecret           []byte
+	nonces               map[string]time.Time
+	uploader             *uploader
+	splitRecFileReporter SplitRecFileReporter
+	ingestMgr            IngestStarter
+	viewResolver         TableViewResolver
 	// activeGames tracks, per table, which owner (see ownerKey) currently
-	// holds the open recording round (started by a gc-less call, closed by
-	// the paired call carrying gc). Only one owner may hold a table at a
-	// time - not one owner per view/path, since a round-start/round-end
-	// request only ever carries the table name.
+	// holds the open recording round (started by a gameRound-less call,
+	// closed by the paired call carrying gameRound). Only one owner may
+	// hold a table at a time - not one owner per view/path, since a
+	// round-start/round-end request only ever carries the table name.
 	activeGames map[string]activeRound
 }
 
@@ -75,8 +77,8 @@ type SplitRecHandler struct {
 // starts N recordings), and the per-path audit record (in mgr.Store())
 // tracking each, if any.
 type activeRound struct {
-	owner     string // ownerKey(req): app_env+":"+game, or just game if app_env is absent
-	game      string // original game field, kept for messages/audit independent of app_env
+	owner     string // ownerKey(req): appEnv+":"+gameId, or just gameId if appEnv is absent
+	game      string // original gameId field, kept for messages/audit independent of appEnv
 	startedAt time.Time
 	paths     []string
 	recordIDs map[string]string // path -> recordID
@@ -87,8 +89,8 @@ type rateLimitEntry struct {
 	resetTime time.Time
 }
 
-// identifierPattern restricts table/game/gc to characters that are safe to
-// embed in a file name (no $, *, /, spaces, etc.).
+// identifierPattern restricts tableId/gameId/gameRound to characters that
+// are safe to embed in a file name (no $, *, /, spaces, etc.).
 var identifierPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
 
 func validIdentifier(s string) bool {
@@ -129,11 +131,29 @@ func (h *SplitRecHandler) SetViewResolver(r TableViewResolver) {
 }
 
 // ConfigureUpload changes the net-storage upload settings without
-// recreating the handler. Called again on every config reload.
+// recreating the handler. Called again on every config reload; carries the
+// already-wired splitRecFileReporter forward onto the new uploader instance
+// (see SetSplitRecFileReporter), since reload order doesn't guarantee that
+// method runs again after this one.
 func (h *SplitRecHandler) ConfigureUpload(cfg UploadConfig) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.uploader = newUploader(cfg, h.parent)
+	h.uploader.reporter = h.splitRecFileReporter
+}
+
+// SetSplitRecFileReporter wires in the client used to tell ppcenter about a
+// round file once its upload succeeds (see SplitRecFileReporter). Not
+// calling this (splitRecFileReporter stays nil) just means round files are
+// never reported - uploading itself is unaffected either way. Safe to call
+// before or after ConfigureUpload.
+func (h *SplitRecHandler) SetSplitRecFileReporter(r SplitRecFileReporter) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.splitRecFileReporter = r
+	if h.uploader != nil {
+		h.uploader.reporter = r
+	}
 }
 
 // ConfigureAuth changes split-rec authentication without recreating the handler.
@@ -146,24 +166,24 @@ func (h *SplitRecHandler) ConfigureAuth(mode, secret string) {
 }
 
 type splitRecRequest struct {
-	Time   string `json:"time"`
-	Table  string `json:"table"`
-	GC     string `json:"gc"`
-	Game   string `json:"game"`
-	AppEnv string `json:"app_env"`
+	Time      string `json:"time"`
+	TableID   string `json:"tableId"`
+	GameRound string `json:"gameRound"`
+	GameID    string `json:"gameId"`
+	AppEnv    string `json:"appEnv"`
 }
 
-// ownerKey identifies who holds a round open (see activeGames): app_env
-// combined with game if app_env was provided, otherwise just game. Two
-// round-start calls with the same game but different app_env are treated
-// as different owners - e.g. app_env "test"+game "p2w001" and app_env
-// "prod"+game "p2w001" can each hold their own round independently, but a
+// ownerKey identifies who holds a round open (see activeGames): appEnv
+// combined with gameId if appEnv was provided, otherwise just gameId. Two
+// round-start calls with the same gameId but different appEnv are treated
+// as different owners - e.g. appEnv "test"+gameId "p2w001" and appEnv
+// "prod"+gameId "p2w001" can each hold their own round independently, but a
 // round can only ever be stopped by the same owner that started it.
 func ownerKey(req splitRecRequest) string {
 	if req.AppEnv != "" {
-		return req.AppEnv + ":" + req.Game
+		return req.AppEnv + ":" + req.GameID
 	}
-	return req.Game
+	return req.GameID
 }
 
 type splitRecResponse struct {
@@ -194,16 +214,17 @@ func (h *SplitRecHandler) ServeHTTP(c *gin.Context) {
 		return
 	}
 
-	// Validate required fields. game is mandatory in both directions: it
+	// Validate required fields. gameId is mandatory in both directions: it
 	// identifies who owns the round (see execute/activeGames).
 	auth := c.GetHeader("Authorization")
-	if req.Time == "" || req.Table == "" || req.Game == "" || auth == "" {
+	if req.Time == "" || req.TableID == "" || req.GameID == "" || auth == "" {
 		c.JSON(http.StatusBadRequest, errResp(400, "missing parameters.", ""))
 		return
 	}
-	if !validIdentifier(req.Table) || !validIdentifier(req.Game) || (req.GC != "" && !validIdentifier(req.GC)) ||
+	if !validIdentifier(req.TableID) || !validIdentifier(req.GameID) ||
+		(req.GameRound != "" && !validIdentifier(req.GameRound)) ||
 		(req.AppEnv != "" && !validIdentifier(req.AppEnv)) {
-		c.JSON(http.StatusBadRequest, errResp(400, "table/game/gc/app_env contain invalid characters.", ""))
+		c.JSON(http.StatusBadRequest, errResp(400, "tableId/gameId/gameRound/appEnv contain invalid characters.", ""))
 		return
 	}
 
@@ -266,23 +287,23 @@ func (h *SplitRecHandler) verifyToken(token, nonce string, req splitRecRequest) 
 			return false
 		}
 		canonical, _ := json.Marshal(struct {
-			Time  string `json:"time"`
-			Table string `json:"table"`
-			GC    string `json:"gc"`
-			Game  string `json:"game"`
-			Nonce string `json:"nonce"`
-		}{req.Time, req.Table, req.GC, req.Game, nonce})
+			Time      string `json:"time"`
+			TableID   string `json:"tableId"`
+			GameRound string `json:"gameRound"`
+			GameID    string `json:"gameId"`
+			Nonce     string `json:"nonce"`
+		}{req.Time, req.TableID, req.GameRound, req.GameID, nonce})
 		mac := hmac.New(sha256.New, secret)
 		mac.Write(canonical)
 		return hmac.Equal(signature, mac.Sum(nil))
 	}
 
-	base := string(secret) + req.Time + req.Table
-	if req.GC != "" {
-		base += req.GC
+	base := string(secret) + req.Time + req.TableID
+	if req.GameRound != "" {
+		base += req.GameRound
 	}
-	if req.Game != "" {
-		base += req.Game
+	if req.GameID != "" {
+		base += req.GameID
 	}
 	expected := fmt.Sprintf("%x", md5.Sum([]byte(base)))
 	return strings.EqualFold(token, expected)
@@ -311,31 +332,31 @@ func (h *SplitRecHandler) useNonce(nonce string, expiry time.Time) bool {
 }
 
 // execute implements the two-phase per-round protocol:
-//   - gc empty: round start. For every path matching req.Table (a table
-//     with multiple configured views records all of them - see
+//   - gameRound empty: round start. For every path matching req.TableID (a
+//     table with multiple configured views records all of them - see
 //     tableToPaths), cuts a fresh segment on the path's already running
 //     recording (record: yes) and locks the whole table to the caller's
-//     owner identity (see ownerKey: app_env+game if app_env was provided,
-//     otherwise just game). If a given path has nothing publishing to it
+//     owner identity (see ownerKey: appEnv+gameId if appEnv was provided,
+//     otherwise just gameId). If a given path has nothing publishing to it
 //     yet and an ingest source is configured for it, this is also what
 //     brings the ingest pull online (see resolveController) - ingest only
 //     ever runs because a round started, not from process boot. A path
 //     with no resolvable controller at all is skipped with a warning
 //     rather than failing the whole round, unless every path fails, in
 //     which case the round-start itself fails.
-//   - gc non-empty: round end. Cuts the segment that has been accumulating
-//     on every path started for this round since the paired start call,
-//     renames each to "$table-$view-$gc-$game", releases the table lock,
-//     and - if ingest was what brought a path online - stops the pull
-//     again for it.
+//   - gameRound non-empty: round end. Cuts the segment that has been
+//     accumulating on every path started for this round since the paired
+//     start call, renames each to "$tableId-$view-$gameRound-$gameId",
+//     releases the table lock, and - if ingest was what brought a path
+//     online - stops the pull again for it.
 //
 // A table can only have one owner holding it open at a time: a second
-// start is rejected, and only the same owner (app_env+game, or game alone
-// when app_env is omitted) that opened the round may close it - a
-// different app_env with the same game is a different owner and cannot
+// start is rejected, and only the same owner (appEnv+gameId, or gameId
+// alone when appEnv is omitted) that opened the round may close it - a
+// different appEnv with the same gameId is a different owner and cannot
 // stop that round.
 func (h *SplitRecHandler) execute(c *gin.Context, req splitRecRequest) error {
-	if req.GC == "" {
+	if req.GameRound == "" {
 		return h.startRound(c.Request.Context(), req)
 	}
 	return h.stopRound(req)
@@ -401,7 +422,7 @@ func (h *SplitRecHandler) lookupController(path string) (PathController, bool) {
 	return nil, false
 }
 
-// startRound opens a round for every path configured for req.Table (see
+// startRound opens a round for every path configured for req.TableID (see
 // tableToPaths). It locks the table to the caller's owner identity first
 // (see ownerKey), so a concurrent start for the same table is rejected
 // before any path is touched; if every path then fails to resolve or
@@ -412,28 +433,28 @@ func (h *SplitRecHandler) lookupController(path string) (PathController, bool) {
 func (h *SplitRecHandler) startRound(ctx context.Context, req splitRecRequest) error {
 	owner := ownerKey(req)
 	h.mu.Lock()
-	if round, active := h.activeGames[req.Table]; active {
+	if round, active := h.activeGames[req.TableID]; active {
 		h.mu.Unlock()
 		if round.owner == owner {
-			return fmt.Errorf("game %q already has an active recording on table %q", req.Game, req.Table)
+			return fmt.Errorf("game %q already has an active recording on table %q", req.GameID, req.TableID)
 		}
-		return fmt.Errorf("table %q is already being recorded by another game", req.Table)
+		return fmt.Errorf("table %q is already being recorded by another game", req.TableID)
 	}
-	h.activeGames[req.Table] = activeRound{owner: owner, game: req.Game, startedAt: now()}
+	h.activeGames[req.TableID] = activeRound{owner: owner, game: req.GameID, startedAt: now()}
 	h.mu.Unlock()
 
 	startedAt := now()
-	paths := h.tableToPaths(req.Table)
+	paths := h.tableToPaths(req.TableID)
 	recordIDs := make(map[string]string, len(paths))
 	var startedPaths []string
 	for _, path := range paths {
 		ctrl, ok := h.resolveController(ctx, path, true, waitForIngestPath, 200*time.Millisecond)
 		if !ok {
-			h.parent.Log(logger.Warn, "[split-rec] table %q: path %q not found, skipping", req.Table, path)
+			h.parent.Log(logger.Warn, "[split-rec] table %q: path %q not found, skipping", req.TableID, path)
 			continue
 		}
 		if _, err := ctrl.SplitRecording(""); err != nil {
-			h.parent.Log(logger.Warn, "[split-rec] table %q: start round on path %q failed: %v", req.Table, path, err)
+			h.parent.Log(logger.Warn, "[split-rec] table %q: start round on path %q failed: %v", req.TableID, path, err)
 			continue
 		}
 		recordID := newRecordID(path)
@@ -444,8 +465,8 @@ func (h *SplitRecHandler) startRound(ctx context.Context, req splitRecRequest) e
 			_ = h.mgr.Store().Insert(Record{
 				ID:        recordID,
 				Path:      path,
-				Table:     req.Table,
-				Game:      req.Game,
+				Table:     req.TableID,
+				Game:      req.GameID,
 				AppEnv:    req.AppEnv,
 				Format:    "fmp4",
 				Status:    "running",
@@ -456,15 +477,15 @@ func (h *SplitRecHandler) startRound(ctx context.Context, req splitRecRequest) e
 
 	if len(startedPaths) == 0 {
 		h.mu.Lock()
-		delete(h.activeGames, req.Table)
+		delete(h.activeGames, req.TableID)
 		h.mu.Unlock()
-		return fmt.Errorf("start round: no path found for table %q", req.Table)
+		return fmt.Errorf("start round: no path found for table %q", req.TableID)
 	}
 
 	h.mu.Lock()
-	h.activeGames[req.Table] = activeRound{
+	h.activeGames[req.TableID] = activeRound{
 		owner:     owner,
-		game:      req.Game,
+		game:      req.GameID,
 		startedAt: startedAt,
 		paths:     startedPaths,
 		recordIDs: recordIDs,
@@ -488,18 +509,19 @@ func (h *SplitRecHandler) startRound(ctx context.Context, req splitRecRequest) e
 // actually preceded it.
 func (h *SplitRecHandler) stopRound(req splitRecRequest) error {
 	h.mu.Lock()
-	round, active := h.activeGames[req.Table]
+	round, active := h.activeGames[req.TableID]
 	if !active {
 		h.mu.Unlock()
-		h.parent.Log(logger.Warn, "[split-rec] table %q: stop round dropped, no active recording (game=%q gc=%q)",
-			req.Table, req.Game, req.GC)
+		h.parent.Log(logger.Warn,
+			"[split-rec] table %q: stop round dropped, no active recording (gameId=%q gameRound=%q)",
+			req.TableID, req.GameID, req.GameRound)
 		return nil
 	}
 	if round.owner != ownerKey(req) {
 		h.mu.Unlock()
-		return fmt.Errorf("recording on table %q was started by a different game", req.Table)
+		return fmt.Errorf("recording on table %q was started by a different game", req.TableID)
 	}
-	delete(h.activeGames, req.Table)
+	delete(h.activeGames, req.TableID)
 	h.mu.Unlock()
 
 	h.mu.Lock()
@@ -512,15 +534,15 @@ func (h *SplitRecHandler) stopRound(req splitRecRequest) error {
 		ctrl, ok := h.lookupController(path)
 		if !ok {
 			stopErrs = append(stopErrs, fmt.Sprintf("path %q not found", path))
-			h.parent.Log(logger.Warn, "[split-rec] table %q: stop round on path %q failed: not found", req.Table, path)
+			h.parent.Log(logger.Warn, "[split-rec] table %q: stop round on path %q failed: not found", req.TableID, path)
 			continue
 		}
 
-		finalName := req.Table + "-" + viewFromPath(req.Table, path) + "-" + req.GC + "-" + req.Game
+		finalName := req.TableID + "-" + viewFromPath(req.TableID, path) + "-" + req.GameRound + "-" + req.GameID
 		finalPath, err := ctrl.SplitRecording(finalName)
 		if err != nil {
 			stopErrs = append(stopErrs, fmt.Sprintf("path %q: %v", path, err))
-			h.parent.Log(logger.Warn, "[split-rec] table %q: stop round on path %q failed: %v", req.Table, path, err)
+			h.parent.Log(logger.Warn, "[split-rec] table %q: stop round on path %q failed: %v", req.TableID, path, err)
 			// Symmetric with the on-demand start: stopping the round is
 			// what ends an ingest-sourced pull, whether or not the split
 			// itself succeeded.
@@ -530,18 +552,28 @@ func (h *SplitRecHandler) stopRound(req splitRecRequest) error {
 			continue
 		}
 
+		var fileSize int64
+		if statInfo, statErr := os.Stat(finalPath); statErr == nil {
+			fileSize = statInfo.Size()
+		}
+		duration := int64(time.Since(round.startedAt).Seconds())
+
 		if h.mgr != nil {
-			var fileSize int64
-			if info, statErr := os.Stat(finalPath); statErr == nil {
-				fileSize = info.Size()
-			}
-			duration := int64(time.Since(round.startedAt).Seconds())
 			if recordID, ok := round.recordIDs[path]; ok {
-				_ = h.mgr.Store().CompleteRound(recordID, req.GC, finalPath, fileSize, duration)
+				_ = h.mgr.Store().CompleteRound(recordID, req.GameRound, finalPath, fileSize, duration)
 			}
 		}
 
-		up.uploadAsync(finalPath, objectKeyFor(finalPath), req.AppEnv)
+		up.uploadAsync(finalPath, objectKeyFor(finalPath), req.AppEnv, SplitRecFileInfo{
+			TableID:         req.TableID,
+			GameID:          req.GameID,
+			GameRound:       req.GameRound,
+			AppEnv:          req.AppEnv,
+			StreamPath:      path,
+			FileName:        filepath.Base(finalPath),
+			DurationSeconds: duration,
+			SizeBytes:       fileSize,
+		})
 
 		if ingestMgr != nil {
 			ingestMgr.StopByPath(path)

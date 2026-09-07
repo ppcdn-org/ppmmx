@@ -37,11 +37,11 @@ type Record struct {
 	Table     string    `json:"table"`
 	GC        string    `json:"gc"`
 	Game      string    `json:"game"`
-	// AppEnv is the split-rec request's optional "app_env" field (see
+	// AppEnv is the split-rec request's optional "appEnv" field (see
 	// ownerKey in split.go), persisted here purely for audit/traceability -
 	// a deployment serving multiple game environments from one process can
 	// tell which environment produced a given row. Empty for callers that
-	// don't send app_env.
+	// don't send appEnv. The column itself stays "app_env" (see migrate).
 	AppEnv    string    `json:"appEnv,omitempty"`
 	Format    string    `json:"format"`
 	Status    string    `json:"status"` // running | completed | error
@@ -181,9 +181,9 @@ func (s *Store) Update(id string, status string, fileSize int64, duration int64)
 	return err
 }
 
-// CompleteRound finalizes a split-rec round: fills in the gc that was only
-// known at stop time, the final (renamed) file path, its size, and marks
-// the record completed.
+// CompleteRound finalizes a split-rec round: fills in the gameRound (the
+// "gc" column) that was only known at stop time, the final (renamed) file
+// path, its size, and marks the record completed.
 func (s *Store) CompleteRound(id, gc, filePath string, fileSize, duration int64) error {
 	_, err := s.db.Exec(`
 		UPDATE recordings SET status='completed', stopped_at=?, gc=?, file_path=?, file_size=?, duration=?
