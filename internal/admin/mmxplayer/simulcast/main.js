@@ -657,11 +657,11 @@ async function updateStats() {
         }
 
         if (audioStats) {
-            // [新增] 获取 Audio Codec 名称
-            let aCodec = 'N/A';
-            if (audioStats.codecId && codecs.has(audioStats.codecId)) {
-                aCodec = codecs.get(audioStats.codecId).split('/')[1] || 'Unknown';
-            }
+            // Audio is always Opus in this deployment (WebRTC-only, RTMP is
+            // disabled) - getStats()'s codecId/codec-report correlation is
+            // unreliable across browsers, so just show the known value
+            // instead of an intermittent 'N/A'.
+            const aCodec = 'opus';
 
             html += renderStatGroup('Audio', {
                 'Codec': aCodec, // [显示]
