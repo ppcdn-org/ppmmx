@@ -178,8 +178,35 @@ func (f *formatFMP4) initialize() bool {
 
 	outDesc := f.ri.stream.OutDescCopy()
 
+	// Every track added below shares one formatFMP4Segment/currentSegment
+	// (see formatFMP4Track.write), whose base timestamp is set from
+	// whichever track's first sample happens to arrive first. That's fine
+	// when there's at most one H264 layer, but a Simulcast publish exposes
+	// several independent H264 layers as separate video medias here, each
+	// with its own encoder warm-up and its own DTSExtractor starting from
+	// its own first IDR - their DTS bases routinely disagree by more than
+	// nextSegmentStartingPos's 1s maxBasetime tolerance, so every layer
+	// but whichever "wins" the shared segment gets permanently rejected as
+	// "received too late, discarding" (internal/recorder/format_fmp4_track.go),
+	// not just at startup but on every subsequent sample. Reconciling
+	// per-layer timestamps isn't implemented, so only the first H264 media
+	// is recorded - by construction (ToStream orders video medias by RID,
+	// see internal/protocols/webrtc/from_stream.go) that's the
+	// highest-resolution layer (RID "0"). This only dedupes repeated H264
+	// layers: a stream legitimately offering one video track per codec
+	// (e.g. H264 + H265 renditions of the same content, as opposed to
+	// several same-codec Simulcast layers) still gets a track for each.
+	h264VideoTrackAdded := false
+
 	for i, origMedia := range f.ri.stream.OrigDesc.Medias {
 		for j, origFormat := range origMedia.Formats {
+			if _, ok := origFormat.(*rtspformat.H264); ok {
+				if h264VideoTrackAdded {
+					continue
+				}
+				h264VideoTrackAdded = true
+			}
+
 			clockRate := origFormat.ClockRate()
 
 			switch origFormat := origFormat.(type) {

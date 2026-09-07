@@ -79,8 +79,25 @@ func (f *formatMPEGTS) initialize() bool {
 		return track
 	}
 
+	// See the identical guard in format_fmp4.go's initialize(): a Simulcast
+	// publish exposes several independent H264 layers as separate media
+	// here, and recording is only meant to keep the highest-resolution one
+	// (ToStream orders video medias by RID, see
+	// internal/protocols/webrtc/from_stream.go, so the first one is RID
+	// "0"). Only repeated H264 layers are deduped - one track per codec is
+	// still added for a stream that legitimately offers several (e.g. an
+	// H264 + H265 rendition pair).
+	h264VideoTrackAdded := false
+
 	for _, media := range f.ri.stream.OrigDesc.Medias {
 		for _, forma := range media.Formats {
+			if _, ok := forma.(*rtspformat.H264); ok {
+				if h264VideoTrackAdded {
+					continue
+				}
+				h264VideoTrackAdded = true
+			}
+
 			clockRate := forma.ClockRate()
 
 			switch forma := forma.(type) {
