@@ -18,6 +18,7 @@ import (
 	"github.com/bluenviron/gortsplib/v5/pkg/format/rtpvp9"
 	"github.com/bluenviron/mediacommon/v2/pkg/codecs/g711"
 	mch264 "github.com/bluenviron/mediacommon/v2/pkg/codecs/h264"
+	mch265 "github.com/bluenviron/mediacommon/v2/pkg/codecs/h265"
 	"github.com/bluenviron/mediacommon/v2/pkg/codecs/opus"
 	"github.com/bluenviron/mediamtx/internal/formatlabel"
 	"github.com/bluenviron/mediamtx/internal/logger"
@@ -61,6 +62,14 @@ const (
 	// currently produces (verified up to Level 4 for a 1080x1920 layer)
 	// with headroom for higher resolutions.
 	h264OutboundFmtpLine = "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=640033"
+
+	// h265OutboundFmtpLine is H265's equivalent of h264OutboundFmtpLine
+	// above - Main profile, level 93 (3.1), single NAL unit per RTP packet
+	// (tx-mode=SRST). Used by setupVideoTrack (the single-media path) and,
+	// for the HEVC/H264 multitrack feature, by SetupFromStreamABR/
+	// SetupFromStreamMultiH264's H265 branches too, so all three declare
+	// the exact same profile.
+	h265OutboundFmtpLine = "level-id=93;profile-id=1;tier-flag=0;tx-mode=SRST"
 )
 
 var multichannelOpusSDP = map[int]string{
@@ -286,7 +295,7 @@ func setupVideoTrack(
 			Caps: webrtc.RTPCodecCapability{
 				MimeType:    webrtc.MimeTypeH265,
 				ClockRate:   90000,
-				SDPFmtpLine: "level-id=93;profile-id=1;tier-flag=0;tx-mode=SRST",
+				SDPFmtpLine: h265OutboundFmtpLine,
 			},
 		}
 
@@ -836,15 +845,24 @@ func SetupFromStreamABR(
 	}
 
 	hasH264 := false
+	hasH265 := false
 	for _, m := range videoMedias {
 		for _, forma := range m.Formats {
-			if _, ok := forma.(*format.H264); ok {
+			switch forma.(type) {
+			case *format.H264:
 				hasH264 = true
+			case *format.H265:
+				hasH265 = true
 			}
 		}
 	}
 
 	// ── Video: one outbound track, all H264 medias → TrackSelector ──
+	// hasH264 takes priority over hasH265 below (matching this function's
+	// prior H264-only behavior for the case where both are somehow
+	// present, e.g. a mixed-codec RTMP multitrack source unrelated to the
+	// HEVC/H264 WHIP feature) - ABR builds one ladder from a single video
+	// codec, never a mix of two.
 	if hasH264 {
 		track := &OutboundTrack{
 			Caps: webrtc.RTPCodecCapability{
@@ -989,6 +1007,135 @@ func SetupFromStreamABR(
 		}
 
 		pc.OutboundTracks = append(pc.OutboundTracks, track)
+	} else if hasH265 { //nolint:dupl
+		// ── Video: one outbound track, all H265 medias → TrackSelector ──
+		// Mirrors the hasH264 branch above; see its comments for the
+		// continuity/dimension-resolution rationale, which applies
+		// identically here. Kept as a separate near-duplicate block
+		// (matching setupVideoTrack's own per-codec //nolint:dupl blocks
+		// above) rather than a generic abstraction, since H264 and H265
+		// differ enough in their NALU/SPS APIs (mch264 vs mch265) and
+		// encoder options (H264's PacketizationMode has no H265
+		// equivalent) that a shared path would need its own type
+		// switches anyway.
+		track := &OutboundTrack{
+			Caps: webrtc.RTPCodecCapability{
+				MimeType:    webrtc.MimeTypeH265,
+				ClockRate:   90000,
+				SDPFmtpLine: h265OutboundFmtpLine,
+			},
+		}
+
+		// single shared encoder → continuous sequence numbers across switches
+		encoder := &rtph265.Encoder{
+			PayloadType:    96,
+			PayloadMaxSize: webrtcPayloadMaxSize,
+		}
+		err := encoder.Init()
+		if err != nil {
+			return err
+		}
+
+		tsBase, err := randUint32()
+		if err != nil {
+			return err
+		}
+		outputClock := abrOutputClock{baseTS: tsBase}
+
+		for trackID, m := range videoMedias {
+			var h265Format *format.H265
+			for _, forma := range m.Formats {
+				if h, ok := forma.(*format.H265); ok {
+					h265Format = h
+					break
+				}
+			}
+			if h265Format == nil {
+				// ABR only supports a single-codec ladder: a mixed-codec
+				// publisher would otherwise silently lose this layer with
+				// no track info and no explanation.
+				r.Parent.Log(logger.Warn,
+					"ABR: video media %d is not H265, skipping (ABR requires all video layers to use the same H265 codec)",
+					trackID)
+				continue
+			}
+
+			firstReceived := false
+			var lastPTS int64
+			dimsResolved := false
+			var ntpLogCount int
+
+			// See the hasH264 branch's identical filter above for why this
+			// must run for every layer regardless of selection state.
+			r.OnDataFiltered(m, h265Format, func(u *unit.Unit) bool {
+				if !u.NilPayload() && !dimsResolved {
+					au, ok := u.Payload.(unit.PayloadH265)
+					if ok {
+						for _, nalu := range au {
+							if len(nalu) != 0 && mch265.NALUType((nalu[0]>>1)&0b111111) == mch265.NALUType_SPS_NUT {
+								var sps mch265.SPS
+								if err := sps.Unmarshal(nalu); err == nil {
+									selector.SetTrackDimensions(trackID, sps.Width(), sps.Height())
+									dimsResolved = true
+								}
+								break
+							}
+						}
+					}
+				}
+
+				return !u.NilPayload() && selector.ShouldQueue(trackID)
+			}, func(u *unit.Unit) error {
+				if u.NilPayload() {
+					return nil
+				}
+
+				if !firstReceived {
+					firstReceived = true
+				} else if u.PTS < lastPTS {
+					return fmt.Errorf("WebRTC doesn't support H265 streams with B-frames")
+				}
+				lastPTS = u.PTS
+
+				// This is the offset between the source PTS clock and wall time, not
+				// playback latency. WHEP output uses the monotonic abrOutputClock below.
+				ntpLogCount++
+				if ntpLogCount%300 == 0 {
+					r.Parent.Log(logger.Info, "ABR track %d: PTS=%d sourceNTP=%s (media PTS-wall offset=%s)",
+						trackID, u.PTS,
+						u.NTP.Format("15:04:05.000"),
+						time.Since(u.NTP).Round(time.Millisecond))
+				}
+
+				au := u.Payload.(unit.PayloadH265)
+
+				shouldForward, _ := selector.OnAccessUnit(trackID, mch265.IsRandomAccess(au))
+				if !shouldForward {
+					return nil
+				}
+
+				packets, err2 := encoder.Encode(au)
+				if err2 != nil {
+					return nil //nolint:nilerr
+				}
+
+				// OBS Simulcast can emit frames slower than the cadence declared by
+				// its source RTP timestamps. Derive the WHEP clock from real arrival
+				// time so browsers play immediately instead of growing their jitter
+				// buffer. This also keeps switches on one continuous timeline.
+				now := time.Now()
+				outTS := outputClock.next(now)
+
+				for _, pkt := range packets {
+					pkt.Timestamp = outTS
+					track.WriteRTPWithNTP(pkt, now) //nolint:errcheck
+				}
+
+				return nil
+			})
+		}
+
+		pc.OutboundTracks = append(pc.OutboundTracks, track)
 	}
 
 	// ── Audio: normal setup ─────────────────────────────────────
@@ -1030,7 +1177,11 @@ func SetupFromStreamABR(
 	return nil
 }
 
-// SetupFromStreamMultiH264 maps H264 video medias to independent WebRTC tracks.
+// SetupFromStreamMultiH264 maps a stream's video medias to independent WebRTC
+// tracks, one m-line per layer. Despite the name (kept for compatibility
+// with existing callers/tests), it now handles either H264 or H265 medias -
+// see the HEVC/H264 multitrack feature - never a mix of the two on the same
+// call, matching every other codec-dispatch point in this file.
 func SetupFromStreamMultiH264(
 	desc *description.Session,
 	r *stream.Reader,
@@ -1041,19 +1192,26 @@ func SetupFromStreamMultiH264(
 		media  *description.Media
 		format *format.H264
 	}
+	type h265Media struct {
+		media  *description.Media
+		format *format.H265
+	}
 
-	videoMedias := make([]h264Media, 0, videoTrackCount)
+	var h264Medias []h264Media
+	var h265Medias []h265Media
 	for _, media := range desc.Medias {
 		if media.Type != description.MediaTypeVideo {
 			continue
 		}
 		for _, forma := range media.Formats {
-			if h264Format, ok := forma.(*format.H264); ok {
-				videoMedias = append(videoMedias, h264Media{media, h264Format})
-				break
+			switch f := forma.(type) {
+			case *format.H264:
+				h264Medias = append(h264Medias, h264Media{media, f})
+			case *format.H265:
+				h265Medias = append(h265Medias, h265Media{media, f})
 			}
 		}
-		if len(videoMedias) == videoTrackCount {
+		if len(h264Medias)+len(h265Medias) >= videoTrackCount {
 			break
 		}
 	}
@@ -1062,61 +1220,111 @@ func SetupFromStreamMultiH264(
 	// offer speculatively (e.g. AutoVideoTracks, which always offers
 	// webrtc.MaxAutoVideoTracks recvonly video m-lines without knowing the
 	// source's real layer count) may ask for more than the stream has.
-	// Rather than failing the whole negotiation, serve however many H264
+	// Rather than failing the whole negotiation, serve however many
 	// layers actually exist - the surplus offered m-lines are answered as
 	// inactive by pion (standard JSEP), and the client already reads its
 	// real track count back from the answer SDP instead of assuming it
 	// got everything it asked for (see whip.Client.initializeInner).
-	if len(videoMedias) == 0 {
-		return fmt.Errorf("stream doesn't contain any H264 video layer")
-	}
+	switch {
+	case len(h264Medias) > 0:
+		for i, videoMedia := range h264Medias {
+			track := &OutboundTrack{
+				Caps: webrtc.RTPCodecCapability{
+					MimeType:    webrtc.MimeTypeH264,
+					ClockRate:   90000,
+					SDPFmtpLine: h264OutboundFmtpLine,
+				},
+				TrackID: fmt.Sprintf("video-%d", i),
+			}
 
-	for i, videoMedia := range videoMedias {
-		track := &OutboundTrack{
-			Caps: webrtc.RTPCodecCapability{
-				MimeType:    webrtc.MimeTypeH264,
-				ClockRate:   90000,
-				SDPFmtpLine: h264OutboundFmtpLine,
-			},
-			TrackID: fmt.Sprintf("video-%d", i),
-		}
+			encoder := &rtph264.Encoder{
+				PayloadType:       96,
+				PayloadMaxSize:    webrtcPayloadMaxSize,
+				PacketizationMode: 1,
+			}
+			err := encoder.Init()
+			if err != nil {
+				return err
+			}
 
-		encoder := &rtph264.Encoder{
-			PayloadType:       96,
-			PayloadMaxSize:    webrtcPayloadMaxSize,
-			PacketizationMode: 1,
-		}
-		err := encoder.Init()
-		if err != nil {
-			return err
-		}
+			firstReceived := false
+			var lastPTS int64
+			r.OnData(videoMedia.media, videoMedia.format, func(u *unit.Unit) error {
+				if u.NilPayload() {
+					return nil
+				}
+				if !firstReceived {
+					firstReceived = true
+				} else if u.PTS < lastPTS {
+					return fmt.Errorf("WebRTC doesn't support H264 streams with B-frames")
+				}
+				lastPTS = u.PTS
 
-		firstReceived := false
-		var lastPTS int64
-		r.OnData(videoMedia.media, videoMedia.format, func(u *unit.Unit) error {
-			if u.NilPayload() {
+				packets, err2 := encoder.Encode(u.Payload.(unit.PayloadH264))
+				if err2 != nil {
+					return nil //nolint:nilerr
+				}
+				for _, pkt := range packets {
+					ntp := u.NTP.Add(timestampToDuration(int64(pkt.Timestamp), 90000))
+					pkt.Timestamp += u.RTPPackets[0].Timestamp
+					track.WriteRTPWithNTP(pkt, ntp) //nolint:errcheck
+				}
 				return nil
-			}
-			if !firstReceived {
-				firstReceived = true
-			} else if u.PTS < lastPTS {
-				return fmt.Errorf("WebRTC doesn't support H264 streams with B-frames")
-			}
-			lastPTS = u.PTS
+			})
 
-			packets, err2 := encoder.Encode(u.Payload.(unit.PayloadH264))
-			if err2 != nil {
-				return nil //nolint:nilerr
-			}
-			for _, pkt := range packets {
-				ntp := u.NTP.Add(timestampToDuration(int64(pkt.Timestamp), 90000))
-				pkt.Timestamp += u.RTPPackets[0].Timestamp
-				track.WriteRTPWithNTP(pkt, ntp) //nolint:errcheck
-			}
-			return nil
-		})
+			pc.OutboundTracks = append(pc.OutboundTracks, track)
+		}
 
-		pc.OutboundTracks = append(pc.OutboundTracks, track)
+	case len(h265Medias) > 0: //nolint:dupl
+		for i, videoMedia := range h265Medias {
+			track := &OutboundTrack{
+				Caps: webrtc.RTPCodecCapability{
+					MimeType:    webrtc.MimeTypeH265,
+					ClockRate:   90000,
+					SDPFmtpLine: h265OutboundFmtpLine,
+				},
+				TrackID: fmt.Sprintf("video-%d", i),
+			}
+
+			encoder := &rtph265.Encoder{
+				PayloadType:    96,
+				PayloadMaxSize: webrtcPayloadMaxSize,
+			}
+			err := encoder.Init()
+			if err != nil {
+				return err
+			}
+
+			firstReceived := false
+			var lastPTS int64
+			r.OnData(videoMedia.media, videoMedia.format, func(u *unit.Unit) error {
+				if u.NilPayload() {
+					return nil
+				}
+				if !firstReceived {
+					firstReceived = true
+				} else if u.PTS < lastPTS {
+					return fmt.Errorf("WebRTC doesn't support H265 streams with B-frames")
+				}
+				lastPTS = u.PTS
+
+				packets, err2 := encoder.Encode(u.Payload.(unit.PayloadH265))
+				if err2 != nil {
+					return nil //nolint:nilerr
+				}
+				for _, pkt := range packets {
+					ntp := u.NTP.Add(timestampToDuration(int64(pkt.Timestamp), 90000))
+					pkt.Timestamp += u.RTPPackets[0].Timestamp
+					track.WriteRTPWithNTP(pkt, ntp) //nolint:errcheck
+				}
+				return nil
+			})
+
+			pc.OutboundTracks = append(pc.OutboundTracks, track)
+		}
+
+	default:
+		return fmt.Errorf("stream doesn't contain any H264 or H265 video layer")
 	}
 
 	audioTrack, err := setupAudioTrack(desc, r, nil)
@@ -1144,14 +1352,15 @@ func SetupFromStreamMultiH264(
 // OutboundTrack's type doc.
 const mmxForwardSimulcastTrackID = "video"
 
-// SetupFromStreamSimulcast maps every H264 video media of desc to one RID
-// encoding ("0", "1", ... highest quality first, matching the RID order
-// OBS's own WHIP Simulcast offer uses and to_stream.go's inbound sort) of a
-// single shared video track/m-line, instead of FromStream's "first H264
-// media only" or SetupFromStreamMultiH264's "one m-line per layer". This is
-// what lets mmx forward its own multi-layer stream to another mmx node's
-// WHIP publish endpoint, which - like mmx's own WHIP publish endpoint -
-// only ever accepts a single video m-line (see TracksAreValid and
+// SetupFromStreamSimulcast maps every video media of desc sharing one codec
+// (H264 or H265 - see the HEVC/H264 multitrack feature) to one RID encoding
+// ("0", "1", ... highest quality first, matching the RID order OBS's own
+// WHIP Simulcast offer uses and to_stream.go's inbound sort) of a single
+// shared video track/m-line, instead of FromStream's "first media only" or
+// SetupFromStreamMultiH264's "one m-line per layer". This is what lets mmx
+// forward its own multi-layer stream to another mmx node's WHIP publish
+// endpoint, which - like mmx's own WHIP publish endpoint - only ever
+// accepts a single video m-line per codec path (see TracksAreValid and
 // offerVideoSimulcastLayerCount in internal/servers/webrtc/session.go).
 // Audio and data channels are set up normally.
 func SetupFromStreamSimulcast(
@@ -1163,71 +1372,129 @@ func SetupFromStreamSimulcast(
 		media  *description.Media
 		format *format.H264
 	}
+	type h265Media struct {
+		media  *description.Media
+		format *format.H265
+	}
 
-	var videoMedias []h264Media
+	var h264Medias []h264Media
+	var h265Medias []h265Media
 	for _, media := range desc.Medias {
 		if media.Type != description.MediaTypeVideo {
 			continue
 		}
 		for _, forma := range media.Formats {
-			if h264Format, ok := forma.(*format.H264); ok {
-				videoMedias = append(videoMedias, h264Media{media, h264Format})
-				break
+			switch f := forma.(type) {
+			case *format.H264:
+				h264Medias = append(h264Medias, h264Media{media, f})
+			case *format.H265:
+				h265Medias = append(h265Medias, h265Media{media, f})
 			}
 		}
 	}
 
-	if len(videoMedias) == 0 {
-		return errNoSupportedCodecsFrom
-	}
+	switch {
+	case len(h264Medias) > 0:
+		for i, videoMedia := range h264Medias {
+			track := &OutboundTrack{
+				Caps: webrtc.RTPCodecCapability{
+					MimeType:    webrtc.MimeTypeH264,
+					ClockRate:   90000,
+					SDPFmtpLine: h264OutboundFmtpLine,
+				},
+				TrackID: mmxForwardSimulcastTrackID,
+				RID:     strconv.Itoa(i),
+			}
 
-	for i, videoMedia := range videoMedias {
-		track := &OutboundTrack{
-			Caps: webrtc.RTPCodecCapability{
-				MimeType:    webrtc.MimeTypeH264,
-				ClockRate:   90000,
-				SDPFmtpLine: h264OutboundFmtpLine,
-			},
-			TrackID: mmxForwardSimulcastTrackID,
-			RID:     strconv.Itoa(i),
-		}
+			encoder := &rtph264.Encoder{
+				PayloadType:       96,
+				PayloadMaxSize:    webrtcPayloadMaxSize,
+				PacketizationMode: 1,
+			}
+			err := encoder.Init()
+			if err != nil {
+				return err
+			}
 
-		encoder := &rtph264.Encoder{
-			PayloadType:       96,
-			PayloadMaxSize:    webrtcPayloadMaxSize,
-			PacketizationMode: 1,
-		}
-		err := encoder.Init()
-		if err != nil {
-			return err
-		}
+			firstReceived := false
+			var lastPTS int64
+			r.OnData(videoMedia.media, videoMedia.format, func(u *unit.Unit) error {
+				if u.NilPayload() {
+					return nil
+				}
+				if !firstReceived {
+					firstReceived = true
+				} else if u.PTS < lastPTS {
+					return fmt.Errorf("WebRTC doesn't support H264 streams with B-frames")
+				}
+				lastPTS = u.PTS
 
-		firstReceived := false
-		var lastPTS int64
-		r.OnData(videoMedia.media, videoMedia.format, func(u *unit.Unit) error {
-			if u.NilPayload() {
+				packets, err2 := encoder.Encode(u.Payload.(unit.PayloadH264))
+				if err2 != nil {
+					return nil //nolint:nilerr
+				}
+				for _, pkt := range packets {
+					ntp := u.NTP.Add(timestampToDuration(int64(pkt.Timestamp), 90000))
+					pkt.Timestamp += u.RTPPackets[0].Timestamp
+					track.WriteRTPWithNTP(pkt, ntp) //nolint:errcheck
+				}
 				return nil
-			}
-			if !firstReceived {
-				firstReceived = true
-			} else if u.PTS < lastPTS {
-				return fmt.Errorf("WebRTC doesn't support H264 streams with B-frames")
-			}
-			lastPTS = u.PTS
+			})
 
-			packets, err2 := encoder.Encode(u.Payload.(unit.PayloadH264))
-			if err2 != nil {
-				return nil //nolint:nilerr
-			}
-			for _, pkt := range packets {
-				ntp := u.NTP.Add(timestampToDuration(int64(pkt.Timestamp), 90000))
-				pkt.Timestamp += u.RTPPackets[0].Timestamp
-				track.WriteRTPWithNTP(pkt, ntp) //nolint:errcheck
-			}
-			return nil
-		})
+			pc.OutboundTracks = append(pc.OutboundTracks, track)
+		}
 
-		pc.OutboundTracks = append(pc.OutboundTracks, track)
+	case len(h265Medias) > 0: //nolint:dupl
+		for i, videoMedia := range h265Medias {
+			track := &OutboundTrack{
+				Caps: webrtc.RTPCodecCapability{
+					MimeType:    webrtc.MimeTypeH265,
+					ClockRate:   90000,
+					SDPFmtpLine: h265OutboundFmtpLine,
+				},
+				TrackID: mmxForwardSimulcastTrackID,
+				RID:     strconv.Itoa(i),
+			}
+
+			encoder := &rtph265.Encoder{
+				PayloadType:    96,
+				PayloadMaxSize: webrtcPayloadMaxSize,
+			}
+			err := encoder.Init()
+			if err != nil {
+				return err
+			}
+
+			firstReceived := false
+			var lastPTS int64
+			r.OnData(videoMedia.media, videoMedia.format, func(u *unit.Unit) error {
+				if u.NilPayload() {
+					return nil
+				}
+				if !firstReceived {
+					firstReceived = true
+				} else if u.PTS < lastPTS {
+					return fmt.Errorf("WebRTC doesn't support H265 streams with B-frames")
+				}
+				lastPTS = u.PTS
+
+				packets, err2 := encoder.Encode(u.Payload.(unit.PayloadH265))
+				if err2 != nil {
+					return nil //nolint:nilerr
+				}
+				for _, pkt := range packets {
+					ntp := u.NTP.Add(timestampToDuration(int64(pkt.Timestamp), 90000))
+					pkt.Timestamp += u.RTPPackets[0].Timestamp
+					track.WriteRTPWithNTP(pkt, ntp) //nolint:errcheck
+				}
+				return nil
+			})
+
+			pc.OutboundTracks = append(pc.OutboundTracks, track)
+		}
+
+	default:
+		return errNoSupportedCodecsFrom
 	}
 
 	audioTrack, err := setupAudioTrack(desc, r, nil)

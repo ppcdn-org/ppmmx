@@ -216,19 +216,24 @@ func (s *Store) SiteStreamConfigs() ([]SiteStreamConfig, error) {
 	return configs, rows.Err()
 }
 
-// IsStreamAllowed reports whether pathName (e.g. "live/table-view") matches
-// one of the configured stream_name-view_name combinations, i.e. whether a
-// publisher should be allowed to start streaming to it. Only paths under
-// "live/" are whitelist-checked, since site_stream_configs only ever
-// generates "live/<stream>-<view>" names; paths outside "live/" (custom
-// path configs, tests, other deployments, ...) are never restricted by
-// this table and are reported as always allowed.
+// IsStreamAllowed reports whether pathName (e.g. "live/table-view", or
+// "live/table-view/h264"/"live/table-view/hevc" for the HEVC/H264
+// multitrack feature) matches one of the configured stream_name-view_name
+// combinations, i.e. whether a publisher should be allowed to start
+// streaming to it. Only paths under "live/" are whitelist-checked, since
+// site_stream_configs only ever generates "live/<stream>-<view>" names;
+// paths outside "live/" (custom path configs, tests, other deployments,
+// ...) are never restricted by this table and are reported as always
+// allowed. A trailing "/h264" or "/hevc" codec segment is stripped before
+// the comparison below, so one whitelist entry authorizes both codec paths
+// of a multitrack stream without needing separate rows per codec.
 func (s *Store) IsStreamAllowed(pathName string) (bool, error) {
 	const prefix = "live/"
 	if !strings.HasPrefix(pathName, prefix) {
 		return true, nil
 	}
 	suffix := pathName[len(prefix):]
+	suffix = strings.TrimSuffix(strings.TrimSuffix(suffix, "/h264"), "/hevc")
 
 	s.mu.RLock()
 	defer s.mu.RUnlock()
