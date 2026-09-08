@@ -50,6 +50,19 @@ type TableViewResolver interface {
 // mediamtx accepting the RTMP publish) before giving up.
 const waitForIngestPath = 10 * time.Second
 
+// split-rec's `time` field is the signing instant (docs/design/
+// ppcdn-external-api.md §5.2/§5.6: callers compute it as T=$(date +%s) at
+// request time), not an expiry deadline - a request is accepted only while
+// `time` is within one of these windows of the server's clock, in either
+// direction. Simple mode's window is intentionally tight since a captured
+// request can be replayed verbatim any time inside it; advance mode's is
+// wider (matching §5.3's "time 不能超过当前时间 5 分钟以后") because its
+// nonce (see useNonce) is what actually prevents replay, not the window.
+const (
+	simpleModeTimeTolerance  = 30 * time.Second
+	advanceModeTimeTolerance = 5 * time.Minute
+)
+
 // SplitRecHandler handles POST /api/split-rec requests.
 type SplitRecHandler struct {
 	mgr                  *Manager
@@ -234,18 +247,28 @@ func (h *SplitRecHandler) ServeHTTP(c *gin.Context) {
 		return
 	}
 
-	// Check expiry
-	expiry, err := parseUnixTime(req.Time)
-	if err != nil || time.Now().After(expiry) {
+	// Check freshness: req.Time is the signing instant, accepted within a
+	// tolerance window of the server's clock (see the doc comment on
+	// simpleModeTimeTolerance/advanceModeTimeTolerance).
+	signingInstant, err := parseUnixTime(req.Time)
+	if err != nil {
 		c.JSON(http.StatusUnauthorized, errResp(401, "token expired!", ""))
 		return
 	}
-	if h.authModeValue() == "advance" {
-		if expiry.After(time.Now().Add(5 * time.Minute)) {
-			c.JSON(http.StatusUnauthorized, errResp(401, "token expiry exceeds 5 minutes!", ""))
-			return
-		}
-		if !h.useNonce(c.GetHeader("X-Split-Rec-Nonce"), expiry) {
+	tolerance := simpleModeTimeTolerance
+	isAdvance := h.authModeValue() == "advance"
+	if isAdvance {
+		tolerance = advanceModeTimeTolerance
+	}
+	if drift := time.Since(signingInstant); drift > tolerance || drift < -tolerance {
+		c.JSON(http.StatusUnauthorized, errResp(401, "token expired!", ""))
+		return
+	}
+	if isAdvance {
+		// A nonce only needs to be remembered until it would fail the
+		// freshness check on its own anyway - retaining it past that point
+		// just grows h.nonces for no benefit.
+		if !h.useNonce(c.GetHeader("X-Split-Rec-Nonce"), signingInstant.Add(advanceModeTimeTolerance)) {
 			c.JSON(http.StatusUnauthorized, errResp(401, "nonce already used!", ""))
 			return
 		}
