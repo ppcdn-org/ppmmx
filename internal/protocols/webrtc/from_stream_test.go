@@ -13,6 +13,7 @@ import (
 	"github.com/bluenviron/mediamtx/internal/unit"
 	"github.com/pion/rtp"
 	"github.com/pion/sdp/v3"
+	"github.com/pion/webrtc/v4"
 	"github.com/stretchr/testify/require"
 )
 
@@ -119,6 +120,35 @@ var realSPS352x288 = []byte{
 // defeating this test. Its content is never parsed, only its NALU type.
 var minimalPPS = []byte{0x68, 0x88, 0x84}
 
+// realSPS1920x1080H265 is mediacommon's own h265.SPS test fixture for a
+// 1920x1080 picture (see mediacommon/pkg/codecs/h265/sps_test.go's
+// casesSPS) - reused here as a real, already-verified SPS NALU rather than
+// hand-rolling one, since a plausible-but-wrong H265 SPS bitstream is easy
+// to get subtly wrong.
+var realSPS1920x1080H265 = []byte{
+	0x42, 0x01, 0x01, 0x01, 0x60, 0x00, 0x00, 0x03,
+	0x00, 0x90, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03,
+	0x00, 0x78, 0xa0, 0x03, 0xc0, 0x80, 0x10, 0xe5,
+	0x96, 0x66, 0x69, 0x24, 0xca, 0xe0, 0x10, 0x00,
+	0x00, 0x03, 0x00, 0x10, 0x00, 0x00, 0x03, 0x01,
+	0xe0, 0x80,
+}
+
+// minimalVPSH265/minimalPPSH265 are placeholder VPS/PPS NALUs (types 32/34):
+// unitRemuxerH265 strips VPS/SPS/PPS from every access unit unless it
+// already has all *three* stored for that format (stricter than H264's
+// SPS+PPS pair - see internal/stream/unit_remuxer.go and
+// format_updater.go's formatUpdaterH265). Their content is never parsed,
+// only their NALU type.
+var minimalVPSH265 = []byte{0x40, 0x01, 0x0c}
+var minimalPPSH265 = []byte{0x44, 0x01, 0xc0}
+
+// minimalIDRH265 is a placeholder IDR_W_RADL NALU (type 19, byte0=(19<<1)),
+// same role as the H264 tests' fake IDR slice bytes: only its NALU type
+// matters to mch265.IsRandomAccess and to the RTP encoder, which
+// packetizes whatever bytes it's given without decoding them.
+var minimalIDRH265 = []byte{0x26, 0x01, 0x84}
+
 // TestSetupFromStreamABRResolvesDimensionsForNonActiveLayer reproduces a
 // real-world report: publishing 1280x720 with 3 Simulcast layers made the
 // player show wrong labels for every layer except the highest (e.g.
@@ -179,6 +209,60 @@ func TestSetupFromStreamABRResolvesDimensionsForNonActiveLayer(t *testing.T) {
 	require.Equal(t, 0, selector.ActiveTrackID(), "writing to layer 1 must not have selected it")
 }
 
+// TestSetupFromStreamABRWithH265ResolvesDimensions covers the HEVC/H264
+// multitrack feature's SetupFromStreamABR H265 branch: an all-H265 stream
+// must get the same real-SPS dimension resolution the H264 branch already
+// gets (see TestSetupFromStreamABRResolvesDimensionsForNonActiveLayer
+// above), and OnAccessUnit must be told about keyframes the same way.
+func TestSetupFromStreamABRWithH265ResolvesDimensions(t *testing.T) {
+	desc := &description.Session{Medias: []*description.Media{
+		{Type: description.MediaTypeVideo, Formats: []format.Format{&format.H265{PayloadTyp: 96}}},
+		{Type: description.MediaTypeVideo, Formats: []format.Format{&format.H265{PayloadTyp: 96}}},
+	}}
+
+	strm := &stream.Stream{
+		OrigDesc:          desc,
+		WriteQueueSize:    512,
+		RTPMaxPayloadSize: 1450,
+		Parent:            test.NilLogger,
+	}
+	require.NoError(t, strm.Initialize())
+
+	subStream := &stream.SubStream{Stream: strm}
+	require.NoError(t, subStream.Initialize())
+
+	selector := NewTrackSelector(test.NilLogger, func(int, int) {})
+	require.NoError(t, selector.LoadFromDescription(desc))
+	require.Equal(t, 0, selector.ActiveTrackID())
+
+	r := &stream.Reader{Parent: test.NilLogger}
+	pc := &PeerConnection{}
+	err := SetupFromStreamABR(desc, r, pc, selector)
+	require.NoError(t, err)
+	require.Len(t, pc.OutboundTracks, 1)
+	require.Equal(t, webrtc.MimeTypeH265, pc.OutboundTracks[0].Caps.MimeType)
+
+	strm.AddReader(r)
+	defer strm.RemoveReader(r)
+
+	// write a real-SPS keyframe to the non-active layer (1)
+	subStream.WriteUnit(desc.Medias[1], desc.Medias[1].Formats[0], &unit.Unit{
+		PTS: 0,
+		NTP: time.Now(),
+		Payload: unit.PayloadH265{
+			minimalVPSH265, realSPS1920x1080H265, minimalPPSH265, minimalIDRH265,
+		},
+	})
+
+	require.Eventually(t, func() bool {
+		tracks := selector.GetTracks()
+		return tracks[1].Width == 1920 && tracks[1].Height == 1080
+	}, 2*time.Second, 10*time.Millisecond,
+		"layer 1's guessed dimensions must be replaced by its real H265 SPS even though it was never selected")
+
+	require.Equal(t, 0, selector.ActiveTrackID(), "writing to layer 1 must not have selected it")
+}
+
 func TestSetupFromStreamMultiH264(t *testing.T) {
 	desc := &description.Session{Medias: []*description.Media{
 		{Type: description.MediaTypeVideo, Formats: []format.Format{&format.H264{PacketizationMode: 1}}},
@@ -216,7 +300,29 @@ func TestSetupFromStreamMultiH264(t *testing.T) {
 	err = SetupFromStreamMultiH264(&description.Session{Medias: []*description.Media{
 		{Type: description.MediaTypeAudio, Formats: []format.Format{&format.Opus{ChannelCount: 2}}},
 	}}, &stream.Reader{Parent: test.NilLogger}, &PeerConnection{}, 3)
-	require.EqualError(t, err, "stream doesn't contain any H264 video layer")
+	require.EqualError(t, err, "stream doesn't contain any H264 or H265 video layer")
+}
+
+// TestSetupFromStreamMultiH265 covers the HEVC/H264 multitrack feature:
+// SetupFromStreamMultiH264 (name kept for compatibility - see its doc
+// comment) must serve an all-H265 stream the same way it serves an
+// all-H264 one.
+func TestSetupFromStreamMultiH265(t *testing.T) {
+	desc := &description.Session{Medias: []*description.Media{
+		{Type: description.MediaTypeVideo, Formats: []format.Format{&format.H265{}}},
+		{Type: description.MediaTypeVideo, Formats: []format.Format{&format.H265{}}},
+		{Type: description.MediaTypeAudio, Formats: []format.Format{&format.Opus{ChannelCount: 2}}},
+	}}
+	pc := &PeerConnection{}
+	err := SetupFromStreamMultiH264(desc, &stream.Reader{Parent: test.NilLogger}, pc, 2)
+	require.NoError(t, err)
+	require.Len(t, pc.OutboundTracks, 3)
+	require.Equal(t, []string{"video-0", "video-1", "audio"}, []string{
+		pc.OutboundTracks[0].TrackID,
+		pc.OutboundTracks[1].TrackID,
+		pc.OutboundTracks[2].TrackID,
+	})
+	require.Equal(t, webrtc.MimeTypeH265, pc.OutboundTracks[0].Caps.MimeType)
 }
 
 func TestSetupFromStreamSimulcast(t *testing.T) {
@@ -243,6 +349,26 @@ func TestSetupFromStreamSimulcast(t *testing.T) {
 
 	require.Len(t, pc.OutboundDataChannels, 1)
 	require.Equal(t, "KLV", pc.OutboundDataChannels[0].Label)
+}
+
+// TestSetupFromStreamSimulcastH265 covers the HEVC/H264 multitrack
+// feature: an all-H265 layer set must be grouped onto one shared
+// track/m-line with per-layer RIDs the same way H264 already is.
+func TestSetupFromStreamSimulcastH265(t *testing.T) {
+	desc := &description.Session{Medias: []*description.Media{
+		{Type: description.MediaTypeVideo, Formats: []format.Format{&format.H265{}}},
+		{Type: description.MediaTypeVideo, Formats: []format.Format{&format.H265{}}},
+	}}
+	pc := &PeerConnection{}
+	err := SetupFromStreamSimulcast(desc, &stream.Reader{Parent: test.NilLogger}, pc)
+	require.NoError(t, err)
+	require.Len(t, pc.OutboundTracks, 2)
+
+	for i := range 2 {
+		require.Equal(t, mmxForwardSimulcastTrackID, pc.OutboundTracks[i].TrackID)
+		require.Equal(t, fmt.Sprint(i), pc.OutboundTracks[i].RID)
+		require.Equal(t, webrtc.MimeTypeH265, pc.OutboundTracks[i].Caps.MimeType)
+	}
 }
 
 func TestSetupFromStreamSimulcastNoVideo(t *testing.T) {

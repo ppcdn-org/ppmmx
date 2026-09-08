@@ -143,6 +143,69 @@ func offerVideoSimulcastLayerCount(medias []*sdp.MediaDescription) int {
 	return count
 }
 
+// maxHEVCSimulcastLayers is a stricter, codec-specific ceiling than
+// maxWHIPSimulcastLayers (which stays 5 for H264): the design confirmed
+// HEVC Simulcast must be capped at 1-3 layers, and that constant has no
+// per-codec concept, so this needs its own limit - see pathCodecFromName's
+// call site in runPublish.
+const maxHEVCSimulcastLayers = 3
+
+// pathCodecFromName returns the codec a WHIP path's trailing segment
+// requires ("h264"/"hevc" - see the design doc's
+// /{appId}/{streamName}/{codecType}/whip convention), or "" when the path
+// doesn't end in a recognized codec segment. "" covers both the legacy
+// 2-segment shape and anything else unrecognized, so the publish offer's
+// video codec stays unconstrained there - every pre-multitrack path keeps
+// behaving exactly as before. See runPublish's offer validation and
+// checkWHIPDeviceID's matching path-binding check in http_server.go.
+func pathCodecFromName(pathName string) string {
+	switch {
+	case strings.HasSuffix(pathName, "/h264"):
+		return "h264"
+	case strings.HasSuffix(pathName, "/hevc"):
+		return "hevc"
+	default:
+		return ""
+	}
+}
+
+// pathCodecRtpmapName maps a path's codec segment (pathCodecFromName's
+// return value) to the SDP rtpmap name pion registers for it (see
+// incomingVideoCodecs in inbound_track.go) - HEVC is spelled "H265" on the
+// wire, not "HEVC".
+func pathCodecRtpmapName(codec string) string {
+	switch codec {
+	case "h264":
+		return "H264"
+	case "hevc":
+		return "H265"
+	default:
+		return ""
+	}
+}
+
+// offerHasVideoCodec reports whether any video media in the offer
+// advertises an rtpmap matching rtpmapName. Mirrors
+// offerH264SendTrackCount's rtpmap-scanning technique above, generalized to
+// an arbitrary codec name instead of hardcoding "H264".
+func offerHasVideoCodec(medias []*sdp.MediaDescription, rtpmapName string) bool {
+	for _, media := range medias {
+		if media.MediaName.Media != "video" {
+			continue
+		}
+		for _, attr := range media.Attributes {
+			if attr.Key != "rtpmap" {
+				continue
+			}
+			fields := strings.Fields(attr.Value)
+			if len(fields) == 2 && strings.EqualFold(strings.SplitN(fields[1], "/", 2)[0], rtpmapName) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func offerSendVideoTrackCount(medias []*sdp.MediaDescription) int {
 	count := 0
 	for _, media := range medias {
@@ -605,6 +668,28 @@ func (s *session) runPublish(req *initialRequestReq) (int, error) {
 		// response.
 		return http.StatusNotAcceptable, fmt.Errorf("%w (offer m-lines: %s)",
 			err, describeOfferMedias(sdp.MediaDescriptions))
+	}
+
+	// HEVC/H264 multitrack: a path ending in /h264 or /hevc only accepts an
+	// offer whose video codec matches (RFC's 406 rationale, same as
+	// TracksAreValid above) - a legacy 2-segment path is unconstrained, so
+	// every pre-existing single-codec publish (H264 or already-supported
+	// single-codec HEVC) keeps working unchanged.
+	if expectedCodec := pathCodecFromName(s.pathName); expectedCodec != "" {
+		rtpmapName := pathCodecRtpmapName(expectedCodec)
+		if !offerHasVideoCodec(sdp.MediaDescriptions, rtpmapName) {
+			s.Log(logger.Debug, "rejected WHIP offer: %s", offer.SDP)
+			return http.StatusNotAcceptable, fmt.Errorf(
+				"path %s requires %s video (offer m-lines: %s)",
+				s.pathName, rtpmapName, describeOfferMedias(sdp.MediaDescriptions))
+		}
+		if expectedCodec == "hevc" {
+			if n := offerVideoSimulcastLayerCount(sdp.MediaDescriptions); n > maxHEVCSimulcastLayers {
+				return http.StatusNotAcceptable, fmt.Errorf(
+					"at most %d Simulcast layers are supported for HEVC, offer requested %d",
+					maxHEVCSimulcastLayers, n)
+			}
+		}
 	}
 
 	// Simulcast layer count is decided by the publisher (OBS), not mmx -

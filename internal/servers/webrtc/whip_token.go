@@ -15,10 +15,16 @@ import (
 // ppcenter repo). Field names are part of the wire format shared between
 // the two independent implementations and must not change on one side
 // without the other.
+//
+// Codec is empty for a token bound to the legacy 2-segment path
+// (appId/stream); when non-empty ("h264"/"hevc") the token is only valid for
+// the corresponding 3-segment codec path (appId/stream/codec) - see
+// checkWHIPDeviceID in http_server.go.
 type whipTokenClaims struct {
 	UUID   string `json:"uuid"`
 	AppID  string `json:"appId"`
 	Stream string `json:"stream"`
+	Codec  string `json:"codec,omitempty"`
 	IAT    int64  `json:"iat"`
 	EXP    int64  `json:"exp"`
 }

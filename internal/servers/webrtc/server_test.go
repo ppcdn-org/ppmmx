@@ -45,10 +45,12 @@ const testWHIPAuthKey = "test-whip-auth-key"
 // makeTestWHIPToken builds a WHIP publish bearer token in the same
 // AES-256-GCM wire format ppcenter's EncryptWHIPToken produces (see
 // decryptWHIPToken in whip_token.go), so tests can exercise
-// checkWHIPDeviceID without depending on the ppcenter repo.
-func makeTestWHIPToken(t *testing.T, authKey, appID, stream string, exp time.Time) string {
+// checkWHIPDeviceID without depending on the ppcenter repo. codec is ""
+// for a legacy 2-segment-path token, or "h264"/"hevc" to bind it to that
+// codec's 3-segment path.
+func makeTestWHIPToken(t *testing.T, authKey, appID, stream, codec string, exp time.Time) string {
 	t.Helper()
-	claims := whipTokenClaims{AppID: appID, Stream: stream, IAT: exp.Add(-time.Hour).Unix(), EXP: exp.Unix()}
+	claims := whipTokenClaims{AppID: appID, Stream: stream, Codec: codec, IAT: exp.Add(-time.Hour).Unix(), EXP: exp.Unix()}
 	plaintext, err := json.Marshal(claims)
 	require.NoError(t, err)
 
@@ -64,11 +66,18 @@ func makeTestWHIPToken(t *testing.T, authKey, appID, stream string, exp time.Tim
 	return base64.RawURLEncoding.EncodeToString(sealed)
 }
 
-// validTestWHIPToken is a 1-hour-valid token for appID/stream, keyed with
-// testWHIPAuthKey.
+// validTestWHIPToken is a 1-hour-valid legacy (no codec) token for
+// appID/stream, keyed with testWHIPAuthKey.
 func validTestWHIPToken(t *testing.T, appID, stream string) string {
 	t.Helper()
-	return makeTestWHIPToken(t, testWHIPAuthKey, appID, stream, time.Now().Add(time.Hour))
+	return makeTestWHIPToken(t, testWHIPAuthKey, appID, stream, "", time.Now().Add(time.Hour))
+}
+
+// validTestWHIPTokenForCodec is validTestWHIPToken's codec-bound
+// counterpart, for the 3-segment appId/stream/codec path.
+func validTestWHIPTokenForCodec(t *testing.T, appID, stream, codec string) string {
+	t.Helper()
+	return makeTestWHIPToken(t, testWHIPAuthKey, appID, stream, codec, time.Now().Add(time.Hour))
 }
 
 func whipAnswer(body []byte) *pwebrtc.SessionDescription {
@@ -562,6 +571,118 @@ func TestServerPublish(t *testing.T) {
 			},
 		},
 	}, list)
+}
+
+// TestServerPublishRejectsMismatchedCodecOnCodecPath and
+// TestServerPublishAcceptsMatchingCodecOnCodecPath cover the HEVC/H264
+// multitrack feature's offer-vs-path codec check added to runPublish
+// (session.go) - an H264 offer must be rejected on a /hevc path, and an
+// H265 offer accepted there.
+func newCodecPathTestServer(t *testing.T, address, localAddr string) *Server {
+	t.Helper()
+	pathManager := &test.PathManager{
+		FindPathConfImpl: func(req defs.PathFindPathConfReq) (*defs.PathFindPathConfRes, error) {
+			return &defs.PathFindPathConfRes{Conf: &conf.Path{}}, nil
+		},
+		AddPublisherImpl: func(req defs.PathAddPublisherReq) (*defs.PathAddPublisherRes, error) {
+			strm := &stream.Stream{
+				OrigDesc:          req.Desc,
+				WriteQueueSize:    512,
+				RTPMaxPayloadSize: 1450,
+				Parent:            test.NilLogger,
+			}
+			require.NoError(t, strm.Initialize())
+			t.Cleanup(strm.Close)
+			return &defs.PathAddPublisherRes{Path: &dummyPath{}, SubStream: &stream.SubStream{Stream: strm}}, nil
+		},
+	}
+
+	s := &Server{
+		Address:               address,
+		TrustedProxies:        conf.IPNetworks{},
+		ReadTimeout:           conf.Duration(10 * time.Second),
+		WriteTimeout:          conf.Duration(10 * time.Second),
+		LocalUDPAddress:       localAddr,
+		LocalTCPAddress:       localAddr,
+		IPsFromInterfaces:     true,
+		IPsFromInterfacesList: []string{},
+		AdditionalHosts:       []string{},
+		ICEServers:            []conf.WebRTCICEServer{},
+		STUNGatherTimeout:     conf.Duration(5 * time.Second),
+		HandshakeTimeout:      conf.Duration(10 * time.Second),
+		TrackGatherTimeout:    conf.Duration(2 * time.Second),
+		PathManager:           pathManager,
+		Parent:                test.NilLogger,
+		WHIPAuthKey:           testWHIPAuthKey,
+	}
+	require.NoError(t, s.Initialize())
+	t.Cleanup(s.Close)
+	return s
+}
+
+func TestServerPublishRejectsMismatchedCodecOnCodecPath(t *testing.T) {
+	newCodecPathTestServer(t, "127.0.0.1:8991", "127.0.0.1:8992")
+
+	tr := &http.Transport{}
+	defer tr.CloseIdleConnections()
+	hc := &http.Client{Transport: tr}
+
+	su, err := url.Parse("http://localhost:8991/testapp/teststream/hevc/whip")
+	require.NoError(t, err)
+
+	// An H264 offer on a path that requires HEVC.
+	track := &webrtc.OutboundTrack{
+		Caps: pwebrtc.RTPCodecCapability{
+			MimeType:    pwebrtc.MimeTypeH264,
+			ClockRate:   90000,
+			SDPFmtpLine: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f",
+		},
+	}
+	wc := &whip.Client{
+		HTTPClient:     hc,
+		URL:            su,
+		Publish:        true,
+		OutboundTracks: []*webrtc.OutboundTrack{track},
+		DeviceID:       validTestWHIPTokenForCodec(t, "testapp", "teststream", "hevc"),
+		Log:            test.NilLogger,
+	}
+
+	err = wc.Initialize(context.Background())
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "bad status code: 406")
+}
+
+func TestServerPublishAcceptsMatchingCodecOnCodecPath(t *testing.T) {
+	newCodecPathTestServer(t, "127.0.0.1:8993", "127.0.0.1:8994")
+
+	tr := &http.Transport{}
+	defer tr.CloseIdleConnections()
+	hc := &http.Client{Transport: tr}
+
+	su, err := url.Parse("http://localhost:8993/testapp/teststream/hevc/whip")
+	require.NoError(t, err)
+
+	// An H265 offer matching the /hevc path, using the same fmtp params
+	// this server registers in inbound_track.go's incomingVideoCodecs.
+	track := &webrtc.OutboundTrack{
+		Caps: pwebrtc.RTPCodecCapability{
+			MimeType:    pwebrtc.MimeTypeH265,
+			ClockRate:   90000,
+			SDPFmtpLine: "level-id=93;profile-id=1;tier-flag=0;tx-mode=SRST",
+		},
+	}
+	wc := &whip.Client{
+		HTTPClient:     hc,
+		URL:            su,
+		Publish:        true,
+		OutboundTracks: []*webrtc.OutboundTrack{track},
+		DeviceID:       validTestWHIPTokenForCodec(t, "testapp", "teststream", "hevc"),
+		Log:            test.NilLogger,
+	}
+
+	err = wc.Initialize(context.Background())
+	require.NoError(t, err)
+	defer checkClose(t, wc.Close)
 }
 
 func TestServerRead(t *testing.T) {
@@ -1353,9 +1474,9 @@ func TestWHIPDeviceIDBearerTokenFallback(t *testing.T) {
 	const testForwardSecret = "test-mmx-forward-secret"
 	s := &httpServer{parent: &Server{WHIPAuthKey: testWHIPAuthKey, ForwardSecret: testForwardSecret}}
 	validToken := validTestWHIPToken(t, "testapp", "teststream")
-	expiredToken := makeTestWHIPToken(t, testWHIPAuthKey, "testapp", "teststream", time.Now().Add(-time.Minute))
+	expiredToken := makeTestWHIPToken(t, testWHIPAuthKey, "testapp", "teststream", "", time.Now().Add(-time.Minute))
 	wrongPathToken := validTestWHIPToken(t, "testapp", "other-stream")
-	wrongKeyToken := makeTestWHIPToken(t, "wrong-auth-key", "testapp", "teststream", time.Now().Add(time.Hour))
+	wrongKeyToken := makeTestWHIPToken(t, "wrong-auth-key", "testapp", "teststream", "", time.Now().Add(time.Hour))
 
 	for _, ca := range []struct {
 		name    string
@@ -1432,6 +1553,46 @@ func TestWHIPDeviceIDBearerTokenFallback(t *testing.T) {
 			ctx.Request = req
 
 			require.Equal(t, ca.allowed, s.checkWHIPDeviceID(ctx, "testapp/teststream"))
+		})
+	}
+}
+
+// TestWHIPDeviceIDCodecBinding covers the HEVC/H264 multitrack feature: a
+// codec-bound token (whipTokenClaims.Codec) must authenticate its own
+// 3-segment path only, never the legacy 2-segment path or a different
+// codec's path - and a legacy (no codec) token must keep working on the
+// legacy path exactly as before this claim existed.
+func TestWHIPDeviceIDCodecBinding(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	s := &httpServer{parent: &Server{WHIPAuthKey: testWHIPAuthKey}}
+	legacyToken := validTestWHIPToken(t, "testapp", "teststream")
+	h264Token := validTestWHIPTokenForCodec(t, "testapp", "teststream", "h264")
+	hevcToken := validTestWHIPTokenForCodec(t, "testapp", "teststream", "hevc")
+
+	for _, ca := range []struct {
+		name     string
+		token    string
+		pathName string
+		allowed  bool
+	}{
+		{name: "legacy token on legacy path", token: legacyToken, pathName: "testapp/teststream", allowed: true},
+		{name: "legacy token on h264 path is rejected", token: legacyToken, pathName: "testapp/teststream/h264", allowed: false},
+		{name: "h264 token on h264 path", token: h264Token, pathName: "testapp/teststream/h264", allowed: true},
+		{name: "hevc token on hevc path", token: hevcToken, pathName: "testapp/teststream/hevc", allowed: true},
+		{name: "h264 token on hevc path is rejected", token: h264Token, pathName: "testapp/teststream/hevc", allowed: false},
+		{name: "hevc token on h264 path is rejected", token: hevcToken, pathName: "testapp/teststream/h264", allowed: false},
+		{name: "h264 token on legacy path is rejected", token: h264Token, pathName: "testapp/teststream", allowed: false},
+	} {
+		t.Run(ca.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/"+ca.pathName+"/whip", nil)
+			req.Header.Set("WHIP-Device-Id", ca.token)
+
+			rec := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(rec)
+			ctx.Request = req
+
+			require.Equal(t, ca.allowed, s.checkWHIPDeviceID(ctx, ca.pathName))
 		})
 	}
 }

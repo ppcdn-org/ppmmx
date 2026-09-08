@@ -239,7 +239,18 @@ func (s *httpServer) checkWHIPDeviceID(ctx *gin.Context, pathName string) bool {
 		return true
 	}
 	claims, err := decryptWHIPToken(s.parent.WHIPAuthKey, token, time.Now())
-	if err != nil || claims.AppID+"/"+claims.Stream != pathName {
+	if err != nil {
+		s.writeErrorNoLog(ctx, http.StatusForbidden, fmt.Errorf("publish deviceID authentication failure!"))
+		return false
+	}
+	// A codec-bound token (see whipTokenClaims.Codec) is only valid for its
+	// own 3-segment codec path - it must not also authenticate the legacy
+	// 2-segment path or a different codec's path.
+	expected := claims.AppID + "/" + claims.Stream
+	if claims.Codec != "" {
+		expected += "/" + claims.Codec
+	}
+	if expected != pathName {
 		s.writeErrorNoLog(ctx, http.StatusForbidden, fmt.Errorf("publish deviceID authentication failure!"))
 		return false
 	}
