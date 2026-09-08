@@ -350,6 +350,22 @@ func TestConfWebRTCIPsFromInterfacesFallback(t *testing.T) {
 	require.Equal(t, true, conf.WebRTCIPsFromInterfaces)
 }
 
+// TestConfWebRTCInboundRTPBufferSize verifies webrtcInboundRTPBufferSize
+// parses from YAML and defaults to 0 (which lets rtpreceiver.Receiver fall
+// back to its own built-in default of 64 - see
+// internal/protocols/webrtc/inbound_track.go) when left unset, as origin
+// nodes are the only deployment meant to raise it (see
+// bin/conf/origin.local.yml).
+func TestConfWebRTCInboundRTPBufferSize(t *testing.T) {
+	conf, _, err := Load(createTempFile(t, []byte("webrtcInboundRTPBufferSize: 128\n")), nil, nil)
+	require.NoError(t, err)
+	require.Equal(t, 128, conf.WebRTCInboundRTPBufferSize)
+
+	conf, _, err = Load(createTempFile(t, []byte("{}")), nil, nil)
+	require.NoError(t, err)
+	require.Equal(t, 0, conf.WebRTCInboundRTPBufferSize)
+}
+
 func TestConfErrors(t *testing.T) {
 	for _, ca := range []struct {
 		name string

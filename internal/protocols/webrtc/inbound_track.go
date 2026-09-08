@@ -254,6 +254,9 @@ type InboundTrack struct {
 	rid       string
 	writeRTCP func([]rtcp.Packet) error
 	log       logger.Writer
+	// bufferSize sets rtpreceiver.Receiver.BufferSize (see start). Zero
+	// keeps gortsplib's own default of 64.
+	bufferSize int
 
 	twccExtID                uint8
 	inboundRTPPacketsLost    *counterdumper.Dumper
@@ -336,6 +339,7 @@ func (t *InboundTrack) start() {
 	t.rtpReceiver = &rtpreceiver.Receiver{
 		ClockRate:            int(t.track.Codec().ClockRate),
 		UnrealiableTransport: true,
+		BufferSize:           t.bufferSize,
 		Period:               1 * time.Second,
 		WritePacketRTCP: func(p rtcp.Packet) {
 			t.writeRTCP([]rtcp.Packet{p}) //nolint:errcheck

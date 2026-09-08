@@ -455,6 +455,7 @@ type session struct {
 	stunGatherTimeout     conf.Duration
 	handshakeTimeout      conf.Duration
 	trackGatherTimeout    conf.Duration
+	inboundRTPBufferSize  int
 	pathName              string
 	remoteAddr            string
 	offer                 []byte

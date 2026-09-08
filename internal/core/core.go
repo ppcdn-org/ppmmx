@@ -769,6 +769,7 @@ func (p *Core) createResources(initial bool) error {
 			STUNGatherTimeout:     p.conf.WebRTCSTUNGatherTimeout,
 			HandshakeTimeout:      p.conf.WebRTCHandshakeTimeout,
 			TrackGatherTimeout:    p.conf.WebRTCTrackGatherTimeout,
+			InboundRTPBufferSize:  p.conf.WebRTCInboundRTPBufferSize,
 			ExternalCmdPool:       p.externalCmdPool,
 			Metrics:               p.metrics,
 			PathManager:           p.pathManager,

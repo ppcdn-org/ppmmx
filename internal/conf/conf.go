@@ -397,6 +397,16 @@ type Conf struct {
 	WebRTCSTUNGatherTimeout     Duration          `json:"webrtcSTUNGatherTimeout"`
 	WebRTCHandshakeTimeout      Duration          `json:"webrtcHandshakeTimeout"`
 	WebRTCTrackGatherTimeout    Duration          `json:"webrtcTrackGatherTimeout"`
+	// WebRTCInboundRTPBufferSize sets rtpreceiver.Receiver.BufferSize (the
+	// packet-reordering buffer) for every WHIP-published inbound track -
+	// see internal/protocols/webrtc/inbound_track.go. Zero/unset keeps
+	// gortsplib's own default of 64. Origin nodes, which take the first
+	// (and often only) hop from an OBS/ppobs publisher and so see the
+	// roughest jitter/reordering, are the deployment this is meant to be
+	// raised for (128, see bin/conf/origin.local.yml) - edge and record
+	// nodes only ever receive an already-cleaned-up mmx-to-mmx forward and
+	// don't need it.
+	WebRTCInboundRTPBufferSize int `json:"webrtcInboundRTPBufferSize"`
 
 	// ABR (Adaptive Bitrate)
 	WebRTCABREnable         bool   `json:"webrtcABREnable"`

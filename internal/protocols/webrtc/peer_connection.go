@@ -186,10 +186,14 @@ type PeerConnection struct {
 	IPsFromInterfacesList []string
 	AdditionalHosts       []string
 	STUNGatherTimeout     time.Duration
-	Publish               bool
-	RecvOnlyVideoTracks   int
-	OutboundTracks        []*OutboundTrack
-	OutboundDataChannels  []*OutboundDataChannel
+	// InboundRTPBufferSize sets rtpreceiver.Receiver.BufferSize for every
+	// inbound (WHIP-published) track this PeerConnection receives - see
+	// InboundTrack.start. Zero keeps gortsplib's own default of 64.
+	InboundRTPBufferSize int
+	Publish              bool
+	RecvOnlyVideoTracks  int
+	OutboundTracks       []*OutboundTrack
+	OutboundDataChannels []*OutboundDataChannel
 	// OnInboundDataChannel, when set, is called for every DataChannel the
 	// remote peer creates (only applies when Publish is false, i.e. this
 	// PeerConnection is receiving media - a WHIP publisher). Used e.g. by
@@ -550,12 +554,13 @@ func (co *PeerConnection) run() {
 
 func (co *PeerConnection) addInboundTrack(pair trackRecvPair) *InboundTrack {
 	track := &InboundTrack{
-		track:     pair.track,
-		receiver:  pair.receiver,
-		id:        pair.track.ID(),
-		rid:       pair.track.RID(),
-		writeRTCP: co.wr.WriteRTCP,
-		log:       co.Log,
+		track:      pair.track,
+		receiver:   pair.receiver,
+		id:         pair.track.ID(),
+		rid:        pair.track.RID(),
+		writeRTCP:  co.wr.WriteRTCP,
+		log:        co.Log,
+		bufferSize: co.InboundRTPBufferSize,
 	}
 	track.initialize()
 

@@ -211,6 +211,7 @@ type Server struct {
 	STUNGatherTimeout     conf.Duration
 	HandshakeTimeout      conf.Duration
 	TrackGatherTimeout    conf.Duration
+	InboundRTPBufferSize  int
 	ExternalCmdPool       *externalcmd.Pool
 	Metrics               serverMetrics
 	PathManager           serverPathManager
@@ -423,6 +424,7 @@ outer:
 				stunGatherTimeout:     s.STUNGatherTimeout,
 				handshakeTimeout:      s.HandshakeTimeout,
 				trackGatherTimeout:    s.TrackGatherTimeout,
+				inboundRTPBufferSize:  s.InboundRTPBufferSize,
 				pathName:              req.pathName,
 				remoteAddr:            req.remoteAddr,
 				offer:                 req.offer,

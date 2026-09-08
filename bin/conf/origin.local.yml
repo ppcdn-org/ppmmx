@@ -60,6 +60,10 @@ webrtcAllowOrigins: ["*"]
 # Simulcast 推流端(如 OBS)冷启动时视频编码器可能晚于音频出包;
 # 默认 2s 窗口过短会导致只采集到音频(播放黑屏)。轨道齐了会提前返回。
 webrtcTrackGatherTimeout: 10s
+# origin 是推流端(OBS/ppobs)直接落地的第一跳，网络抖动/乱序最明显，把入站
+# RTP 包重排缓冲从默认的 64 个包提到 128 个，减少因缓冲过小误判丢包。edge/
+# record 只接收 mmx 间转发(已经过 origin 整理)的流，不需要调大，维持默认。
+webrtcInboundRTPBufferSize: 128
 
 # ABR (Adaptive Bitrate)
 webrtcABREnable: true
