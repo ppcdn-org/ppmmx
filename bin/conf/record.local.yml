@@ -118,4 +118,5 @@ paths:
     # Delete segments after this timespan.
     # Set to 0s to disable automatic deletion.
     recordDeleteAfter: 24h
+    recordMinFreeSpace: 8G
 

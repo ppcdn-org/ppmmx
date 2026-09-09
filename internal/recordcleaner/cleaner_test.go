@@ -105,7 +105,7 @@ func TestCleanerMultipleEntriesSamePath(t *testing.T) {
 	require.NoError(t, err)
 }
 
-// TestCleanerMinFreeSpace verifies that when free space is below
+// TestCleanerMinFreeSpace verifies that when free space is below a path's
 // RecordMinFreeSpace, the cleaner force-deletes the globally oldest
 // segments (oldest first, across all paths sharing the filesystem) until
 // free space recovers, even though none of the segments have expired by
@@ -143,18 +143,22 @@ func TestCleanerMinFreeSpace(t *testing.T) {
 	c := &Cleaner{
 		PathConfs: map[string]*conf.Path{
 			"path1": {
-				Name:         "path1",
-				RecordPath:   filepath.Join(dir, "%path.%Y-%m-%d_%H-%M-%S-%f"),
-				RecordFormat: conf.RecordFormatFMP4,
+				Name:               "path1",
+				RecordPath:         filepath.Join(dir, "%path.%Y-%m-%d_%H-%M-%S-%f"),
+				RecordFormat:       conf.RecordFormatFMP4,
+				RecordMinFreeSpace: 2000, // needs 2 of the 4 (1000-byte) segments freed
 			},
 			"path2": {
 				Name:         "path2",
 				RecordPath:   filepath.Join(dir, "%path.%Y-%m-%d_%H-%M-%S-%f"),
 				RecordFormat: conf.RecordFormatFMP4,
+				// left unset: the shared filesystem's floor is resolved as
+				// the highest value set among the paths sharing it (see
+				// Cleaner.minFreeSpaceForRoot) - path1's 2000 alone must
+				// still drive the reclaim for both.
 			},
 		},
-		RecordMinFreeSpace: 2000, // needs 2 of the 4 (1000-byte) segments freed
-		Parent:             test.NilLogger,
+		Parent: test.NilLogger,
 	}
 	c.Initialize()
 	defer c.Close()
@@ -204,10 +208,11 @@ func TestCleanerMinFreeSpaceProtectsRecent(t *testing.T) {
 				Name:         "path1",
 				RecordPath:   filepath.Join(dir, "%path.%Y-%m-%d_%H-%M-%S-%f"),
 				RecordFormat: conf.RecordFormatFMP4,
+				// impossible to satisfy - forces the loop to run to completion
+				RecordMinFreeSpace: 1_000_000_000,
 			},
 		},
-		RecordMinFreeSpace: 1_000_000_000, // impossible to satisfy - forces the loop to run to completion
-		Parent:             test.NilLogger,
+		Parent: test.NilLogger,
 	}
 	c.Initialize()
 	defer c.Close()
@@ -222,7 +227,7 @@ func TestCleanerMinFreeSpaceProtectsRecent(t *testing.T) {
 }
 
 // TestCleanerMinFreeSpaceDisabledByDefault verifies that a zero
-// RecordMinFreeSpace (the zero value, distinct from setDefaults' 8G
+// RecordMinFreeSpace (the zero value, distinct from Path.setDefaults' 8G
 // default which only applies via conf.Load) never force-deletes
 // unexpired segments.
 func TestCleanerMinFreeSpaceDisabledByDefault(t *testing.T) {
@@ -244,9 +249,9 @@ func TestCleanerMinFreeSpaceDisabledByDefault(t *testing.T) {
 				Name:         "path1",
 				RecordPath:   filepath.Join(dir, "%path/%Y-%m-%d_%H-%M-%S-%f"),
 				RecordFormat: conf.RecordFormatFMP4,
+				// RecordMinFreeSpace intentionally left at zero.
 			},
 		},
-		// RecordMinFreeSpace intentionally left at zero.
 		Parent: test.NilLogger,
 	}
 	c.Initialize()

@@ -235,6 +235,17 @@ type Path struct {
 	RecordMaxPartSize     StringSize   `json:"recordMaxPartSize"`
 	RecordSegmentDuration Duration     `json:"recordSegmentDuration"`
 	RecordDeleteAfter     Duration     `json:"recordDeleteAfter"`
+	// RecordMinFreeSpace is a floor on free disk space on the filesystem
+	// holding this path's recordings, checked by recordcleaner.Cleaner
+	// after the age-based (RecordDeleteAfter) pass. If still below this,
+	// the globally oldest segments (across every path sharing that
+	// filesystem) are force-deleted until back above it - a safety net for
+	// a RecordDeleteAfter window too long (or bitrate too high) for the
+	// available disk. Zero disables the check for this path. When paths
+	// share a filesystem with different values set, the highest one wins
+	// for that filesystem (see recordcleaner.Cleaner.enforceMinFreeSpace) -
+	// the physical disk can only satisfy the strictest requirement anyway.
+	RecordMinFreeSpace StringSize `json:"recordMinFreeSpace"`
 
 	// Forward (Tencent Cloud WHIP relay)
 	ForwardTencent          bool   `json:"forwardTencent"`
@@ -390,6 +401,7 @@ func (pconf *Path) setDefaults() {
 	pconf.RecordMaxPartSize = 50 * 1024 * 1024
 	pconf.RecordSegmentDuration = 3600 * Duration(time.Second)
 	pconf.RecordDeleteAfter = 24 * 3600 * Duration(time.Second)
+	pconf.RecordMinFreeSpace = 8 * 1024 * 1024 * 1024 // 8G
 
 	// Publisher source
 	pconf.OverridePublisher = true

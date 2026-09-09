@@ -91,6 +91,15 @@ func atLeastOneRecordDeleteAfter(pathConfs map[string]*conf.Path) bool {
 	return false
 }
 
+func atLeastOneRecordMinFreeSpace(pathConfs map[string]*conf.Path) bool {
+	for _, e := range pathConfs {
+		if e.RecordMinFreeSpace != 0 {
+			return true
+		}
+	}
+	return false
+}
+
 func getRTPMaxPayloadSize(udpMaxPayloadSize int, rtspEncryption conf.Encryption) int {
 	// UDP max payload size - 12 (RTP header)
 	v := udpMaxPayloadSize - 12
@@ -438,11 +447,10 @@ func (p *Core) createResources(initial bool) error {
 	}
 
 	if p.recordCleaner == nil &&
-		(atLeastOneRecordDeleteAfter(p.conf.Paths) || p.conf.RecordMinFreeSpace > 0) {
+		(atLeastOneRecordDeleteAfter(p.conf.Paths) || atLeastOneRecordMinFreeSpace(p.conf.Paths)) {
 		p.recordCleaner = &recordcleaner.Cleaner{
-			PathConfs:          p.conf.Paths,
-			RecordMinFreeSpace: p.conf.RecordMinFreeSpace,
-			Parent:             p,
+			PathConfs: p.conf.Paths,
+			Parent:    p,
 		}
 		p.recordCleaner.Initialize()
 	}
@@ -1067,9 +1075,8 @@ func (p *Core) closeResources(newConf *conf.Conf, calledByAPI bool) {
 		closeLogger
 
 	closeRecorderCleaner := newConf == nil ||
-		(atLeastOneRecordDeleteAfter(newConf.Paths) || newConf.RecordMinFreeSpace > 0) !=
-			(atLeastOneRecordDeleteAfter(p.conf.Paths) || p.conf.RecordMinFreeSpace > 0) ||
-		newConf.RecordMinFreeSpace != p.conf.RecordMinFreeSpace ||
+		(atLeastOneRecordDeleteAfter(newConf.Paths) || atLeastOneRecordMinFreeSpace(newConf.Paths)) !=
+			(atLeastOneRecordDeleteAfter(p.conf.Paths) || atLeastOneRecordMinFreeSpace(p.conf.Paths)) ||
 		closeLogger
 	if !closeRecorderCleaner && p.recordCleaner != nil && !reflect.DeepEqual(newConf.Paths, p.conf.Paths) {
 		p.recordCleaner.ReloadPathConfs(newConf.Paths)

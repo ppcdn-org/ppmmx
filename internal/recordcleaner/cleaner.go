@@ -25,7 +25,8 @@ var diskFreeBytes = freeBytes
 
 // minFreeSpaceProtectedAge is how recent a segment must be to always
 // survive enforceMinFreeSpace's forced reclaim, regardless of how far
-// under RecordMinFreeSpace the disk is. Segment filenames are stamped
+// under the resolved RecordMinFreeSpace floor the disk is. Segment
+// filenames are stamped
 // with when they started, not when they finished (a segment can still be
 // actively being written to well past its own Start, e.g. up to
 // recordSegmentDuration later - see recorder.formatFMP4Segment), so this
@@ -36,14 +37,11 @@ const minFreeSpaceProtectedAge = 10 * time.Minute
 
 // Cleaner removes expired recording segments from disk.
 type Cleaner struct {
+	// PathConfs also carries each path's RecordMinFreeSpace (see
+	// enforceMinFreeSpaceOnRoot for how a shared filesystem resolves one
+	// effective floor across paths with different values).
 	PathConfs map[string]*conf.Path
-	// RecordMinFreeSpace is a floor on free disk space, checked after the
-	// age-based (recordDeleteAfter) pass on every filesystem that holds at
-	// least one path's recordings. If still below this, the globally
-	// oldest segments (across all paths sharing that filesystem) are
-	// force-deleted until back above it. Zero disables the check.
-	RecordMinFreeSpace conf.StringSize
-	Parent             logger.Writer
+	Parent    logger.Writer
 
 	ctx       context.Context
 	ctxCancel func()
@@ -173,15 +171,12 @@ func (c *Cleaner) pathRoot(pathName string) string {
 
 // enforceMinFreeSpace force-deletes the globally oldest recording segments
 // (oldest first, across every path that shares the affected filesystem)
-// until free space is back at or above RecordMinFreeSpace. This runs after
-// the age-based (recordDeleteAfter) pass and only kicks in when that
-// wasn't enough - e.g. recordDeleteAfter's window is longer than what the
-// disk can hold at the current recording bitrate.
+// until free space is back at or above the resolved floor for that
+// filesystem (see enforceMinFreeSpaceOnRoot). This runs after the
+// age-based (recordDeleteAfter) pass and only kicks in when that wasn't
+// enough - e.g. recordDeleteAfter's window is longer than what the disk
+// can hold at the current recording bitrate.
 func (c *Cleaner) enforceMinFreeSpace(now time.Time, pathNames []string) {
-	if c.RecordMinFreeSpace == 0 {
-		return
-	}
-
 	rootToPaths := make(map[string][]string)
 	for _, pathName := range pathNames {
 		root := c.pathRoot(pathName)
@@ -196,13 +191,38 @@ func (c *Cleaner) enforceMinFreeSpace(now time.Time, pathNames []string) {
 	}
 }
 
+// minFreeSpaceForRoot resolves the effective free-space floor for a
+// filesystem shared by pathsOnRoot: the highest RecordMinFreeSpace set
+// among them (0 for any path that leaves it unset, i.e. doesn't
+// participate in the floor). The physical disk can only ever satisfy the
+// strictest of several paths' requirements at once, so the highest value
+// wins rather than e.g. an average or the first one found.
+func (c *Cleaner) minFreeSpaceForRoot(pathsOnRoot []string) conf.StringSize {
+	var floor conf.StringSize
+	for _, pathName := range pathsOnRoot {
+		pathConf, _, err := conf.FindPathConf(c.PathConfs, pathName)
+		if err != nil {
+			continue
+		}
+		if pathConf.RecordMinFreeSpace > floor {
+			floor = pathConf.RecordMinFreeSpace
+		}
+	}
+	return floor
+}
+
 func (c *Cleaner) enforceMinFreeSpaceOnRoot(now time.Time, root string, pathsOnRoot []string) {
+	minFreeSpace := c.minFreeSpaceForRoot(pathsOnRoot)
+	if minFreeSpace == 0 {
+		return
+	}
+
 	free, err := diskFreeBytes(root)
 	if err != nil {
 		c.Log(logger.Warn, "unable to check free disk space on %s: %v", root, err)
 		return
 	}
-	if free >= uint64(c.RecordMinFreeSpace) {
+	if free >= uint64(minFreeSpace) {
 		return
 	}
 
@@ -252,10 +272,10 @@ func (c *Cleaner) enforceMinFreeSpaceOnRoot(now time.Time, root string, pathsOnR
 	c.Log(logger.Warn,
 		"free space on %s (%s) is below the configured minimum (%s); force-deleting oldest recordings "+
 			"(older than %s, excluding each path's most recent segment) until it recovers",
-		root, bytefmt.ByteSize(free), bytefmt.ByteSize(uint64(c.RecordMinFreeSpace)), minFreeSpaceProtectedAge)
+		root, bytefmt.ByteSize(free), bytefmt.ByteSize(uint64(minFreeSpace)), minFreeSpaceProtectedAge)
 
 	for _, seg := range segments {
-		if free >= uint64(c.RecordMinFreeSpace) {
+		if free >= uint64(minFreeSpace) {
 			break
 		}
 

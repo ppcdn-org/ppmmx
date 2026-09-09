@@ -485,24 +485,6 @@ type Conf struct {
 	// different downstream mmx node.
 	ForwardMmxEnable bool `json:"forwardMmxEnable"`
 
-	// Record cleaner: RecordMinFreeSpace is a floor on free disk space on
-	// the filesystem holding recordings, checked on every cleaner run
-	// alongside the existing per-path recordDeleteAfter age-based
-	// deletion. If free space is still below this after the age-based
-	// pass, the cleaner force-deletes the globally oldest recording
-	// segments (across all paths, oldest first) until back above it.
-	// This is a safety net for recordDeleteAfter windows too long (or
-	// bitrate too high) for the available disk - see
-	// docs/recorder-api.md for the incident this was added for (a 48G
-	// disk filling up well within the 24h recordDeleteAfter window).
-	//
-	// Never deletes a segment younger than 10 minutes, nor a path's
-	// single most recent segment (which may still be open/actively
-	// written to) - see recordcleaner.minFreeSpaceProtectedAge. Free
-	// space can stay below this floor if that's what it takes to avoid
-	// touching an in-progress recording.
-	RecordMinFreeSpace StringSize `json:"recordMinFreeSpace"`
-
 	// Admin web UI (integrated)
 	AdminAddress string `json:"adminAddress"`
 	AdminName    string `json:"adminName"`
@@ -700,7 +682,6 @@ func (conf *Conf) setDefaults() {
 		"?txSecret={txSecret}&txTime={txTime}"
 	conf.TencentWHIPTokenDays = 30
 	conf.ForwardMmxEnable = false
-	conf.RecordMinFreeSpace = 8 * 1024 * 1024 * 1024 // 8G
 	conf.AdminAddress = ":8080"
 	conf.PlaySignatureTTL = Duration(time.Hour)
 
