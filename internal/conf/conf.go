@@ -496,12 +496,10 @@ type Conf struct {
 	// PPCDN control plane
 	MMXControl               bool     `json:"mmxControl"`
 	MMXControlURL            string   `json:"mmxControlURL"`
-	MMXControlToken          string   `json:"-"` // from .env MMX_CONTROL_TOKEN; sent as the node's Authorization bearer, must match ppcenter's nodeAuth config
+	MMXNodeSecret            string   `json:"-"` // from .env MMX_NODE_SECRET; sent in registration and as the Authorization bearer
 	MMXNodeRole              string   `json:"mmxNodeRole"`
-	MMXNodeID                int      `json:"mmxNodeID"`
 	MMXNodeRegion            string   `json:"mmxNodeRegion"`
 	MMXNodeCapacity          int      `json:"mmxNodeCapacity"`
-	MMXNodePoolID            string   `json:"mmxNodePoolId"`
 	MMXHeartbeatInterval     Duration `json:"mmxHeartbeatInterval"`
 	MMXWebRTCBaseURL         string   `json:"mmxWebRTCBaseURL"`
 	MMXPublishURL            string   `json:"mmxPublishURL"`
@@ -726,7 +724,7 @@ func Load(fpath string, defaultConfPaths []string, l logger.Writer) (*Conf, stri
 	conf.WebRTCDegradeWSSecret = DotenvValue("WHIP_WS_SECRET")
 	conf.WebRTCWHIPAuthKey = DotenvValue("WHIP_AUTH_KEY")
 	conf.WebRTCForwardSecret = DotenvValue("MMX_FORWARD_SECRET")
-	conf.MMXControlToken = DotenvValue("MMX_CONTROL_TOKEN")
+	conf.MMXNodeSecret = DotenvValue("MMX_NODE_SECRET")
 	// bin/.env keys: "prod" selects S3, anything else selects MinIO.
 	conf.NetStorageEnv = DotenvValue("APP_ENV")
 	conf.NetStorageS3Bucket = DotenvValue("S3_BUCKET")
@@ -1258,11 +1256,8 @@ func (conf *Conf) Validate(l logger.Writer) error {
 		if conf.MMXNodeRole != "NODE_ROLE_ORIGIN" && conf.MMXNodeRole != "NODE_ROLE_EDGE" && conf.MMXNodeRole != "NODE_ROLE_RECORDER" {
 			return fmt.Errorf("'mmxNodeRole' must be NODE_ROLE_ORIGIN, NODE_ROLE_EDGE or NODE_ROLE_RECORDER")
 		}
-		if strings.TrimSpace(conf.MMXControlToken) == "" {
-			return fmt.Errorf("MMX_CONTROL_TOKEN must be set (in .env) when mmxControl is true")
-		}
-		if conf.MMXNodeID <= 0 {
-			return fmt.Errorf("'mmxNodeID' must be greater than zero")
+		if strings.TrimSpace(conf.MMXNodeSecret) == "" {
+			return fmt.Errorf("MMX_NODE_SECRET must be set (in .env) when mmxControl is true")
 		}
 		if strings.TrimSpace(conf.MMXNodeRegion) == "" {
 			return fmt.Errorf("'mmxNodeRegion' is required")

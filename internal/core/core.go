@@ -813,9 +813,9 @@ func (p *Core) createResources(initial bool) error {
 	if p.conf.WebRTC && p.conf.MMXControl && p.mmxControl == nil {
 		p.mmxControl = mmxcontrol.New(p.ctx, mmxcontrol.Config{
 			URL:                   p.conf.MMXControlURL,
-			AuthToken:             p.conf.MMXControlToken,
-			Role:                  p.conf.MMXNodeRole,
-			NodeID:                int32(p.conf.MMXNodeID),
+			NodeSecret:            p.conf.MMXNodeSecret,
+			NodeType:              p.conf.MMXNodeRole,
+			DiskSerial:            mmxcontrol.DiskSerial(),
 			Version:               strings.TrimSpace(string(version)),
 			Region:                p.conf.MMXNodeRegion,
 			Capacity:              int32(p.conf.MMXNodeCapacity),
@@ -823,10 +823,9 @@ func (p *Core) createResources(initial bool) error {
 			WebRTCBaseURL:         p.conf.MMXWebRTCBaseURL,
 			PublishURL:            p.conf.MMXPublishURL,
 			ABRNegotiationAddress: p.conf.MMXABRNegotiationAddress,
-			PoolID:                p.conf.MMXNodePoolID,
 		}, func() []string { return nil }, p)
 		p.mmxControl.SetHTTPFallback(mmxcontrol.DeriveFallbackURL(p.conf.MMXControlURL),
-			p.conf.MMXControlToken, 10*time.Second)
+			p.conf.MMXNodeSecret, 10*time.Second)
 	}
 	if p.conf.WebRTC && p.conf.MMXRecordingSyncEnabled && p.recordingSync == nil {
 		p.recordingSync = mmxcontrol.NewRecordingSyncClient(
@@ -840,7 +839,7 @@ func (p *Core) createResources(initial bool) error {
 	// file once its upload succeeds (see recording.SplitRecFileReporter and
 	// ppcenter's POST /internal/mmx/v1/records/split-rec-files). Reuses
 	// mmxControl's own endpoint/credential (MMXControlURL +
-	// MMXControlToken, the same node auth every other node-to-ppcenter
+	// MMXNodeSecret, the same node auth every other node-to-ppcenter
 	// call already uses) rather than the separate, opt-in
 	// mmxRecordingSyncEnabled path above: every deployment that has
 	// mmxControl on (which split-rec's record nodes already do) gets
@@ -851,7 +850,7 @@ func (p *Core) createResources(initial bool) error {
 	if p.conf.WebRTC && p.conf.MMXControl && p.splitHandler != nil {
 		p.splitHandler.SetSplitRecFileReporter(splitRecFileReporterAdapter{client: mmxcontrol.NewRecordingSyncClient(
 			mmxcontrol.DeriveFallbackURL(p.conf.MMXControlURL),
-			p.conf.MMXControlToken,
+			p.conf.MMXNodeSecret,
 			10*time.Second,
 		)})
 	}

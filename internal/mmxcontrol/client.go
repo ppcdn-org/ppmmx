@@ -8,6 +8,9 @@ import (
 	"math/rand/v2"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -21,12 +24,12 @@ import (
 
 var errReconnectHint = errors.New("RECONNECT_HINT received")
 
-// Config contains the legacy ppcenter WorkerIndication identity.
+// Config contains the MMX node identity and static endpoint configuration.
 type Config struct {
 	URL                   string
-	AuthToken             string // sent as "Authorization: Bearer <token>" on both the WS dial and the HTTP fallback; must match ppcenter's nodeAuth.bearerToken (or a nodeAuth.nodeTokens entry)
-	Role                  string
-	NodeID                int32
+	NodeSecret            string // sent as the Authorization bearer on MMX connections
+	NodeType              string
+	DiskSerial            string
 	Version               string
 	Region                string
 	Capacity              int32
@@ -34,7 +37,6 @@ type Config struct {
 	WebRTCBaseURL         string
 	PublishURL            string
 	ABRNegotiationAddress string
-	PoolID                string
 }
 
 // Client sends registration and heartbeat indications to ppcenter.
@@ -77,7 +79,7 @@ func (c *Client) Close() {
 
 func (c *Client) SetHTTPFallback(baseURL, token string, timeout time.Duration) {
 	if baseURL != "" {
-		c.fallback = NewHTTPFallbackClient(baseURL, token, timeout, c.indication, c.parent)
+		c.fallback = NewHTTPFallbackClient(baseURL, token, timeout, c.heartbeat, c.parent)
 	}
 }
 
@@ -166,8 +168,8 @@ func (c *Client) run(ctx context.Context) {
 
 func (c *Client) connect(ctx context.Context) error {
 	var header http.Header
-	if c.config.AuthToken != "" {
-		header = http.Header{"Authorization": []string{"Bearer " + c.config.AuthToken}}
+	if c.config.NodeSecret != "" {
+		header = http.Header{"Authorization": []string{"Bearer " + c.config.NodeSecret}}
 	}
 	conn, _, err := websocket.DefaultDialer.DialContext(ctx, c.config.URL, header)
 	if err != nil {
@@ -178,7 +180,9 @@ func (c *Client) connect(ctx context.Context) error {
 	c.outageLogged = false
 
 	readErr := make(chan error, 1)
+	ack := make(chan error, 1)
 	go func() {
+		registered := false
 		for {
 			_, data, err := conn.ReadMessage()
 			if err != nil {
@@ -190,15 +194,38 @@ func (c *Client) connect(ctx context.Context) error {
 				readErr <- errReconnectHint
 				return
 			}
+			if accepted, reason, ok := decodeNodeRegisterAck(data); ok && !registered {
+				if accepted {
+					registered = true
+					ack <- nil
+				} else {
+					ack <- errors.New("MMX node registration rejected: " + reason)
+					return
+				}
+			}
 		}
 	}()
 
-	send := func() error {
+	if err := func() error {
 		conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-		return conn.WriteMessage(websocket.BinaryMessage, c.indication())
-	}
-	if err := send(); err != nil {
+		return conn.WriteMessage(websocket.BinaryMessage, c.registration())
+	}(); err != nil {
 		return err
+	}
+	select {
+	case err := <-ack:
+		if err != nil {
+			return err
+		}
+	case err := <-readErr:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+
+	sendHeartbeat := func() error {
+		conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+		return conn.WriteMessage(websocket.BinaryMessage, c.heartbeat())
 	}
 
 	ticker := time.NewTicker(c.config.HeartbeatInterval)
@@ -212,43 +239,104 @@ func (c *Client) connect(ctx context.Context) error {
 		case err := <-readErr:
 			return err
 		case <-ticker.C:
-			if err := send(); err != nil {
+			if err := sendHeartbeat(); err != nil {
 				return err
 			}
 		}
 	}
 }
 
-func (c *Client) indication() []byte {
+func (c *Client) registration() []byte {
+	var out []byte
+	out = appendString(out, 1, "COMMAND_TYPE_REGISTER")
+	out = appendString(out, 2, c.config.NodeSecret)
+	out = appendString(out, 3, c.config.NodeType)
+	out = appendString(out, 4, c.config.DiskSerial)
+	out = appendString(out, 5, c.config.Version)
+	out = appendString(out, 6, c.config.Region)
+	if value := strings.TrimSpace(c.config.WebRTCBaseURL); value != "" {
+		out = appendString(out, 7, value)
+	}
+	if value := strings.TrimSpace(c.config.PublishURL); value != "" {
+		out = appendString(out, 8, value)
+	}
+	if value := strings.TrimSpace(c.config.ABRNegotiationAddress); value != "" {
+		out = appendString(out, 9, value)
+	}
+	return out
+}
+
+func (c *Client) heartbeat() []byte {
 	pipelines := append([]string(nil), c.snapshot()...)
 	sort.Strings(pipelines)
 	pipelines = deduplicate(pipelines)
 
 	var out []byte
-	out = appendString(out, 1, "COMMAND_TYPE_INDICATION")
-	out = appendString(out, 2, c.config.Role)
-	out = protowire.AppendTag(out, 3, protowire.VarintType)
-	out = protowire.AppendVarint(out, uint64(uint32(c.config.NodeID)<<1))
-	out = appendString(out, 4, c.config.Version)
-	out = appendString(out, 5, c.config.Region)
-	out = protowire.AppendTag(out, 6, protowire.VarintType)
+	out = appendString(out, 1, "COMMAND_TYPE_HEARTBEAT")
+	out = protowire.AppendTag(out, 2, protowire.VarintType)
 	out = protowire.AppendVarint(out, uint64(c.config.Capacity))
 	for _, pipeline := range pipelines {
-		out = appendString(out, 7, pipeline)
-	}
-	if value := strings.TrimSpace(c.config.WebRTCBaseURL); value != "" {
-		out = appendString(out, 8, value)
-	}
-	if value := strings.TrimSpace(c.config.PublishURL); value != "" {
-		out = appendString(out, 9, value)
-	}
-	if value := strings.TrimSpace(c.config.ABRNegotiationAddress); value != "" {
-		out = appendString(out, 10, value)
-	}
-	if value := strings.TrimSpace(c.config.PoolID); value != "" {
-		out = appendString(out, 11, value)
+		out = appendString(out, 3, pipeline)
 	}
 	return out
+}
+
+func decodeNodeRegisterAck(data []byte) (accepted bool, reason string, ok bool) {
+	var msgType string
+	for len(data) > 0 {
+		number, wireType, n := protowire.ConsumeTag(data)
+		if n < 0 {
+			return false, "", false
+		}
+		data = data[n:]
+		switch number {
+		case 1:
+			value, n := protowire.ConsumeString(data)
+			if n < 0 {
+				return false, "", false
+			}
+			msgType = value
+			data = data[n:]
+		case 2:
+			value, n := protowire.ConsumeVarint(data)
+			if n < 0 {
+				return false, "", false
+			}
+			accepted = value != 0
+			data = data[n:]
+		case 3:
+			value, n := protowire.ConsumeString(data)
+			if n < 0 {
+				return false, "", false
+			}
+			reason = value
+			data = data[n:]
+		default:
+			n := protowire.ConsumeFieldValue(number, wireType, data)
+			if n < 0 {
+				return false, "", false
+			}
+			data = data[n:]
+		}
+	}
+	return accepted, reason, msgType == "COMMAND_TYPE_REGISTER_ACK"
+}
+
+// DiskSerial returns a best-effort serial without invoking an external command.
+func DiskSerial() string {
+	if runtime.GOOS != "linux" {
+		return ""
+	}
+	entries, err := os.ReadDir("/sys/block")
+	if err != nil {
+		return ""
+	}
+	for _, entry := range entries {
+		if value, err := os.ReadFile(filepath.Join("/sys/block", entry.Name(), "device", "serial")); err == nil && strings.TrimSpace(string(value)) != "" {
+			return strings.TrimSpace(string(value))
+		}
+	}
+	return ""
 }
 
 func appendString(out []byte, number protowire.Number, value string) []byte {

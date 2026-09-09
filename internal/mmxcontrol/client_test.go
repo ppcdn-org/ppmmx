@@ -20,30 +20,29 @@ type testLogger struct{}
 
 func (testLogger) Log(logger.Level, string, ...any) {}
 
-func TestClientSendsRegistrationAndHeartbeat(t *testing.T) {
+func TestClientSendsRegistrationThenHeartbeat(t *testing.T) {
 	messages := make(chan []byte, 4)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		conn, err := (&websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}).Upgrade(w, r, nil)
-		require.NoError(t, err)
-		defer conn.Close()
-		for {
-			messageType, payload, err := conn.ReadMessage()
-			if err != nil {
-				return
-			}
-			require.Equal(t, websocket.BinaryMessage, messageType)
-			messages <- payload
+	server := newControlServer(t, func(conn *websocket.Conn) {
+		_, registration, err := conn.ReadMessage()
+		if err != nil {
+			return
 		}
-	}))
+		messages <- registration
+		require.NoError(t, conn.WriteMessage(websocket.BinaryMessage, registerAck(true, "")))
+		_, heartbeat, err := conn.ReadMessage()
+		if err == nil {
+			messages <- heartbeat
+		}
+	})
 	defer server.Close()
 
 	var mu sync.Mutex
 	pipelines := []string{"app/b", "app/a", "app/a"}
 	client := New(context.Background(), Config{
-		URL:  strings.Replace(server.URL, "http://", "ws://", 1),
-		Role: "NODE_ROLE_EDGE", NodeID: 7, Version: "1.0", Region: "Sydney",
-		Capacity: 100, HeartbeatInterval: 20 * time.Millisecond,
-		WebRTCBaseURL: "https://edge.example",
+		URL: strings.Replace(server.URL, "http://", "ws://", 1), NodeSecret: "node-secret",
+		NodeType: "NODE_ROLE_EDGE", DiskSerial: "disk-123", Version: "1.0", Region: "Sydney",
+		Capacity: 100, HeartbeatInterval: 20 * time.Millisecond, WebRTCBaseURL: "https://edge.example",
+		PublishURL: "https://publish.example", ABRNegotiationAddress: "abr.example:443",
 	}, func() []string {
 		mu.Lock()
 		defer mu.Unlock()
@@ -51,99 +50,85 @@ func TestClientSendsRegistrationAndHeartbeat(t *testing.T) {
 	}, testLogger{})
 	defer client.Close()
 
-	fields := decodeIndication(t, awaitMessage(t, messages))
-	require.Equal(t, "COMMAND_TYPE_INDICATION", fields.msgType)
-	require.Equal(t, "NODE_ROLE_EDGE", fields.role)
-	require.Equal(t, int32(7), fields.nodeID)
-	require.Equal(t, []string{"app/a", "app/b"}, fields.pipelines)
-	require.Equal(t, "https://edge.example", fields.webRTCBaseURL)
+	registration := decodeMessage(t, awaitMessage(t, messages))
+	require.Equal(t, messageFields{
+		msgType: "COMMAND_TYPE_REGISTER", nodeSecret: "node-secret", nodeType: "NODE_ROLE_EDGE",
+		diskSerial: "disk-123", version: "1.0", region: "Sydney", webRTCBaseURL: "https://edge.example",
+		publishURL: "https://publish.example", abrAddress: "abr.example:443",
+	}, registration)
 
 	mu.Lock()
 	pipelines = []string{"app/c"}
 	mu.Unlock()
-	require.Equal(t, []string{"app/c"}, decodeIndication(t, awaitMessage(t, messages)).pipelines)
+	heartbeat := decodeMessage(t, awaitMessage(t, messages))
+	require.Equal(t, "COMMAND_TYPE_HEARTBEAT", heartbeat.msgType)
+	require.Equal(t, int32(100), heartbeat.capacity)
+	require.Equal(t, []string{"app/c"}, heartbeat.pipelines)
+	require.Empty(t, heartbeat.nodeSecret)
+	require.Empty(t, heartbeat.nodeType)
+	require.Empty(t, heartbeat.region)
 }
 
-func TestClientSendsAuthorizationHeader(t *testing.T) {
-	headers := make(chan string, 1)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		headers <- r.Header.Get("Authorization")
-		conn, err := (&websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}).Upgrade(w, r, nil)
-		require.NoError(t, err)
-		defer conn.Close()
-		_, _, _ = conn.ReadMessage()
-	}))
-	defer server.Close()
-
-	client := New(context.Background(), Config{
-		URL:       strings.Replace(server.URL, "http://", "ws://", 1),
-		AuthToken: "s3cr3t-node-token",
-		Role:      "NODE_ROLE_ORIGIN", NodeID: 1, Region: "Tokyo",
-		Capacity: 10, HeartbeatInterval: time.Second,
-	}, func() []string { return nil }, testLogger{})
-	defer client.Close()
-
-	select {
-	case got := <-headers:
-		require.Equal(t, "Bearer s3cr3t-node-token", got)
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for dial")
-	}
-}
-
-// An unset AuthToken must leave the dial unauthenticated rather than send a
-// bare "Bearer ", so a control plane with no nodeAuth configured keeps working.
-func TestClientOmitsAuthorizationHeaderWithoutToken(t *testing.T) {
-	headers := make(chan string, 1)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Non-blocking: the client redials once the handler returns, and a
-		// blocking send would wedge that second handler goroutine.
-		select {
-		case headers <- r.Header.Get("Authorization"):
-		default:
+func TestClientWaitsForAcceptedRegistration(t *testing.T) {
+	heartbeat := make(chan struct{}, 1)
+	server := newControlServer(t, func(conn *websocket.Conn) {
+		_, _, err := conn.ReadMessage()
+		if err != nil {
+			return
 		}
+		time.Sleep(80 * time.Millisecond)
+		_ = conn.WriteMessage(websocket.BinaryMessage, registerAck(true, ""))
+		if _, _, err = conn.ReadMessage(); err == nil {
+			heartbeat <- struct{}{}
+		}
+	})
+	defer server.Close()
+	client := newTestClient(server.URL)
+	defer client.Close()
+
+	select {
+	case <-heartbeat:
+		t.Fatal("heartbeat sent before registration was accepted")
+	case <-time.After(50 * time.Millisecond):
+	}
+	select {
+	case <-heartbeat:
+	case <-time.After(time.Second):
+		t.Fatal("heartbeat not sent after registration was accepted")
+	}
+}
+
+func TestClientReconnectsAfterRejectedRegistration(t *testing.T) {
+	connections := make(chan struct{}, 2)
+	server := newControlServer(t, func(conn *websocket.Conn) {
+		connections <- struct{}{}
+		_, _, err := conn.ReadMessage()
+		if err == nil {
+			_ = conn.WriteMessage(websocket.BinaryMessage, registerAck(false, "invalid secret"))
+		}
+	})
+	defer server.Close()
+	client := newTestClient(server.URL)
+	defer client.Close()
+	awaitConnection(t, connections)
+	awaitConnection(t, connections)
+}
+
+func TestClientSendsNodeSecretAuthorization(t *testing.T) {
+	header := make(chan string, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		header <- r.Header.Get("Authorization")
 		conn, err := (&websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}).Upgrade(w, r, nil)
-		require.NoError(t, err)
+		if err != nil {
+			return
+		}
 		defer conn.Close()
 		_, _, _ = conn.ReadMessage()
 	}))
 	defer server.Close()
-
-	client := New(context.Background(), Config{
-		URL:  strings.Replace(server.URL, "http://", "ws://", 1),
-		Role: "NODE_ROLE_ORIGIN", NodeID: 1, Region: "Tokyo",
-		Capacity: 10, HeartbeatInterval: time.Second,
-	}, func() []string { return nil }, testLogger{})
+	client := newTestClient(server.URL)
 	defer client.Close()
-
-	select {
-	case got := <-headers:
-		require.Empty(t, got)
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for dial")
-	}
-}
-
-func TestClientReconnects(t *testing.T) {
-	connections := make(chan struct{}, 2)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		conn, err := (&websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}).Upgrade(w, r, nil)
-		require.NoError(t, err)
-		connections <- struct{}{}
-		_, _, _ = conn.ReadMessage()
-		conn.Close()
-	}))
-	defer server.Close()
-
-	client := New(context.Background(), Config{
-		URL:  strings.Replace(server.URL, "http://", "ws://", 1),
-		Role: "NODE_ROLE_ORIGIN", NodeID: 1, Region: "Tokyo",
-		Capacity: 10, HeartbeatInterval: time.Second,
-	}, func() []string { return nil }, testLogger{})
-	defer client.Close()
-
-	awaitConnection(t, connections)
-	awaitConnection(t, connections)
+	require.Equal(t, "Bearer node-secret", <-header)
 }
 
 func TestDeriveFallbackURL(t *testing.T) {
@@ -152,13 +137,43 @@ func TestDeriveFallbackURL(t *testing.T) {
 	require.Empty(t, DeriveFallbackURL("://not-a-url"))
 }
 
+func newControlServer(t *testing.T, handle func(*websocket.Conn)) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := (&websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}).Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		handle(conn)
+	}))
+}
+
+func newTestClient(serverURL string) *Client {
+	return New(context.Background(), Config{
+		URL: strings.Replace(serverURL, "http://", "ws://", 1), NodeSecret: "node-secret",
+		NodeType: "NODE_ROLE_ORIGIN", Region: "Tokyo", Capacity: 10, HeartbeatInterval: 20 * time.Millisecond,
+	}, func() []string { return nil }, testLogger{})
+}
+
+func registerAck(accepted bool, reason string) []byte {
+	out := appendString(nil, 1, "COMMAND_TYPE_REGISTER_ACK")
+	out = protowire.AppendTag(out, 2, protowire.VarintType)
+	if accepted {
+		out = protowire.AppendVarint(out, 1)
+	} else {
+		out = protowire.AppendVarint(out, 0)
+	}
+	return appendString(out, 3, reason)
+}
+
 func awaitMessage(t *testing.T, messages <-chan []byte) []byte {
 	t.Helper()
 	select {
 	case message := <-messages:
 		return message
 	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for indication")
+		t.Fatal("timed out waiting for message")
 		return nil
 	}
 }
@@ -172,45 +187,55 @@ func awaitConnection(t *testing.T, connections <-chan struct{}) {
 	}
 }
 
-type indicationFields struct {
-	msgType       string
-	role          string
-	nodeID        int32
-	pipelines     []string
-	webRTCBaseURL string
+type messageFields struct {
+	msgType, nodeSecret, nodeType, diskSerial, version, region string
+	webRTCBaseURL, publishURL, abrAddress                      string
+	capacity                                                   int32
+	pipelines                                                  []string
 }
 
-func decodeIndication(t *testing.T, payload []byte) indicationFields {
+func decodeMessage(t *testing.T, payload []byte) messageFields {
 	t.Helper()
-	var fields indicationFields
+	var fields messageFields
 	for len(payload) > 0 {
-		number, wireType, consumed := protowire.ConsumeTag(payload)
-		require.Greater(t, consumed, 0)
-		payload = payload[consumed:]
-		switch wireType {
-		case protowire.BytesType:
-			value, n := protowire.ConsumeString(payload)
-			require.Greater(t, n, 0)
-			payload = payload[n:]
-			switch number {
-			case 1:
-				fields.msgType = value
-			case 2:
-				fields.role = value
-			case 7:
-				fields.pipelines = append(fields.pipelines, value)
-			case 8:
-				fields.webRTCBaseURL = value
-			}
-		case protowire.VarintType:
+		number, wireType, n := protowire.ConsumeTag(payload)
+		require.Greater(t, n, 0)
+		payload = payload[n:]
+		if wireType == protowire.VarintType {
 			value, n := protowire.ConsumeVarint(payload)
 			require.Greater(t, n, 0)
 			payload = payload[n:]
-			if number == 3 {
-				fields.nodeID = int32(value >> 1)
+			if number == 2 {
+				fields.capacity = int32(value)
 			}
-		default:
-			t.Fatalf("unsupported wire type %v", wireType)
+			continue
+		}
+		value, n := protowire.ConsumeString(payload)
+		require.Greater(t, n, 0)
+		payload = payload[n:]
+		if fields.msgType == "COMMAND_TYPE_HEARTBEAT" && number == 3 {
+			fields.pipelines = append(fields.pipelines, value)
+			continue
+		}
+		switch number {
+		case 1:
+			fields.msgType = value
+		case 2:
+			fields.nodeSecret = value
+		case 3:
+			fields.nodeType = value
+		case 4:
+			fields.diskSerial = value
+		case 5:
+			fields.version = value
+		case 6:
+			fields.region = value
+		case 7:
+			fields.webRTCBaseURL = value
+		case 8:
+			fields.publishURL = value
+		case 9:
+			fields.abrAddress = value
 		}
 	}
 	return fields

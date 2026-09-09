@@ -78,30 +78,28 @@ func TestConf(t *testing.T) {
 }
 
 func TestConfMMXControl(t *testing.T) {
-	t.Setenv("MMX_CONTROL_TOKEN", "test-control-token")
+	t.Setenv("MMX_NODE_SECRET", "test-control-token")
 	data := "mmxControl: yes\nmmxControlURL: ws://center.example/ws/mmx\n" +
-		"mmxNodeRole: NODE_ROLE_EDGE\nmmxNodeID: 7\nmmxNodeRegion: Sydney\n" +
+		"mmxNodeRole: NODE_ROLE_EDGE\nmmxNodeRegion: Sydney\n" +
 		"mmxNodeCapacity: 100\nmmxHeartbeatInterval: 10s\n" +
 		"mmxWebRTCBaseURL: https://edge.example\npaths:\n  all:\n"
 	loaded, _, err := Load(createTempFile(t, []byte(data)), nil, nil)
 	require.NoError(t, err)
 	require.True(t, loaded.MMXControl)
-	require.Equal(t, 7, loaded.MMXNodeID)
 	require.Equal(t, 10*time.Second, time.Duration(loaded.MMXHeartbeatInterval))
-	require.Equal(t, "test-control-token", loaded.MMXControlToken)
+	require.Equal(t, "test-control-token", loaded.MMXNodeSecret)
 }
 
 func TestConfMMXControlValidation(t *testing.T) {
-	t.Setenv("MMX_CONTROL_TOKEN", "test-control-token")
+	t.Setenv("MMX_NODE_SECRET", "test-control-token")
 	base := "mmxControl: yes\nmmxControlURL: ws://center.example/ws/mmx\n" +
-		"mmxNodeRole: NODE_ROLE_EDGE\nmmxNodeID: 7\nmmxNodeRegion: Sydney\n" +
+		"mmxNodeRole: NODE_ROLE_EDGE\nmmxNodeRegion: Sydney\n" +
 		"mmxNodeCapacity: 100\nmmxWebRTCBaseURL: https://edge.example\n"
 	for _, ca := range []struct{ name, override, clearEnv string }{
 		{name: "bad URL", override: "mmxControlURL: http://center.example\n"},
 		{name: "bad role", override: "mmxNodeRole: NODE_ROLE_BOGUS\n"},
-		{name: "bad ID", override: "mmxNodeID: 0\n"},
 		{name: "bad capacity", override: "mmxNodeCapacity: 0\n"},
-		{name: "missing token", clearEnv: "MMX_CONTROL_TOKEN"},
+		{name: "missing token", clearEnv: "MMX_NODE_SECRET"},
 	} {
 		t.Run(ca.name, func(t *testing.T) {
 			if ca.clearEnv != "" {
