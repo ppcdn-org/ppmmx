@@ -144,6 +144,7 @@ type Core struct {
 	mmxControl      *mmxcontrol.Client
 	recordingSync   *mmxcontrol.RecordingSyncClient
 	segmentReporter *mmxcontrol.SegmentReporter
+	trafficUsage    *TrafficUsageSampler
 	srtServer       *srt.Server
 	moqServer       *moq.Server
 	api             *api.API
@@ -855,6 +856,26 @@ func (p *Core) createResources(initial bool) error {
 		)})
 	}
 
+	// trafficUsage meters downstream (Edge→viewer) bytes for usage-based
+	// billing (see docs/design/ppcdn-billing-and-traffic-monitoring.zh-CN.md
+	// §2) by polling webRTCServer's own session list - it needs
+	// p.webRTCServer itself (not just splitHandler existing), so it's gated
+	// and (re)wired independently of the reporter above. Same endpoint/
+	// credential reuse as recordingSync/segmentReporter: no separate opt-in
+	// flag, every mmxControl deployment gets it.
+	if p.conf.WebRTC && p.conf.MMXControl && p.webRTCServer != nil && p.trafficUsage == nil {
+		p.trafficUsage = &TrafficUsageSampler{
+			Server: p.webRTCServer,
+			Reporter: mmxcontrol.NewTrafficUsageClient(
+				mmxcontrol.DeriveFallbackURL(p.conf.MMXControlURL),
+				p.conf.MMXNodeSecret,
+				10*time.Second,
+			),
+			Parent: p,
+		}
+		p.trafficUsage.Initialize()
+	}
+
 	if p.conf.SRT &&
 		p.srtServer == nil {
 		i := &srt.Server{
@@ -1360,6 +1381,10 @@ func (p *Core) closeResources(newConf *conf.Conf, calledByAPI bool) {
 	if closeWebRTCServer && p.webRTCServer != nil {
 		p.webRTCServer.Close()
 		p.webRTCServer = nil
+		if p.trafficUsage != nil {
+			p.trafficUsage.Close()
+			p.trafficUsage = nil
+		}
 	}
 	if (newConf == nil || !newConf.WebRTC || closePathManager) && p.recMgr != nil {
 		_ = p.recMgr.Close()
