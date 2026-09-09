@@ -18,7 +18,6 @@ logFile: logs/mmx-edge.log
 mmxControl: true
 mmxControlURL: ws://127.0.0.1:18000/ws/mmx
 mmxNodeRole: NODE_ROLE_EDGE
-mmxNodeID: 1
 mmxNodeRegion: local
 mmxNodeCapacity: 300
 mmxHeartbeatInterval: 10s

@@ -196,6 +196,24 @@ func (c *conn) runPublishReader(sconn srt.Conn, streamID *streamID, pathConf *co
 		return err
 	}
 
+	videoTracks, err := mpegts.ValidateVideoTracks(r.Tracks())
+	if err != nil {
+		return err
+	}
+	if len(videoTracks) > 1 {
+		c.Log(logger.Info, "SRT publish contains %d H264 video tracks; treating them as a simulcast ladder (highest quality first)", len(videoTracks))
+		for i, track := range videoTracks {
+			elementaryOrder := 0
+			for j, candidate := range r.Tracks() {
+				if candidate == track {
+					elementaryOrder = j + 1
+					break
+				}
+			}
+			c.Log(logger.Info, "simulcast layer %d: MPEG-TS elementary stream order %d, PID %d", i, elementaryOrder, track.PID)
+		}
+	}
+
 	decodeErrors := &errordumper.Dumper{
 		OnReport: func(val uint64, last error) {
 			if val == 1 {

@@ -14,7 +14,6 @@ logFile: logs/mmx-record.log
 mmxControl: true
 mmxControlURL: ws://127.0.0.1:18000/ws/mmx
 mmxNodeRole: NODE_ROLE_RECORDER
-mmxNodeID: 1
 mmxNodeRegion: local
 mmxNodeCapacity: 100
 mmxHeartbeatInterval: 10s

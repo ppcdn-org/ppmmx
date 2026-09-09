@@ -80,6 +80,9 @@ func (s *Source) runReader(sconn srt.Conn) error {
 	if err != nil {
 		return err
 	}
+	if _, err = mpegts.ValidateVideoTracks(r.Tracks()); err != nil {
+		return err
+	}
 
 	decodeErrors := &errordumper.Dumper{
 		OnReport: func(val uint64, last error) {

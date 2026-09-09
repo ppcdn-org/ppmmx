@@ -19,3 +19,10 @@ If you need to use the standard stream ID syntax instead of the custom one in us
 If you want to publish a stream by using a client in listening mode (i.e. with `mode=listener` appended to the URL), read the next section.
 
 Some clients that can publish with SRT are [FFmpeg](17-ffmpeg.md), [GStreamer](18-gstreamer.md), [OBS Studio](19-obs-studio.md).
+
+An SRT MPEG-TS publish may contain a simulcast ladder with up to four H264
+video elementary streams. The elementary streams must be ordered from highest
+quality to lowest quality. MediaMTX preserves that order as layer indices
+`0..N-1` for WebRTC simulcast and layer forwarding. A publish containing more
+than one video stream must contain H264 video only; single-video publishes
+retain the other supported video codec behavior.
