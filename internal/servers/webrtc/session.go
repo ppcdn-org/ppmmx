@@ -29,6 +29,7 @@ import (
 	"github.com/bluenviron/mediamtx/internal/protocols/webrtc"
 	wsproto "github.com/bluenviron/mediamtx/internal/protocols/websocket"
 	"github.com/bluenviron/mediamtx/internal/protocols/whip"
+	"github.com/bluenviron/mediamtx/internal/recvstats"
 	"github.com/bluenviron/mediamtx/internal/stream"
 )
 
@@ -782,6 +783,7 @@ func (s *session) runPublish(req *initialRequestReq) (int, error) {
 			s.pathName, startInfo.reconnectCount, startInfo.streamingSince.Format(time.RFC3339))
 	}
 	go s.runPublishStatsSummary()
+	go s.runReceiveStatsSummary(pc)
 
 	select {
 	case <-pc.Failed():
@@ -1152,6 +1154,33 @@ func (s *session) runPublishStatsSummary() {
 			elapsed, reconnects := s.parent.publishStatsSummary(s.pathName)
 			s.Log(logger.Info, "[publish-stats] path=%s streaming for %s, %d reconnect(s) so far",
 				s.pathName, elapsed.Round(time.Second), reconnects)
+
+		case <-s.ctx.Done():
+			return
+		}
+	}
+}
+
+// runReceiveStatsSummary logs this WHIP publish session's receive bitrate
+// and RTP packet-loss rate every recvstats.Interval, for the whole life of
+// the session. Independent of the degrade protocol (runDegradeSampling only
+// runs when webrtcDegradeEnable is set): ingest receive stats are wanted for
+// every publish regardless of config.
+func (s *session) runReceiveStatsSummary(pc *webrtc.PeerConnection) {
+	ticker := time.NewTicker(recvstats.Interval)
+	defer ticker.Stop()
+
+	var sampler recvstats.Sampler
+	st := pc.Stats()
+	sampler.Sample(st.BytesReceived, st.RTPPacketsReceived, st.RTPPacketsLost, time.Now()) // seed baseline
+
+	for {
+		select {
+		case <-ticker.C:
+			st := pc.Stats()
+			if snap, ok := sampler.Sample(st.BytesReceived, st.RTPPacketsReceived, st.RTPPacketsLost, time.Now()); ok {
+				s.Log(logger.Info, "%s", snap.LogLine("whip", s.pathName))
+			}
 
 		case <-s.ctx.Done():
 			return

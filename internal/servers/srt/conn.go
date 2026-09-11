@@ -21,6 +21,7 @@ import (
 	"github.com/bluenviron/mediamtx/internal/hooks"
 	"github.com/bluenviron/mediamtx/internal/logger"
 	"github.com/bluenviron/mediamtx/internal/protocols/mpegts"
+	"github.com/bluenviron/mediamtx/internal/recvstats"
 	"github.com/bluenviron/mediamtx/internal/stream"
 )
 
@@ -266,10 +267,48 @@ func (c *conn) runPublishReader(sconn srt.Conn, streamID *streamID, pathConf *co
 	c.sconn = sconn
 	c.mutex.Unlock()
 
+	// log ingest receive bitrate + packet-loss every recvstats.Interval for
+	// the life of this publish (stops when the read loop below returns).
+	statsDone := make(chan struct{})
+	defer close(statsDone)
+	go c.runReceiveStatsSummary(sconn, streamID.path, statsDone)
+
 	for {
 		err = r.Read()
 		if err != nil {
 			return err
+		}
+	}
+}
+
+// runReceiveStatsSummary periodically logs this SRT publish connection's
+// receive bitrate and packet-loss rate, computed from the SRT socket's
+// accumulated byte/packet counters (same format as every other ingest
+// protocol - see recvstats).
+func (c *conn) runReceiveStatsSummary(sconn srt.Conn, pathName string, done <-chan struct{}) {
+	ticker := time.NewTicker(recvstats.Interval)
+	defer ticker.Stop()
+
+	var sampler recvstats.Sampler
+	var st srt.Statistics
+	sconn.Stats(&st)
+	sampler.Sample(st.Accumulated.ByteRecv, st.Accumulated.PktRecv, st.Accumulated.PktRecvLoss, time.Now()) // seed baseline
+
+	for {
+		select {
+		case <-ticker.C:
+			sconn.Stats(&st)
+			if snap, ok := sampler.Sample(
+				st.Accumulated.ByteRecv, st.Accumulated.PktRecv, st.Accumulated.PktRecvLoss, time.Now(),
+			); ok {
+				c.Log(logger.Info, "%s", snap.LogLine("srt", pathName))
+			}
+
+		case <-done:
+			return
+
+		case <-c.ctx.Done():
+			return
 		}
 	}
 }
