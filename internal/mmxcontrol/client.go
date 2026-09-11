@@ -24,6 +24,23 @@ import (
 
 var errReconnectHint = errors.New("RECONNECT_HINT received")
 
+// fallbackCyclesBeforeRetry bounds how many consecutive HTTP-fallback
+// heartbeat cycles run() will ride out before it unconditionally breaks
+// back out to try the WebSocket again (R1: a fallback that keeps
+// succeeding must not park the node on the degraded path forever, since
+// that channel can't carry ppcenter's WS-pushed commands). stableSessionCycles
+// is how many heartbeat intervals a WS session has to stay registered
+// before run() resets its reconnect backoff (R3); requiring a minimum,
+// rather than resetting on every successful dial, avoids degrading into a
+// tight retry loop when a connection is accepted and drops right away.
+// Both are expressed in HeartbeatInterval units rather than a fixed
+// wall-clock duration so they scale with whatever interval a deployment
+// configures.
+const (
+	fallbackCyclesBeforeRetry = 4
+	stableSessionCycles       = 2
+)
+
 // Config contains the MMX node identity and static endpoint configuration.
 type Config struct {
 	URL                   string
@@ -58,6 +75,13 @@ type Client struct {
 	// successful dial, so the next outage logs again. Only ever touched
 	// from the single goroutine run() spawns, so no lock needed.
 	outageLogged bool
+
+	// lastSessionDuration is how long the most recent WS session stayed
+	// registered before connect() returned, set by connect() just before
+	// it returns (zero if registration never completed). run() reads it
+	// to decide whether the reconnect backoff should reset (R3). Same
+	// single-goroutine reasoning as outageLogged applies, no lock needed.
+	lastSessionDuration time.Duration
 }
 
 // New starts a control-plane client.
@@ -120,35 +144,30 @@ func (c *Client) run(ctx context.Context) {
 		if !c.outageLogged {
 			c.parent.Log(logger.Warn, "MMX control connection lost: %v", err)
 		}
+		if c.lastSessionDuration >= stableSessionCycles*c.config.HeartbeatInterval {
+			backoff = time.Second
+		}
 
+		retryNow := false
 		if c.fallback != nil {
 			if !c.outageLogged {
 				c.parent.Log(logger.Info, "MMX control falling back to HTTP")
 			}
-			for {
-				if ctx.Err() != nil {
-					return
-				}
-				if hbErr := c.fallback.Heartbeat(ctx); hbErr != nil {
-					if !c.outageLogged {
-						c.parent.Log(logger.Warn, "MMX HTTP fallback heartbeat failed: %v", hbErr)
-					}
-					break
-				}
-				if _, pollErr := c.fallback.PollCommands(ctx); pollErr != nil {
-					if !c.outageLogged {
-						c.parent.Log(logger.Warn, "MMX HTTP fallback poll failed: %v", pollErr)
-					}
-					break
-				}
-				select {
-				case <-ctx.Done():
-					return
-				case <-time.After(c.config.HeartbeatInterval):
-				}
+			retryNow = c.runFallback(ctx)
+			if ctx.Err() != nil {
+				return
 			}
 		}
 		c.outageLogged = true
+
+		// A retryNow exit already waited fallbackCyclesBeforeRetry heartbeat
+		// cycles, which is by itself enough spacing between WS dial
+		// attempts - looping back immediately (skipping the backoff sleep
+		// below) is what lets run() actually retry the WebSocket instead of
+		// parking on a healthy fallback forever (R1).
+		if retryNow {
+			continue
+		}
 
 		if !errors.Is(err, errReconnectHint) {
 			delay := backoff + time.Duration(rand.Int64N(int64(backoff/2)+1))
@@ -166,7 +185,49 @@ func (c *Client) run(ctx context.Context) {
 	}
 }
 
+// runFallback keeps the node alive over HTTP while the WebSocket control
+// channel is down, for up to fallbackCyclesBeforeRetry heartbeat cycles.
+// It returns true if it rode out all of them without a failure, telling
+// run() to go try the WebSocket again; it returns false as soon as the
+// fallback itself fails, telling run() to fall through to its normal
+// backoff before the next WebSocket attempt.
+func (c *Client) runFallback(ctx context.Context) bool {
+	for cycle := 0; cycle < fallbackCyclesBeforeRetry; cycle++ {
+		if ctx.Err() != nil {
+			return false
+		}
+		if hbErr := c.fallback.Heartbeat(ctx); hbErr != nil {
+			if !c.outageLogged {
+				c.parent.Log(logger.Warn, "MMX HTTP fallback heartbeat failed: %v", hbErr)
+			}
+			return false
+		}
+		if _, pollErr := c.fallback.PollCommands(ctx); pollErr != nil {
+			if !c.outageLogged {
+				c.parent.Log(logger.Warn, "MMX HTTP fallback poll failed: %v", pollErr)
+			}
+			return false
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(c.config.HeartbeatInterval):
+		}
+	}
+	c.parent.Log(logger.Info, "MMX control retrying WebSocket after %d HTTP fallback cycles", fallbackCyclesBeforeRetry)
+	return true
+}
+
 func (c *Client) connect(ctx context.Context) error {
+	var registeredAt time.Time
+	defer func() {
+		if !registeredAt.IsZero() {
+			c.lastSessionDuration = time.Since(registeredAt)
+		} else {
+			c.lastSessionDuration = 0
+		}
+	}()
+
 	var header http.Header
 	if c.config.NodeSecret != "" {
 		header = http.Header{"Authorization": []string{"Bearer " + c.config.NodeSecret}}
@@ -222,6 +283,7 @@ func (c *Client) connect(ctx context.Context) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+	registeredAt = time.Now()
 
 	sendHeartbeat := func() error {
 		conn.SetWriteDeadline(time.Now().Add(10 * time.Second))

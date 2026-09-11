@@ -137,6 +137,170 @@ func TestDeriveFallbackURL(t *testing.T) {
 	require.Empty(t, DeriveFallbackURL("://not-a-url"))
 }
 
+// TestClientRetriesWebSocketWhileFallbackHealthy is R1's acceptance test: a
+// WebSocket dial that always fails, with an HTTP fallback that always
+// succeeds, must still see repeated dial attempts. Before the fix, the
+// fallback loop's only exit was a fallback failure, so a healthy fallback
+// parked the client on it forever and connect() was never called again.
+func TestClientRetriesWebSocketWhileFallbackHealthy(t *testing.T) {
+	var mu sync.Mutex
+	dialAttempts := 0
+	wsServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		dialAttempts++
+		mu.Unlock()
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer wsServer.Close()
+
+	fallback := newFallbackServer(t, nil)
+	defer fallback.Close()
+
+	client := New(context.Background(), Config{
+		URL: strings.Replace(wsServer.URL, "http://", "ws://", 1), NodeSecret: "node-secret",
+		NodeType: "NODE_ROLE_EDGE", Region: "Tokyo", Capacity: 10, HeartbeatInterval: 15 * time.Millisecond,
+	}, func() []string { return nil }, testLogger{})
+	client.SetHTTPFallback(fallback.URL, "node-secret", time.Second)
+	defer client.Close()
+
+	require.Eventually(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return dialAttempts >= 3
+	}, 2*time.Second, 10*time.Millisecond,
+		"WebSocket dial should be retried periodically while HTTP fallback stays healthy (R1)")
+}
+
+// TestClientReturnsToWebSocketAfterFallback is R1's second acceptance test:
+// the WebSocket fails, the client rides out a couple of HTTP-fallback
+// stretches, then the WebSocket starts accepting again - the client must
+// notice and register over it, and the HTTP fallback heartbeats along the
+// way must stay evenly spaced (no gap wide enough to trip ppcenter's
+// heartbeatTimeout).
+func TestClientReturnsToWebSocketAfterFallback(t *testing.T) {
+	var attemptMu sync.Mutex
+	dialAttempts := 0
+	registered := make(chan struct{}, 1)
+	wsServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attemptMu.Lock()
+		dialAttempts++
+		attempt := dialAttempts
+		attemptMu.Unlock()
+
+		if attempt <= 2 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		conn, err := (&websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}).Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		if _, _, err := conn.ReadMessage(); err != nil {
+			return
+		}
+		_ = conn.WriteMessage(websocket.BinaryMessage, registerAck(true, ""))
+		select {
+		case registered <- struct{}{}:
+		default:
+		}
+		_, _, _ = conn.ReadMessage()
+	}))
+	defer wsServer.Close()
+
+	var timesMu sync.Mutex
+	var fallbackHeartbeats []time.Time
+	fallback := newFallbackServer(t, func(path string) {
+		if path == "/heartbeat" {
+			timesMu.Lock()
+			fallbackHeartbeats = append(fallbackHeartbeats, time.Now())
+			timesMu.Unlock()
+		}
+	})
+	defer fallback.Close()
+
+	heartbeatInterval := 15 * time.Millisecond
+	client := New(context.Background(), Config{
+		URL: strings.Replace(wsServer.URL, "http://", "ws://", 1), NodeSecret: "node-secret",
+		NodeType: "NODE_ROLE_EDGE", Region: "Tokyo", Capacity: 10, HeartbeatInterval: heartbeatInterval,
+	}, func() []string { return nil }, testLogger{})
+	client.SetHTTPFallback(fallback.URL, "node-secret", time.Second)
+	defer client.Close()
+
+	select {
+	case <-registered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("client never reconnected over WebSocket after riding out HTTP fallback")
+	}
+
+	timesMu.Lock()
+	times := append([]time.Time(nil), fallbackHeartbeats...)
+	timesMu.Unlock()
+	require.NotEmpty(t, times, "fallback heartbeat should have fired before WebSocket recovered")
+	for i := 1; i < len(times); i++ {
+		gap := times[i].Sub(times[i-1])
+		require.Lessf(t, gap, 4*heartbeatInterval,
+			"fallback heartbeat gap %v at index %d is too wide - heartbeat must not be interrupted while WebSocket is retried", gap, i)
+	}
+}
+
+// TestClientResetsBackoffAfterStableSession is R3's acceptance test: two
+// quick WebSocket failures grow the reconnect backoff, then a session that
+// stays registered long enough to count as stable (stableSessionCycles *
+// HeartbeatInterval) must reset it back to its 1s floor rather than leaving
+// it parked at the elevated value.
+func TestClientResetsBackoffAfterStableSession(t *testing.T) {
+	heartbeatInterval := 20 * time.Millisecond
+	var mu sync.Mutex
+	var dialTimes []time.Time
+	attempt := 0
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		attempt++
+		n := attempt
+		dialTimes = append(dialTimes, time.Now())
+		mu.Unlock()
+
+		if n <= 2 || n >= 4 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		conn, err := (&websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}).Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		if _, _, err := conn.ReadMessage(); err != nil {
+			return
+		}
+		_ = conn.WriteMessage(websocket.BinaryMessage, registerAck(true, ""))
+		time.Sleep(stableSessionCycles*heartbeatInterval + 20*time.Millisecond)
+	}))
+	defer server.Close()
+
+	client := New(context.Background(), Config{
+		URL: strings.Replace(server.URL, "http://", "ws://", 1), NodeSecret: "node-secret",
+		NodeType: "NODE_ROLE_EDGE", Region: "Tokyo", Capacity: 10, HeartbeatInterval: heartbeatInterval,
+	}, func() []string { return nil }, testLogger{})
+	defer client.Close()
+
+	require.Eventually(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return attempt >= 4
+	}, 15*time.Second, 20*time.Millisecond, "expected at least 4 WebSocket dial attempts")
+
+	mu.Lock()
+	times := append([]time.Time(nil), dialTimes...)
+	mu.Unlock()
+	require.Len(t, times, 4)
+
+	gapAfterStable := times[3].Sub(times[2])
+	require.Lessf(t, gapAfterStable, 2500*time.Millisecond,
+		"backoff should reset to ~1s after a stable session instead of staying at the ~4s it would otherwise have grown to (gap was %v)", gapAfterStable)
+}
+
 func newControlServer(t *testing.T, handle func(*websocket.Conn)) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -146,6 +310,27 @@ func newControlServer(t *testing.T, handle func(*websocket.Conn)) *httptest.Serv
 		}
 		defer conn.Close()
 		handle(conn)
+	}))
+}
+
+// newFallbackServer serves the two HTTP-fallback endpoints HTTPFallbackClient
+// calls, always succeeding. onRequest, if non-nil, is invoked with the
+// request path before the response is written.
+func newFallbackServer(t *testing.T, onRequest func(path string)) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if onRequest != nil {
+			onRequest(r.URL.Path)
+		}
+		switch r.URL.Path {
+		case "/heartbeat":
+			w.WriteHeader(http.StatusOK)
+		case "/commands/pending":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"commands":[]}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
 	}))
 }
 
