@@ -64,6 +64,11 @@ type UploadConfig struct {
 	// S3Domain, if set, is used only to build a friendly playback URL for
 	// logging (e.g. a CDN domain in front of the bucket).
 	S3Domain string
+	// S3Endpoint, if set, overrides the S3 API endpoint so uploads can target
+	// an S3-compatible provider (e.g. OVH: "https://s3.sgp.io.cloud.ovh.net")
+	// instead of AWS. Empty means the AWS SDK's default AWS endpoint for
+	// S3Region. A trailing slash is tolerated.
+	S3Endpoint string
 
 	MinioEndpoint  string
 	MinioAccessKey string
@@ -243,7 +248,14 @@ func (u *uploader) uploadS3(filePath, objectKey string) error {
 	}
 	defer f.Close()
 
-	client := s3.NewFromConfig(cfg)
+	client := s3.NewFromConfig(cfg, func(o *s3.Options) {
+		// Custom endpoint for S3-compatible providers (e.g. OVH). Overrides
+		// any AWS_ENDPOINT_URL[_S3] the SDK may have picked up from the env,
+		// so the endpoint can live in .env alongside the other S3_* settings.
+		if ep := strings.TrimRight(strings.TrimSpace(u.cfg.S3Endpoint), "/"); ep != "" {
+			o.BaseEndpoint = aws.String(ep)
+		}
+	})
 	_, err = client.PutObject(ctx, &s3.PutObjectInput{
 		Bucket:      aws.String(u.cfg.s3BucketName()),
 		Key:         aws.String(objectKey),

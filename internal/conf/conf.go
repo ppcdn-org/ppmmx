@@ -460,6 +460,7 @@ type Conf struct {
 	NetStorageS3AccessKey    string `json:"-"`
 	NetStorageS3SecretKey    string `json:"-"`
 	NetStorageS3Domain       string `json:"-"`
+	NetStorageS3Endpoint     string `json:"-"`
 	NetStorageMinioEndpoint  string `json:"-"`
 	NetStorageMinioAccessKey string `json:"-"`
 	NetStorageMinioSecretKey string `json:"-"`
@@ -732,6 +733,11 @@ func Load(fpath string, defaultConfPaths []string, l logger.Writer) (*Conf, stri
 	conf.NetStorageS3AccessKey = DotenvValue("S3_ACCESS_ID")
 	conf.NetStorageS3SecretKey = DotenvValue("S3_ACCESS_PASS")
 	conf.NetStorageS3Domain = DotenvValue("S3_HTTPS_DOMAIN")
+	// Optional custom S3 API endpoint for S3-compatible providers (e.g. OVH:
+	// "https://s3.sgp.io.cloud.ovh.net"). Empty = the AWS SDK's default AWS
+	// endpoint for S3_REGION. Sourced from .env so all S3 settings live in one
+	// place (rather than needing AWS_ENDPOINT_URL_S3 in the process env).
+	conf.NetStorageS3Endpoint = DotenvValue("S3_ENDPOINT_URL")
 	// Nacos (optional): if BOOTSTRAP_JASYPT_ENCRYPTOR_PASSWORD is set, fetch
 	// MinIO settings from Nacos first; the MINIO_* env vars below still
 	// override on top when set, same precedence as the previous Go service.
