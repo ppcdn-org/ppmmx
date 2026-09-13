@@ -251,30 +251,11 @@ func TestRecorder(t *testing.T) {
 								PPS: test.FormatH264.PPS,
 							},
 						},
+						// No H265 track: a recording carries a single video
+						// track and H264 wins (see pickRecordedVideo), even
+						// though this stream also publishes a H265 rendition.
 						{
 							ID:        2,
-							TimeScale: 90000,
-							Codec: &mcodecs.H265{
-								VPS: []byte{
-									0x40, 0x01, 0x0c, 0x01, 0xff, 0xff, 0x01, 0x60,
-									0x00, 0x00, 0x03, 0x00, 0x90, 0x00, 0x00, 0x03,
-									0x00, 0x00, 0x03, 0x00, 0x78, 0xba, 0x02, 0x40,
-								},
-								SPS: []byte{
-									0x42, 0x01, 0x01, 0x01, 0x60, 0x00, 0x00, 0x03,
-									0x00, 0x90, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03,
-									0x00, 0x78, 0xa0, 0x03, 0xc0, 0x80, 0x11, 0x07,
-									0xcb, 0x96, 0xe9, 0x29, 0x30, 0xbc, 0x05, 0xa0,
-									0x20, 0x00, 0x00, 0x03, 0x00, 0x20, 0x00, 0x00,
-									0x03, 0x03, 0xc1,
-								},
-								PPS: []byte{
-									0x44, 0x01, 0xc0, 0x73, 0xc1, 0x89,
-								},
-							},
-						},
-						{
-							ID:        3,
 							TimeScale: 44100,
 							Codec: &mcodecs.MPEG4Audio{
 								Config: mpeg4audio.AudioSpecificConfig{
@@ -286,7 +267,7 @@ func TestRecorder(t *testing.T) {
 							},
 						},
 						{
-							ID:        4,
+							ID:        3,
 							TimeScale: 8000,
 							Codec: &mcodecs.LPCM{
 								BitDepth:     16,
@@ -295,7 +276,7 @@ func TestRecorder(t *testing.T) {
 							},
 						},
 						{
-							ID:        5,
+							ID:        4,
 							TimeScale: 44100,
 							Codec: &mcodecs.LPCM{
 								BitDepth:     16,
@@ -380,12 +361,6 @@ func TestRecorder(t *testing.T) {
 					},
 					{
 						SequenceNumber: 4,
-						Tracks: []*fmp4.PartTrack{{
-							ID: 5,
-						}},
-					},
-					{
-						SequenceNumber: 5,
 						Tracks: []*fmp4.PartTrack{{
 							ID:       1,
 							BaseTime: 9000,
