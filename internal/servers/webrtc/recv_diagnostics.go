@@ -56,6 +56,11 @@ func (n *nackDeltaSampler) extra(st *webrtc.Stats, perTrack map[string]*rtprecei
 	n.lastReceived = st.NACKPacketsReceived
 	n.seeded = true
 
+	// Reported on the same terms as the SRT ingest line (rtt, jitter), so
+	// the two protocols' numbers can be compared directly instead of each
+	// being read in its own units.
+	fmt.Fprintf(&sb, " rtt=%.1fms jitter=%.1f", st.RTTMilliseconds, st.RTPPacketsJitter)
+
 	if detail := n.perTrackDetail(perTrack); detail != "" {
 		sb.WriteString(" layers[" + detail + "]")
 	}

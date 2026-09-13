@@ -15,4 +15,7 @@ type Stats struct {
 	// remote peer - see statsInterceptor's fields.
 	NACKPacketsRequested uint64
 	NACKPacketsReceived  uint64
+	// RTTMilliseconds is the selected ICE candidate pair's latest
+	// round-trip time, the counterpart of SRT's MsRTT.
+	RTTMilliseconds float64
 }

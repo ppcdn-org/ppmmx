@@ -1076,6 +1076,22 @@ func bytesStats(wr *webrtc.PeerConnection) (uint64, uint64) {
 	return 0, 0
 }
 
+// candidatePairRTT returns the selected ICE candidate pair's latest
+// round-trip time, in milliseconds, or 0 when no pair has reported one yet.
+// This is the WHIP counterpart of SRT's MsRTT, so the two ingest protocols
+// can be compared on the same terms.
+func candidatePairRTT(wr *webrtc.PeerConnection) float64 {
+	for _, stats := range wr.GetStats() {
+		if pstats, ok := stats.(webrtc.ICECandidatePairStats); ok {
+			if pstats.State == webrtc.StatsICECandidatePairStateSucceeded &&
+				pstats.CurrentRoundTripTime != 0 {
+				return pstats.CurrentRoundTripTime * 1000
+			}
+		}
+	}
+	return 0
+}
+
 // Stats returns statistics.
 func (co *PeerConnection) Stats() *Stats {
 	bytesReceived, bytesSent := bytesStats(co.wr)
@@ -1124,6 +1140,7 @@ func (co *PeerConnection) Stats() *Stats {
 
 		NACKPacketsRequested: co.statsInterceptor.nackPacketsRequested.Load(),
 		NACKPacketsReceived:  co.statsInterceptor.nackPacketsReceived.Load(),
+		RTTMilliseconds:      candidatePairRTT(co.wr),
 	}
 }
 
