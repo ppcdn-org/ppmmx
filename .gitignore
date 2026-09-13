@@ -38,3 +38,15 @@ bin/crash-stderr-*.log
 bin/mmx.gz
 bin/mmx.exe~
 
+# Local cross-compile helper and its intermediate output; the release build
+# is driven from CI/Makefile, this is just a convenience for pushing a
+# linux/amd64 binary to the fleet from a Windows workstation.
+/build-linux.ps1
+/bin/_parts/
+
+# Machine-local test configs (real endpoints/credentials), never fixtures.
+/bin/conf/testEnv/
+
+# Agent workspace
+/.claude/
+
