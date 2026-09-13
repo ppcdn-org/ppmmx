@@ -752,6 +752,7 @@ func (p *Core) createResources(initial bool) error {
 				S3SecretKey:    p.conf.NetStorageS3SecretKey,
 				S3Domain:       p.conf.NetStorageS3Domain,
 				S3Endpoint:     p.conf.NetStorageS3Endpoint,
+				S3ACL:          p.conf.NetStorageS3ACL,
 				MinioEndpoint:  p.conf.NetStorageMinioEndpoint,
 				MinioAccessKey: p.conf.NetStorageMinioAccessKey,
 				MinioSecretKey: p.conf.NetStorageMinioSecretKey,
@@ -1272,6 +1273,7 @@ func (p *Core) closeResources(newConf *conf.Conf, calledByAPI bool) {
 		newConf.NetStorageS3SecretKey != p.conf.NetStorageS3SecretKey ||
 		newConf.NetStorageS3Domain != p.conf.NetStorageS3Domain ||
 		newConf.NetStorageS3Endpoint != p.conf.NetStorageS3Endpoint ||
+		newConf.NetStorageS3ACL != p.conf.NetStorageS3ACL ||
 		newConf.NetStorageMinioEndpoint != p.conf.NetStorageMinioEndpoint ||
 		newConf.NetStorageMinioAccessKey != p.conf.NetStorageMinioAccessKey ||
 		newConf.NetStorageMinioSecretKey != p.conf.NetStorageMinioSecretKey ||

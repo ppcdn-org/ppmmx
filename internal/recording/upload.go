@@ -13,6 +13,7 @@ import (
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	awscreds "github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/minio/minio-go/v7"
 	miniocreds "github.com/minio/minio-go/v7/pkg/credentials"
 
@@ -53,8 +54,14 @@ type SplitRecFileInfo struct {
 // recordings. It is sourced from environment variables / bin/.env (see
 // internal/conf), never from the YAML.
 type UploadConfig struct {
-	// Env selects the backend: "prod" uploads to S3, anything else
-	// (dev/test/uat/stag/empty) uploads to MinIO.
+	// Env is the process-wide default environment, used for the MinIO
+	// fallback bucket when a split-rec request doesn't send its own
+	// "appEnv" (MinIO always needs some bucket to target). It plays no part
+	// in the normal S3 (OVH net-storage) path: S3, once configured, uploads
+	// every environment to the same S3Bucket, and the "<appEnv>/" key prefix
+	// that tells them apart (see remoteObjectKey) is added only when the
+	// request itself sends a non-empty appEnv - Env is never used as a
+	// fallback for it.
 	Env string
 
 	S3Bucket    string
@@ -69,6 +76,12 @@ type UploadConfig struct {
 	// instead of AWS. Empty means the AWS SDK's default AWS endpoint for
 	// S3Region. A trailing slash is tolerated.
 	S3Endpoint string
+	// S3ACL, if set, is sent as the canned ACL (e.g. "public-read",
+	// "private") on every object PUT to S3. Empty omits the ACL header
+	// entirely, so the object falls back to whatever default ACL/policy the
+	// bucket itself has - the original, implicit behavior from before this
+	// setting existed.
+	S3ACL string
 
 	MinioEndpoint  string
 	MinioAccessKey string
@@ -81,12 +94,13 @@ type UploadConfig struct {
 	MinioDomain string
 }
 
-// resolveEnv returns the environment to use for this upload: appEnv (from
-// the split-rec request's optional "appEnv" field) takes priority when
-// non-empty, so a single process serving multiple game environments routes
-// each round's upload independently; an empty appEnv (older callers that
-// don't send it) falls back to c.Env, the process-wide APP_ENV - the
-// original, single-environment-per-process behavior is unchanged.
+// resolveEnv returns the environment to use for the MinIO fallback bucket
+// (see minioBucket): appEnv (from the split-rec request's optional
+// "appEnv" field) takes priority when non-empty, so a single process
+// serving multiple game environments routes each round independently; an
+// empty appEnv falls back to c.Env, the process-wide APP_ENV, since MinIO
+// always needs some bucket to target. Not used on the S3 path - see
+// remoteObjectKey, which leaves an empty appEnv unprefixed instead.
 func (c UploadConfig) resolveEnv(appEnv string) string {
 	if appEnv != "" {
 		return appEnv
@@ -94,14 +108,35 @@ func (c UploadConfig) resolveEnv(appEnv string) string {
 	return c.Env
 }
 
-func (c UploadConfig) isProd(appEnv string) bool {
-	return strings.EqualFold(strings.TrimSpace(c.resolveEnv(appEnv)), "prod")
-}
-
 // minioBucket is not a separate setting: the MinIO bucket is always the
-// (lowercased) environment name, e.g. env "test" -> bucket "test".
+// resolved environment's (lowercased) name, e.g. env "test" -> bucket
+// "test". Only relevant on the MinIO fallback path - see s3Configured. MinIO
+// always needs *some* bucket to write to, so this still falls back to the
+// process-wide Env when appEnv is empty - unlike remoteObjectKey's S3 key
+// prefix, which has a well-defined "no prefix" empty case instead.
 func (c UploadConfig) minioBucket(appEnv string) string {
 	return strings.ToLower(strings.TrimSpace(c.resolveEnv(appEnv)))
+}
+
+// remoteObjectKey returns the object key actually used at the storage
+// backend for objectKey. OVH net-storage gives ppcdn a single bucket for
+// every environment, so on the S3 path (the normal case) different
+// environments are kept apart by an "<appEnv>/" key prefix instead of by
+// bucket - e.g. a partner's integration-test upload with appEnv=test lands
+// in the same S3Bucket as everything else, as "test/table1-...mp4". The
+// prefix is opt-in: it only applies when the split-rec request itself sends
+// a non-empty appEnv. A request that omits it gets the plain, unprefixed
+// key - same as before this feature existed - with no fallback to the
+// process-wide APP_ENV and no error either way; this keeps the common case
+// (callers that never pass appEnv) byte-for-byte unchanged. The MinIO
+// fallback already separates environments by bucket (see minioBucket), so
+// the key there is left untouched regardless.
+func (c UploadConfig) remoteObjectKey(objectKey, appEnv string) string {
+	appEnv = strings.TrimSpace(appEnv)
+	if !c.s3Configured() || appEnv == "" {
+		return objectKey
+	}
+	return strings.ToLower(appEnv) + "/" + objectKey
 }
 
 // s3BucketName strips a "s3://" prefix some deployments include in
@@ -111,6 +146,12 @@ func (c UploadConfig) s3BucketName() string {
 	b := strings.TrimSpace(c.S3Bucket)
 	b = strings.TrimPrefix(b, "s3://")
 	return strings.Trim(b, "/")
+}
+
+// s3ACL returns the canned ACL to send with each S3 PutObject call, or ""
+// to omit the ACL header entirely - see UploadConfig.S3ACL.
+func (c UploadConfig) s3ACL() s3types.ObjectCannedACL {
+	return s3types.ObjectCannedACL(strings.TrimSpace(c.S3ACL))
 }
 
 // minioSecure defaults to true (matches MinIO's own client default) unless
@@ -123,16 +164,27 @@ func (c UploadConfig) minioSecure() bool {
 	return secure
 }
 
+// s3Configured reports whether S3 (OVH net-storage) credentials are set.
+// Unlike the old prod-only check, this no longer depends on appEnv: S3, once
+// configured, is the backend for every environment (see remoteObjectKey).
+func (c UploadConfig) s3Configured() bool {
+	return c.S3Bucket != "" && c.S3AccessKey != "" && c.S3SecretKey != ""
+}
+
+// configured reports whether uploads for appEnv have anywhere to go: S3 if
+// configured (takes priority, and then covers every environment), otherwise
+// MinIO if that's configured for the resolved environment's bucket.
 func (c UploadConfig) configured(appEnv string) bool {
-	if c.isProd(appEnv) {
-		return c.S3Bucket != "" && c.S3AccessKey != "" && c.S3SecretKey != ""
+	if c.s3Configured() {
+		return true
 	}
 	return c.MinioEndpoint != "" && c.MinioAccessKey != "" && c.MinioSecretKey != "" && c.minioBucket(appEnv) != ""
 }
 
-// uploader pushes finished round recordings to S3 (prod) or MinIO (other
-// environments) in the background, with retries. Uploading is best-effort:
-// a failure never affects the recording/split-rec response.
+// uploader pushes finished round recordings to S3 (every environment, once
+// configured) or MinIO (fallback when S3 isn't configured) in the
+// background, with retries. Uploading is best-effort: a failure never
+// affects the recording/split-rec response.
 type uploader struct {
 	cfg      UploadConfig
 	parent   logger.Writer
@@ -144,12 +196,14 @@ func newUploader(cfg UploadConfig, parent logger.Writer) *uploader {
 }
 
 // uploadAsync uploads filePath under objectKey in the background. appEnv is
-// the split-rec request's optional "appEnv" field: when non-empty it picks
-// which environment's bucket/backend this round's file goes to, taking
-// priority over the process-wide APP_ENV (see UploadConfig.resolveEnv) -
-// this is what lets one process serve multiple game environments without
-// their recordings landing in the same bucket. It is a no-op if net storage
-// isn't configured for the resolved environment. info carries the
+// the split-rec request's optional "appEnv" field. On the S3 path, a
+// non-empty appEnv only adds an "<appEnv>/" key prefix within the one
+// shared bucket (see remoteObjectKey) - it never changes the bucket itself,
+// and an empty appEnv gets no prefix at all (no fallback to the
+// process-wide APP_ENV). It is a no-op if net storage isn't configured for
+// the resolved environment (see UploadConfig.configured, which - unlike the
+// key prefix - does still fall back to APP_ENV for the MinIO path, since
+// MinIO needs some bucket to target). info carries the
 // tableId/gameId/gameRound identity (and appEnv again, for the reported
 // row) used to tell ppcenter about the file once the upload succeeds - see
 // SplitRecFileReporter; a zero-value info is fine when no reporter is
@@ -180,6 +234,9 @@ func (u *uploader) uploadWithRetry(filePath, objectKey, appEnv string, info Spli
 		defer cleanup()
 	}
 
+	useS3 := u.cfg.s3Configured()
+	remoteKey := u.cfg.remoteObjectKey(objectKey, appEnv)
+
 	var lastErr error
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		if attempt > 1 {
@@ -191,23 +248,23 @@ func (u *uploader) uploadWithRetry(filePath, objectKey, appEnv string, info Spli
 		}
 
 		var err error
-		if u.cfg.isProd(appEnv) {
-			err = u.uploadS3(uploadPath, objectKey)
+		if useS3 {
+			err = u.uploadS3(uploadPath, remoteKey)
 		} else {
-			err = u.uploadMinio(uploadPath, objectKey, appEnv)
+			err = u.uploadMinio(uploadPath, remoteKey, appEnv)
 		}
 		if err == nil {
 			u.parent.Log(logger.Info, "[upload] %s -> %s succeeded (attempt %d/%d)%s",
-				filePath, objectKey, attempt, maxAttempts, u.playbackURLSuffix(objectKey, appEnv))
-			u.reportSplitRecFile(objectKey, appEnv, info)
+				filePath, remoteKey, attempt, maxAttempts, u.playbackURLSuffix(remoteKey, appEnv))
+			u.reportSplitRecFile(remoteKey, appEnv, info)
 			return
 		}
 		lastErr = err
 		u.parent.Log(logger.Warn, "[upload] %s -> %s failed (attempt %d/%d): %v",
-			filePath, objectKey, attempt, maxAttempts, err)
+			filePath, remoteKey, attempt, maxAttempts, err)
 	}
 	u.parent.Log(logger.Warn, "[upload] %s -> %s gave up after %d attempts: %v",
-		filePath, objectKey, maxAttempts, lastErr)
+		filePath, remoteKey, maxAttempts, lastErr)
 }
 
 // reportSplitRecFile tells ppcenter about a round file once its upload has
@@ -216,17 +273,17 @@ func (u *uploader) uploadWithRetry(filePath, objectKey, appEnv string, info Spli
 // upload itself: a failure here only logs a warning, since the file is
 // already safely uploaded by this point and the split-rec HTTP response
 // returned long ago.
-func (u *uploader) reportSplitRecFile(objectKey, appEnv string, info SplitRecFileInfo) {
+func (u *uploader) reportSplitRecFile(remoteKey, appEnv string, info SplitRecFileInfo) {
 	if u.reporter == nil {
 		return
 	}
-	info.ObjectKey = objectKey
+	info.ObjectKey = remoteKey
 	info.AppEnv = appEnv
-	info.PlaybackURL = u.playbackURL(objectKey, appEnv)
+	info.PlaybackURL = u.playbackURL(remoteKey, appEnv)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := u.reporter.ReportSplitRecFile(ctx, info); err != nil {
-		u.parent.Log(logger.Warn, "[upload] %s -> %s: report to ppcenter failed: %v", objectKey, appEnv, err)
+		u.parent.Log(logger.Warn, "[upload] %s -> %s: report to ppcenter failed: %v", remoteKey, appEnv, err)
 	}
 }
 
@@ -256,12 +313,16 @@ func (u *uploader) uploadS3(filePath, objectKey string) error {
 			o.BaseEndpoint = aws.String(ep)
 		}
 	})
-	_, err = client.PutObject(ctx, &s3.PutObjectInput{
+	input := &s3.PutObjectInput{
 		Bucket:      aws.String(u.cfg.s3BucketName()),
 		Key:         aws.String(objectKey),
 		Body:        f,
 		ContentType: aws.String("video/mp4"),
-	})
+	}
+	if acl := u.cfg.s3ACL(); acl != "" {
+		input.ACL = acl
+	}
+	_, err = client.PutObject(ctx, input)
 	return err
 }
 
@@ -289,15 +350,17 @@ func objectKeyFor(filePath string) string {
 	return filepath.Base(filePath)
 }
 
-// playbackURL returns the public playback URL for objectKey on the active
-// backend (S3 for prod, MinIO otherwise), or "" if no playback domain is
+// playbackURL returns the public playback URL for remoteKey - the object
+// key as actually stored (see remoteObjectKey; already "<env>/..."-prefixed
+// on the S3 path, by the time this is called) - on the active backend (S3
+// if configured, MinIO otherwise), or "" if no playback domain is
 // configured for it. The URL is path-style (domain/bucket/key): both the
 // S3 and MinIO endpoints in use here serve objects that way, not
 // virtual-hosted-style.
-func (u *uploader) playbackURL(objectKey, appEnv string) string {
+func (u *uploader) playbackURL(remoteKey, appEnv string) string {
 	domain := u.cfg.S3Domain
 	bucket := u.cfg.s3BucketName()
-	if !u.cfg.isProd(appEnv) {
+	if !u.cfg.s3Configured() {
 		domain = u.cfg.MinioDomain
 		bucket = u.cfg.minioBucket(appEnv)
 	}
@@ -312,13 +375,13 @@ func (u *uploader) playbackURL(objectKey, appEnv string) string {
 	if !strings.Contains(domain, "://") {
 		domain = "https://" + domain
 	}
-	return fmt.Sprintf("%s/%s/%s", domain, bucket, objectKey)
+	return fmt.Sprintf("%s/%s/%s", domain, bucket, remoteKey)
 }
 
 // playbackURLSuffix returns ", url=<...>" for a friendlier success log
 // line - see playbackURL.
-func (u *uploader) playbackURLSuffix(objectKey, appEnv string) string {
-	url := u.playbackURL(objectKey, appEnv)
+func (u *uploader) playbackURLSuffix(remoteKey, appEnv string) string {
+	url := u.playbackURL(remoteKey, appEnv)
 	if url == "" {
 		return ""
 	}

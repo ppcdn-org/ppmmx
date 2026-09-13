@@ -461,6 +461,7 @@ type Conf struct {
 	NetStorageS3SecretKey    string `json:"-"`
 	NetStorageS3Domain       string `json:"-"`
 	NetStorageS3Endpoint     string `json:"-"`
+	NetStorageS3ACL          string `json:"-"`
 	NetStorageMinioEndpoint  string `json:"-"`
 	NetStorageMinioAccessKey string `json:"-"`
 	NetStorageMinioSecretKey string `json:"-"`
@@ -738,6 +739,11 @@ func Load(fpath string, defaultConfPaths []string, l logger.Writer) (*Conf, stri
 	// endpoint for S3_REGION. Sourced from .env so all S3 settings live in one
 	// place (rather than needing AWS_ENDPOINT_URL_S3 in the process env).
 	conf.NetStorageS3Endpoint = DotenvValue("S3_ENDPOINT_URL")
+	// Canned ACL sent with every uploaded object (e.g. "public-read",
+	// "private" - see AWS's ObjectCannedACL). Empty omits the ACL header
+	// entirely, so the object falls back to the bucket's own default
+	// ACL/policy - the original, implicit behavior.
+	conf.NetStorageS3ACL = DotenvValue("S3_ACL")
 	// Nacos (optional): if BOOTSTRAP_JASYPT_ENCRYPTOR_PASSWORD is set, fetch
 	// MinIO settings from Nacos first; the MINIO_* env vars below still
 	// override on top when set, same precedence as the previous Go service.

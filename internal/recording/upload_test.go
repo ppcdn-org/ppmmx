@@ -6,63 +6,80 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
+
 	"github.com/bluenviron/mediamtx/internal/test"
 )
 
-func TestUploadConfigIsProd(t *testing.T) {
-	require.True(t, UploadConfig{Env: "prod"}.isProd(""))
-	require.True(t, UploadConfig{Env: "PROD"}.isProd(""))
-	require.True(t, UploadConfig{Env: " prod "}.isProd(""))
-	require.False(t, UploadConfig{Env: "test"}.isProd(""))
-	require.False(t, UploadConfig{Env: "uat"}.isProd(""))
-	require.False(t, UploadConfig{Env: ""}.isProd(""))
-}
-
-// TestUploadConfigIsProdAppEnvOverride verifies the split-rec request's
-// "app_env" field takes priority over the process-wide APP_ENV (UploadConfig.Env)
-// when non-empty - this is what lets one process serve multiple game
-// environments, each round routed independently - and that an empty appEnv
-// (callers that don't send it) falls back to the process-wide value.
-func TestUploadConfigIsProdAppEnvOverride(t *testing.T) {
-	require.True(t, UploadConfig{Env: "test"}.isProd("prod"), "app_env overrides process-wide Env")
-	require.False(t, UploadConfig{Env: "prod"}.isProd("test"), "app_env overrides process-wide Env, other direction")
-	require.True(t, UploadConfig{Env: "prod"}.isProd(""), "empty app_env falls back to process-wide Env")
+// TestUploadConfigS3Configured verifies S3 (OVH net-storage) readiness is
+// purely a function of whether credentials are set - not of appEnv/Env -
+// since S3, once configured, is the backend for every environment (see
+// remoteObjectKey for how environments are kept apart within it).
+func TestUploadConfigS3Configured(t *testing.T) {
+	require.False(t, UploadConfig{}.s3Configured())
+	require.False(t, UploadConfig{S3Bucket: "b", S3AccessKey: "a"}.s3Configured(), "missing S3 secret key")
+	require.True(t, UploadConfig{S3Bucket: "b", S3AccessKey: "a", S3SecretKey: "s"}.s3Configured())
+	require.True(t, UploadConfig{Env: "test", S3Bucket: "b", S3AccessKey: "a", S3SecretKey: "s"}.s3Configured(),
+		"env is irrelevant to S3 readiness")
 }
 
 func TestUploadConfigConfigured(t *testing.T) {
 	require.False(t, UploadConfig{}.configured(""), "nothing set")
 
 	require.False(t, UploadConfig{
-		Env: "prod", S3Bucket: "b", S3AccessKey: "a",
-	}.configured(""), "prod missing S3 secret key")
+		S3Bucket: "b", S3AccessKey: "a",
+	}.configured(""), "S3 missing secret key, and no MinIO fallback configured")
 
 	require.True(t, UploadConfig{
-		Env: "prod", S3Bucket: "b", S3AccessKey: "a", S3SecretKey: "s",
-	}.configured(""), "prod with full S3 creds")
-
-	require.False(t, UploadConfig{
-		Env: "prod", MinioEndpoint: "e", MinioAccessKey: "a", MinioSecretKey: "s",
-	}.configured(""), "prod ignores MinIO-only config")
-
-	require.False(t, UploadConfig{
-		Env: "test", MinioEndpoint: "e", MinioAccessKey: "a",
-	}.configured(""), "non-prod missing MinIO secret key")
-
-	require.True(t, UploadConfig{
-		Env: "test", MinioEndpoint: "e", MinioAccessKey: "a", MinioSecretKey: "s",
-	}.configured(""), "non-prod with full MinIO creds")
-
-	require.False(t, UploadConfig{
-		Env: "", S3Bucket: "b", S3AccessKey: "a", S3SecretKey: "s",
-	}.configured(""), "empty env routes to MinIO, ignoring S3-only config")
-
-	require.False(t, UploadConfig{
-		Env: "", MinioEndpoint: "e", MinioAccessKey: "a", MinioSecretKey: "s",
-	}.configured(""), "MinIO with no env set has no derivable bucket name")
+		S3Bucket: "b", S3AccessKey: "a", S3SecretKey: "s",
+	}.configured(""), "S3 fully configured")
 
 	require.True(t, UploadConfig{
 		Env: "test", S3Bucket: "b", S3AccessKey: "a", S3SecretKey: "s",
-	}.configured("prod"), "app_env=prod overrides process-wide Env=test, routes to S3")
+	}.configured(""), "S3 configured - used for every environment, not just prod")
+
+	require.True(t, UploadConfig{
+		S3Bucket: "b", S3AccessKey: "a", S3SecretKey: "s",
+		MinioEndpoint: "e", MinioAccessKey: "a", MinioSecretKey: "s",
+	}.configured("test"), "S3 takes priority over MinIO when both happen to be configured")
+
+	require.False(t, UploadConfig{
+		Env: "test", MinioEndpoint: "e", MinioAccessKey: "a",
+	}.configured(""), "no S3, MinIO missing secret key")
+
+	require.True(t, UploadConfig{
+		Env: "test", MinioEndpoint: "e", MinioAccessKey: "a", MinioSecretKey: "s",
+	}.configured(""), "no S3 - falls back to MinIO")
+
+	require.False(t, UploadConfig{
+		Env: "", MinioEndpoint: "e", MinioAccessKey: "a", MinioSecretKey: "s",
+	}.configured(""), "no S3, and MinIO with no resolvable env has no derivable bucket name")
+}
+
+// TestUploadConfigRemoteObjectKey covers the OVH net-storage requirement
+// that every environment shares one S3 bucket, kept apart by an "<appEnv>/"
+// object-key prefix instead of by bucket selection - including prod, which
+// gets "prod/..." like any other environment rather than staying unprefixed
+// (when a request actually sends appEnv="prod"). The prefix is opt-in: it
+// only appears when the request itself sends a non-empty appEnv, with no
+// fallback to the process-wide Env and no error either way - this keeps the
+// common case (callers that never pass appEnv, e.g. today's real prod
+// traffic) byte-for-byte identical to the plain, unprefixed key.
+func TestUploadConfigRemoteObjectKey(t *testing.T) {
+	s3 := UploadConfig{S3Bucket: "b", S3AccessKey: "a", S3SecretKey: "s"}
+	require.Equal(t, "prod/key.mp4", s3.remoteObjectKey("key.mp4", "prod"), "prod is not special-cased - it gets a prefix too")
+	require.Equal(t, "test/key.mp4", s3.remoteObjectKey("key.mp4", "test"))
+	require.Equal(t, "key.mp4", s3.remoteObjectKey("key.mp4", ""),
+		"no appEnv sent - unprefixed, regardless of S3Bucket etc. being configured")
+	require.Equal(t, "key.mp4",
+		UploadConfig{Env: "prod", S3Bucket: "b", S3AccessKey: "a", S3SecretKey: "s"}.remoteObjectKey("key.mp4", ""),
+		"empty appEnv is NOT prefixed with the process-wide Env either - no fallback here, unlike minioBucket")
+	require.Equal(t, "uat/key.mp4", s3.remoteObjectKey("key.mp4", "  UAT  "),
+		"appEnv is trimmed and lowercased when present")
+
+	minio := UploadConfig{Env: "test"} // no S3 creds -> MinIO fallback
+	require.Equal(t, "key.mp4", minio.remoteObjectKey("key.mp4", "test"),
+		"MinIO already separates environments by bucket, so the key is left untouched")
 }
 
 func TestUploadConfigMinioBucket(t *testing.T) {
@@ -106,21 +123,37 @@ func TestUploadConfigS3BucketName(t *testing.T) {
 	require.Equal(t, "", UploadConfig{}.s3BucketName())
 }
 
+func TestUploadConfigS3ACL(t *testing.T) {
+	require.Equal(t, s3types.ObjectCannedACL(""), UploadConfig{}.s3ACL(),
+		"empty S3ACL omits the header, falling back to the bucket's own default ACL/policy")
+	require.Equal(t, s3types.ObjectCannedACLPublicRead, UploadConfig{S3ACL: "public-read"}.s3ACL())
+	require.Equal(t, s3types.ObjectCannedACLPrivate, UploadConfig{S3ACL: " private "}.s3ACL())
+}
+
 func TestPlaybackURLSuffix(t *testing.T) {
 	// The playback URL is path-style (domain/bucket/key), so it always
 	// needs a resolved bucket name - both S3's (as configured, minus any
 	// s3:// prefix) and MinIO's (the env name) - or it's omitted entirely.
-	prod := newUploader(UploadConfig{Env: "prod", S3Bucket: "s3://my-bucket", S3Domain: "cdn.example.com/"}, test.NilLogger)
-	require.Equal(t, ", url=https://cdn.example.com/my-bucket/key.mp4", prod.playbackURLSuffix("key.mp4", ""))
+	// playbackURL renders whatever key it's handed as-is; in real use that
+	// key already carries the "<env>/" prefix from remoteObjectKey (see
+	// TestUploadConfigRemoteObjectKey) - here it's passed explicitly to
+	// isolate domain/bucket resolution.
+	s3 := newUploader(UploadConfig{S3Bucket: "s3://my-bucket", S3AccessKey: "a", S3SecretKey: "s", S3Domain: "cdn.example.com/"}, test.NilLogger)
+	require.Equal(t, ", url=https://cdn.example.com/my-bucket/prod/key.mp4", s3.playbackURLSuffix("prod/key.mp4", "prod"),
+		"S3 configured: same bucket/domain regardless of env")
+	require.Equal(t, ", url=https://cdn.example.com/my-bucket/test/key.mp4", s3.playbackURLSuffix("test/key.mp4", "test"),
+		"non-prod appEnv - still S3, same bucket, just a different key prefix")
 
-	prodNoDomain := newUploader(UploadConfig{Env: "prod", S3Bucket: "my-bucket"}, test.NilLogger)
-	require.Equal(t, "", prodNoDomain.playbackURLSuffix("key.mp4", ""))
+	s3NoDomain := newUploader(UploadConfig{S3Bucket: "my-bucket", S3AccessKey: "a", S3SecretKey: "s"}, test.NilLogger)
+	require.Equal(t, "", s3NoDomain.playbackURLSuffix("prod/key.mp4", "prod"))
 
-	prodNoBucket := newUploader(UploadConfig{Env: "prod", S3Domain: "cdn.example.com"}, test.NilLogger)
-	require.Equal(t, "", prodNoBucket.playbackURLSuffix("key.mp4", ""), "no bucket resolvable - omit rather than build a broken URL")
+	s3NoBucket := newUploader(UploadConfig{S3AccessKey: "a", S3SecretKey: "s", S3Domain: "cdn.example.com"}, test.NilLogger)
+	require.Equal(t, "", s3NoBucket.playbackURLSuffix("prod/key.mp4", "prod"), "no bucket resolvable - omit rather than build a broken URL")
 
-	nonProd := newUploader(UploadConfig{Env: "test", S3Domain: "cdn.example.com"}, test.NilLogger)
-	require.Equal(t, "", nonProd.playbackURLSuffix("key.mp4", ""), "non-prod ignores S3Domain/S3Bucket")
+	// S3 not fully configured (credentials missing) falls back to MinIO,
+	// bucketed by the resolved environment; S3Domain/S3Bucket are ignored.
+	s3IncompleteFallsBackToMinio := newUploader(UploadConfig{Env: "test", S3Domain: "cdn.example.com", MinioDomain: "minio.example.com/"}, test.NilLogger)
+	require.Equal(t, ", url=https://minio.example.com/test/key.mp4", s3IncompleteFallsBackToMinio.playbackURLSuffix("key.mp4", ""))
 
 	nonProdWithMinioDomain := newUploader(UploadConfig{Env: "test", MinioDomain: "minio.example.com/"}, test.NilLogger)
 	require.Equal(t, ", url=https://minio.example.com/test/key.mp4", nonProdWithMinioDomain.playbackURLSuffix("key.mp4", ""))
@@ -128,18 +161,15 @@ func TestPlaybackURLSuffix(t *testing.T) {
 	// Both S3_HTTPS_DOMAIN and MINIO_URL are commonly configured
 	// as a full URL (scheme included) rather than a bare domain; the
 	// scheme must not be duplicated.
-	prodWithSchemeInDomain := newUploader(UploadConfig{Env: "prod", S3Bucket: "my-bucket", S3Domain: "https://cdn.example.com/"}, test.NilLogger)
-	require.Equal(t, ", url=https://cdn.example.com/my-bucket/key.mp4", prodWithSchemeInDomain.playbackURLSuffix("key.mp4", ""))
+	s3WithSchemeInDomain := newUploader(UploadConfig{S3Bucket: "my-bucket", S3AccessKey: "a", S3SecretKey: "s", S3Domain: "https://cdn.example.com/"}, test.NilLogger)
+	require.Equal(t, ", url=https://cdn.example.com/my-bucket/key.mp4", s3WithSchemeInDomain.playbackURLSuffix("key.mp4", "prod"))
 
 	nonProdWithSchemeInMinioDomain := newUploader(UploadConfig{Env: "test", MinioDomain: "https://minio.example.com"}, test.NilLogger)
 	require.Equal(t, ", url=https://minio.example.com/test/key.mp4", nonProdWithSchemeInMinioDomain.playbackURLSuffix("key.mp4", ""))
 
-	// app_env overrides the process-wide Env for both which backend is used
-	// and, for MinIO, which bucket - a multi-environment process's log line
-	// must reflect the actual destination of each round's upload.
-	appEnvOverridesToProd := newUploader(UploadConfig{Env: "test", S3Bucket: "my-bucket", S3Domain: "cdn.example.com"}, test.NilLogger)
-	require.Equal(t, ", url=https://cdn.example.com/my-bucket/key.mp4", appEnvOverridesToProd.playbackURLSuffix("key.mp4", "prod"))
-
+	// app_env overrides the process-wide Env for MinIO's bucket choice (S3's
+	// bucket never varies by env - see TestUploadConfigRemoteObjectKey for
+	// how appEnv affects the S3 key instead).
 	appEnvOverridesMinioBucket := newUploader(UploadConfig{Env: "test", MinioDomain: "minio.example.com"}, test.NilLogger)
 	require.Equal(t, ", url=https://minio.example.com/uat/key.mp4", appEnvOverridesMinioBucket.playbackURLSuffix("key.mp4", "uat"))
 }
