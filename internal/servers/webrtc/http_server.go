@@ -21,6 +21,7 @@ import (
 	"github.com/bluenviron/mediamtx/internal/defs"
 	"github.com/bluenviron/mediamtx/internal/logger"
 	"github.com/bluenviron/mediamtx/internal/protocols/httpp"
+	"github.com/bluenviron/mediamtx/internal/protocols/publishtoken"
 	"github.com/bluenviron/mediamtx/internal/protocols/whip"
 )
 
@@ -238,19 +239,15 @@ func (s *httpServer) checkWHIPDeviceID(ctx *gin.Context, pathName string) bool {
 	if s.parent.ForwardSecret != "" && subtle.ConstantTimeCompare([]byte(token), []byte(s.parent.ForwardSecret)) == 1 {
 		return true
 	}
-	claims, err := decryptWHIPToken(s.parent.WHIPAuthKey, token, time.Now())
+	claims, err := publishtoken.Decrypt(s.parent.WHIPAuthKey, token, time.Now())
 	if err != nil {
 		s.writeErrorNoLog(ctx, http.StatusForbidden, fmt.Errorf("publish deviceID authentication failure!"))
 		return false
 	}
-	// A codec-bound token (see whipTokenClaims.Codec) is only valid for its
-	// own 3-segment codec path - it must not also authenticate the legacy
-	// 2-segment path or a different codec's path.
-	expected := claims.AppID + "/" + claims.Stream
-	if claims.Codec != "" {
-		expected += "/" + claims.Codec
-	}
-	if expected != pathName {
+	// A codec-bound token (see publishtoken.Claims.Codec) is only valid for
+	// its own 3-segment codec path - it must not also authenticate the
+	// legacy 2-segment path or a different codec's path.
+	if !claims.PathMatches(pathName) {
 		s.writeErrorNoLog(ctx, http.StatusForbidden, fmt.Errorf("publish deviceID authentication failure!"))
 		return false
 	}

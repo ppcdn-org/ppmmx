@@ -55,6 +55,8 @@ type conn struct {
 	wg                  *sync.WaitGroup
 	externalCmdPool     *externalcmd.Pool
 	pathManager         serverPathManager
+	publishAuthKey      string
+	publishTokenReq     bool
 	parent              *Server
 
 	ctx       context.Context
@@ -134,6 +136,17 @@ func (c *conn) runInner() error {
 }
 
 func (c *conn) runPublish(streamID *streamID) error {
+	// Checked before FindPathConf so an unauthorized publish is rejected
+	// without touching path configuration or hooks.
+	switch err := c.checkPublishToken(streamID); {
+	case err == nil:
+	case errors.Is(err, errTokenUncheckable):
+		c.Log(logger.Warn, "%v", err)
+	default:
+		c.connReq.Reject(srt.REJ_PEER)
+		return err
+	}
+
 	res, err := c.pathManager.FindPathConf(defs.PathFindPathConfReq{
 		AccessRequest: defs.PathAccessRequest{
 			Name:    streamID.path,
@@ -201,8 +214,18 @@ func (c *conn) runPublishReader(sconn srt.Conn, streamID *streamID, pathConf *co
 	if err != nil {
 		return err
 	}
+
+	// SRT has no SDP offer/answer, so the codec only becomes known once the
+	// PMT arrives - this is the earliest a path/codec mismatch can be
+	// detected, which is why it surfaces as "connected, then dropped"
+	// rather than a rejected handshake.
+	if err := checkTracksMatchPathCodec(streamID.path, videoTracks); err != nil {
+		return err
+	}
+
 	if len(videoTracks) > 1 {
-		c.Log(logger.Info, "SRT publish contains %d H264 video tracks; treating them as a simulcast ladder (highest quality first)", len(videoTracks))
+		c.Log(logger.Info, "SRT publish contains %d %s video tracks; treating them as a simulcast ladder (highest quality first)",
+			len(videoTracks), mpegts.VideoCodecName(videoTracks[0].Codec))
 		for i, track := range videoTracks {
 			elementaryOrder := 0
 			for j, candidate := range r.Tracks() {

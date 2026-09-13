@@ -521,6 +521,12 @@ type Conf struct {
 	// SRT server
 	SRT        bool   `json:"srt"`
 	SRTAddress string `json:"srtAddress"`
+	// SRTPublishTokenRequired rejects a SRT publish that carries no
+	// ppcenter publish token in its streamID. The token itself is checked
+	// whenever one is present (and WHIP_AUTH_KEY is set); this only
+	// controls whether omitting it is allowed, so existing publishers and
+	// third-party SRT tools keep working until it's turned on.
+	SRTPublishTokenRequired bool `json:"srtPublishTokenRequired"`
 
 	// MoQ server
 	MoQ               bool       `json:"moq"`

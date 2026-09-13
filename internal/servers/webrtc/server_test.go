@@ -27,6 +27,7 @@ import (
 	"github.com/bluenviron/mediamtx/internal/defs"
 	"github.com/bluenviron/mediamtx/internal/externalcmd"
 	"github.com/bluenviron/mediamtx/internal/logger"
+	"github.com/bluenviron/mediamtx/internal/protocols/publishtoken"
 	"github.com/bluenviron/mediamtx/internal/protocols/webrtc"
 	"github.com/bluenviron/mediamtx/internal/protocols/whip"
 	"github.com/bluenviron/mediamtx/internal/stream"
@@ -44,13 +45,13 @@ const testWHIPAuthKey = "test-whip-auth-key"
 
 // makeTestWHIPToken builds a WHIP publish bearer token in the same
 // AES-256-GCM wire format ppcenter's EncryptWHIPToken produces (see
-// decryptWHIPToken in whip_token.go), so tests can exercise
-// checkWHIPDeviceID without depending on the ppcenter repo. codec is ""
-// for a legacy 2-segment-path token, or "h264"/"hevc" to bind it to that
-// codec's 3-segment path.
+// publishtoken.Decrypt), so tests can exercise checkWHIPDeviceID without
+// depending on the ppcenter repo. codec is "" for a legacy
+// 2-segment-path token, or "h264"/"hevc" to bind it to that codec's
+// 3-segment path.
 func makeTestWHIPToken(t *testing.T, authKey, appID, stream, codec string, exp time.Time) string {
 	t.Helper()
-	claims := whipTokenClaims{AppID: appID, Stream: stream, Codec: codec, IAT: exp.Add(-time.Hour).Unix(), EXP: exp.Unix()}
+	claims := publishtoken.Claims{AppID: appID, Stream: stream, Codec: codec, IAT: exp.Add(-time.Hour).Unix(), EXP: exp.Unix()}
 	plaintext, err := json.Marshal(claims)
 	require.NoError(t, err)
 

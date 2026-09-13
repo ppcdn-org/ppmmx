@@ -85,7 +85,17 @@ type Server struct {
 	ExternalCmdPool     *externalcmd.Pool
 	Metrics             serverMetrics
 	PathManager         serverPathManager
-	Parent              serverParent
+	// PublishAuthKey is the shared secret ppcenter seals publish tokens
+	// with - the same key the WHIP server uses (see the HEVC/H264
+	// multitrack design §3.2: both ingest protocols share one token
+	// format, one key and one codec-binding rule). Empty disables token
+	// checking entirely, leaving the pre-existing streamID user/pass path.
+	PublishAuthKey string
+	// PublishTokenRequired rejects a publish that carries no token at all.
+	// Off by default so existing SRT publishers and third-party tools keep
+	// working; production should turn it on.
+	PublishTokenRequired bool
+	Parent               serverParent
 
 	ctx       context.Context
 	ctxCancel func()
@@ -185,6 +195,8 @@ outer:
 				wg:                  &s.wg,
 				externalCmdPool:     s.ExternalCmdPool,
 				pathManager:         s.PathManager,
+				publishAuthKey:      s.PublishAuthKey,
+				publishTokenReq:     s.PublishTokenRequired,
 				parent:              s,
 			}
 			c.initialize()

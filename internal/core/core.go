@@ -892,7 +892,11 @@ func (p *Core) createResources(initial bool) error {
 			ExternalCmdPool:     p.externalCmdPool,
 			Metrics:             p.metrics,
 			PathManager:         p.pathManager,
-			Parent:              p,
+			// Same key as the WHIP server above: one publish token format
+			// shared by both ingest protocols.
+			PublishAuthKey:       p.conf.WebRTCWHIPAuthKey,
+			PublishTokenRequired: p.conf.SRTPublishTokenRequired,
+			Parent:               p,
 		}
 		err = i.Initialize()
 		if err != nil {
