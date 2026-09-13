@@ -50,7 +50,7 @@ type forwardTarget struct {
 // splitting needed) - restarting automatically on failure. It mirrors
 // internal/recorder's Recorder/recorderInstance split: Forwarder is the
 // long-lived supervisor, forwarderInstance is a single connect-and-push
-// attempt. mmx acts as a WHIP *client* here — the mirror image of the WHIP
+// attempt. mmx acts as a WHIP *client* here ??the mirror image of the WHIP
 // server role it already has for OBS ingest.
 //
 // Exactly one of Tencent/StreamKey or Mmx should be set by the caller (see
@@ -190,30 +190,45 @@ func (fi *forwarderInstance) run() {
 // so webrtc.FromStream's "first matching format" behavior is fine there. A
 // mmx target's desc is the path's whole multi-layer session - FromStream
 // would silently keep only the first video media, dropping every other
-// Simulcast layer, so this counts H264 video medias first and switches to
-// webrtc.SetupFromStreamSimulcast (one RID encoding per layer, all sharing
-// a single video m-line) whenever there's more than one: the target mmx
-// node's own WHIP publish endpoint, like this node's, only ever accepts a
-// single video m-line (see TracksAreValid).
+// Simulcast layer, so this counts the ladder's video medias first and
+// switches to webrtc.SetupFromStreamSimulcast (one RID encoding per layer,
+// all sharing a single video m-line) whenever there's more than one: the
+// target mmx node's own WHIP publish endpoint, like this node's, only ever
+// accepts a single video m-line (see TracksAreValid).
+//
+// Both H264 and H265 ladders count: a path carries a single video codec
+// (see mpegts.ValidateVideoTracks and the WHIP server's own path/codec
+// check), so counting either kind of layer measures the same ladder.
+// Counting only H264 used to send a HEVC ladder down the FromStream path,
+// which forwarded its first layer and dropped the rest.
 func setupOutboundTracks(desc *description.Session, r *stream.Reader, pc *webrtc.PeerConnection) error {
-	h264VideoMedias := 0
+	if simulcastLayerCount(desc) > 1 {
+		return webrtc.SetupFromStreamSimulcast(desc, r, pc)
+	}
+
+	return webrtc.FromStream(desc, r, pc)
+}
+
+// simulcastLayerCount counts the description's Simulcast-capable video
+// medias - see setupOutboundTracks, which uses it to decide between a
+// Simulcast offer and a single-track one.
+func simulcastLayerCount(desc *description.Session) int {
+	n := 0
 	for _, media := range desc.Medias {
 		if media.Type != description.MediaTypeVideo {
 			continue
 		}
 		for _, forma := range media.Formats {
-			if _, ok := forma.(*format.H264); ok {
-				h264VideoMedias++
-				break
+			switch forma.(type) {
+			case *format.H264, *format.H265:
+				n++
+			default:
+				continue
 			}
+			break
 		}
 	}
-
-	if h264VideoMedias > 1 {
-		return webrtc.SetupFromStreamSimulcast(desc, r, pc)
-	}
-
-	return webrtc.FromStream(desc, r, pc)
+	return n
 }
 
 func (fi *forwarderInstance) runInner() error {
