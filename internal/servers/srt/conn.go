@@ -322,6 +322,7 @@ func (c *conn) runReceiveStatsSummary(sconn srt.Conn, pathName string, done <-ch
 	// both makes the SRT ingest hop and the WHIP forward hops directly
 	// comparable, instead of only the raw loss rate they already share.
 	lastRetrans, lastDrop := st.Accumulated.PktRecvRetrans, st.Accumulated.PktRecvDrop
+	lastBelated := st.Accumulated.PktRecvBelated
 
 	for {
 		select {
@@ -336,6 +337,23 @@ func (c *conn) runReceiveStatsSummary(sconn srt.Conn, pathName string, done <-ch
 						st.Accumulated.PktRecvDrop-lastDrop)
 				}
 				lastRetrans, lastDrop = st.Accumulated.PktRecvRetrans, st.Accumulated.PktRecvDrop
+
+				// Link diagnostics, to tell a bandwidth ceiling apart from
+				// the other things that produce the same loss figure:
+				// linkCapacity is SRT's own estimate of what the path can
+				// carry (loss at a rate well under it is not congestion),
+				// rtt and its spread show queueing, belated/reorder count
+				// packets that arrived too late to use rather than never
+				// arriving at all, and recvBuf shows whether the receiver
+				// itself is falling behind.
+				snap.Extra += fmt.Sprintf(
+					" linkCapacity=%.1fMbps recvRate=%.1fMbps rtt=%.1fms belated=%d reorderTol=%d recvBuf=%dms",
+					st.Instantaneous.MbpsLinkCapacity, st.Instantaneous.MbpsRecvRate,
+					st.Instantaneous.MsRTT,
+					st.Accumulated.PktRecvBelated-lastBelated,
+					st.Instantaneous.PktReorderTolerance,
+					st.Instantaneous.MsRecvBuf)
+				lastBelated = st.Accumulated.PktRecvBelated
 
 				c.Log(logger.Info, "%s", snap.LogLine("srt", pathName))
 			}
