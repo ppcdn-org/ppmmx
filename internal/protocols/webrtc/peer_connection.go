@@ -13,6 +13,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/bluenviron/gortsplib/v5/pkg/rtpreceiver"
+	"github.com/bluenviron/gortsplib/v5/pkg/rtpsender"
 	"github.com/pion/ice/v4"
 	"github.com/pion/interceptor"
 	"github.com/pion/rtcp"
@@ -1119,7 +1121,61 @@ func (co *PeerConnection) Stats() *Stats {
 		RTPPacketsJitter:    rtpPacketsJitter,
 		RTCPPacketsReceived: co.statsInterceptor.rtcpPacketsReceived.Load(),
 		RTCPPacketsSent:     co.statsInterceptor.rtcpPacketsSent.Load(),
+
+		NACKPacketsRequested: co.statsInterceptor.nackPacketsRequested.Load(),
+		NACKPacketsReceived:  co.statsInterceptor.nackPacketsReceived.Load(),
 	}
+}
+
+// OutboundTrackStats returns per-track send statistics, keyed by a label
+// identifying the track (RID for Simulcast encodings, else the media kind).
+// ReportedLost comes from the remote receiver's own RTCP receiver reports,
+// making this the sending end's view of the same hop InboundTrackStats
+// measures at the receiving end.
+func (co *PeerConnection) OutboundTrackStats() map[string]*rtpsender.Stats {
+	out := make(map[string]*rtpsender.Stats)
+
+	for _, tr := range co.OutboundTracks {
+		if tr.rtcpSender == nil {
+			continue
+		}
+		st := tr.rtcpSender.Stats()
+		if st == nil {
+			continue
+		}
+		label := tr.RID
+		if label == "" {
+			label = strings.Split(tr.Caps.MimeType, "/")[0]
+		}
+		out[label] = st
+	}
+
+	return out
+}
+
+// InboundTrackStats returns per-track receive statistics, keyed by a label
+// identifying the track (RID for Simulcast layers, else the track ID). The
+// aggregate Stats() sums every layer together, which hides a single bad
+// Simulcast layer - this is what tells the layers apart.
+func (co *PeerConnection) InboundTrackStats() map[string]*rtpreceiver.Stats {
+	out := make(map[string]*rtpreceiver.Stats)
+
+	co.inboundTracksMutex.RLock()
+	defer co.inboundTracksMutex.RUnlock()
+
+	for _, tr := range co.inboundTracks {
+		st := tr.rtpReceiver.Stats()
+		if st == nil {
+			continue
+		}
+		label := tr.rid
+		if label == "" {
+			label = tr.id
+		}
+		out[label] = st
+	}
+
+	return out
 }
 
 // SendPLI sends a Picture Loss Indication RTCP packet for each video track,

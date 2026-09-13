@@ -294,6 +294,12 @@ func (c *conn) runReceiveStatsSummary(sconn srt.Conn, pathName string, done <-ch
 	sconn.Stats(&st)
 	sampler.Sample(st.Accumulated.ByteRecv, st.Accumulated.PktRecv, st.Accumulated.PktRecvLoss, time.Now()) // seed baseline
 
+	// SRT's ARQ counterpart to the WHIP hops' NACK counters: retrans is
+	// loss the protocol repaired, drop is loss it gave up on. Reporting
+	// both makes the SRT ingest hop and the WHIP forward hops directly
+	// comparable, instead of only the raw loss rate they already share.
+	lastRetrans, lastDrop := st.Accumulated.PktRecvRetrans, st.Accumulated.PktRecvDrop
+
 	for {
 		select {
 		case <-ticker.C:
@@ -301,6 +307,13 @@ func (c *conn) runReceiveStatsSummary(sconn srt.Conn, pathName string, done <-ch
 			if snap, ok := sampler.Sample(
 				st.Accumulated.ByteRecv, st.Accumulated.PktRecv, st.Accumulated.PktRecvLoss, time.Now(),
 			); ok {
+				if st.Accumulated.PktRecvRetrans >= lastRetrans && st.Accumulated.PktRecvDrop >= lastDrop {
+					snap.Extra = fmt.Sprintf(" retrans=%d drop=%d",
+						st.Accumulated.PktRecvRetrans-lastRetrans,
+						st.Accumulated.PktRecvDrop-lastDrop)
+				}
+				lastRetrans, lastDrop = st.Accumulated.PktRecvRetrans, st.Accumulated.PktRecvDrop
+
 				c.Log(logger.Info, "%s", snap.LogLine("srt", pathName))
 			}
 

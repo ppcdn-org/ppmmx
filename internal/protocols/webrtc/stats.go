@@ -10,4 +10,9 @@ type Stats struct {
 	RTPPacketsJitter    float64
 	RTCPPacketsReceived uint64
 	RTCPPacketsSent     uint64
+	// NACKPacketsRequested/NACKPacketsReceived count individual RTP
+	// sequence numbers asked for retransmission by this peer / by the
+	// remote peer - see statsInterceptor's fields.
+	NACKPacketsRequested uint64
+	NACKPacketsReceived  uint64
 }

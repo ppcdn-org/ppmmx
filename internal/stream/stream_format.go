@@ -43,6 +43,11 @@ type streamFormat struct {
 	rtpMaxPayloadSize    int
 	replaceNTP           bool
 	inboundFramesInError *errordumper.Dumper
+	// mediaLabel identifies which media/format inside the stream this is,
+	// e.g. "video[0]/H264". Without it a "N processing errors" line on a
+	// multi-layer Simulcast path can't be attributed to a specific layer -
+	// see diagnoseLabel.
+	mediaLabel string
 	inboundBytes         *atomic.Uint64
 	outboundBytes        *atomic.Uint64
 	updateLastTime       func(time.Duration)

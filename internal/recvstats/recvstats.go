@@ -37,6 +37,12 @@ type Snapshot struct {
 	TotalBytes    uint64 // cumulative received bytes
 	TotalReceived uint64 // cumulative received packets
 	TotalLost     uint64 // cumulative lost packets
+
+	// Extra is appended verbatim to LogLine, for protocol-specific detail
+	// that doesn't fit the common bitrate/loss shape (e.g. WHIP's NACK
+	// counters and per-Simulcast-layer breakdown). Empty for protocols
+	// that have nothing to add.
+	Extra string
 }
 
 // Sample records the current cumulative counters (received bytes, received
@@ -82,9 +88,10 @@ func (s *Sampler) Sample(bytesRecv, pktsRecv, pktsLost uint64, now time.Time) (S
 // the ingest protocol (e.g. "whip", "srt"); path is the stream path.
 func (sn Snapshot) LogLine(proto, path string) string {
 	return fmt.Sprintf(
-		"[recv-stats] proto=%s path=%s bitrate=%s loss=%.2f%% (window=%s, recv=%d lost=%d bytes=%d)",
+		"[recv-stats] proto=%s path=%s bitrate=%s loss=%.2f%% (window=%s, recv=%d lost=%d bytes=%d)%s",
 		proto, path, formatBitrate(sn.BitrateBps), sn.LossPct,
 		sn.Window.Round(time.Second), sn.TotalReceived, sn.TotalLost, sn.TotalBytes,
+		sn.Extra,
 	)
 }
 

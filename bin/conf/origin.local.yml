@@ -47,8 +47,8 @@ rtsp: false
 # RTMP 已关闭：不再接收 OBS Enhanced Broadcasting (Multitrack Video) 推流。
 rtmp: false
 hls: false
-srt: false
-# srtAddress: :8890  # disabled: conflicts with Edge WHEP port
+srt: true
+srtAddress: :7890
 moq: false
 
 # ── WebRTC ────────────────────────────────────

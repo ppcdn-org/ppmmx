@@ -349,6 +349,7 @@ func (s *Stream) Initialize() error {
 			writeRTSP:            s.writeRTSP,
 			updateOutDesc:        s.updateOutDesc,
 			inboundFramesInError: s.inboundFramesInError,
+			mediaIndex:           i,
 			parent:               s.Parent,
 		}
 		err := sm.initialize()

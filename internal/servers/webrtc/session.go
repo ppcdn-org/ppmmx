@@ -1174,11 +1174,15 @@ func (s *session) runReceiveStatsSummary(pc *webrtc.PeerConnection) {
 	st := pc.Stats()
 	sampler.Sample(st.BytesReceived, st.RTPPacketsReceived, st.RTPPacketsLost, time.Now()) // seed baseline
 
+	var nackSampler nackDeltaSampler
+	nackSampler.seed(st)
+
 	for {
 		select {
 		case <-ticker.C:
 			st := pc.Stats()
 			if snap, ok := sampler.Sample(st.BytesReceived, st.RTPPacketsReceived, st.RTPPacketsLost, time.Now()); ok {
+				snap.Extra = nackSampler.extra(st, pc.InboundTrackStats())
 				s.Log(logger.Info, "%s", snap.LogLine("whip", s.pathName))
 			}
 

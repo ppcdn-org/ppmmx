@@ -1,15 +1,25 @@
 package stream
 
 import (
+	"strconv"
 	"sync/atomic"
 	"time"
 
 	"github.com/bluenviron/gortsplib/v5/pkg/description"
 	"github.com/bluenviron/gortsplib/v5/pkg/format"
 	"github.com/bluenviron/mediamtx/internal/errordumper"
+	"github.com/bluenviron/mediamtx/internal/formatlabel"
 	"github.com/bluenviron/mediamtx/internal/logger"
 	"github.com/pion/rtp"
 )
+
+// mediaLabel renders a short stable identifier for one format inside one
+// media, e.g. "video[1]/H264". On a Simulcast path every layer is a
+// separate video media, so the index is what distinguishes them in the
+// per-format diagnostics (see streamFormat.mediaLabel).
+func mediaLabel(medi *description.Media, index int, forma format.Format) string {
+	return string(medi.Type) + "[" + strconv.Itoa(index) + "]/" + string(formatlabel.FormatToLabel(forma))
+}
 
 type streamMedia struct {
 	origMedia            *description.Media
@@ -22,7 +32,10 @@ type streamMedia struct {
 	writeRTSP            func(*description.Media, []*rtp.Packet, time.Time)
 	updateOutDesc        func(func())
 	inboundFramesInError *errordumper.Dumper
-	parent               logger.Writer
+	// mediaIndex is this media's position in the stream's OrigDesc, used
+	// to build each format's mediaLabel (see streamFormat.mediaLabel).
+	mediaIndex int
+	parent     logger.Writer
 
 	outMedia *description.Media
 	formats  map[format.Format]*streamFormat
@@ -49,6 +62,7 @@ func (sm *streamMedia) initialize() error {
 			updateLastTime:       sm.updateLastTime,
 			writeRTSP:            sm.writeRTSPWrapper,
 			updateOutDesc:        sm.updateOutDesc,
+			mediaLabel:           mediaLabel(sm.origMedia, sm.mediaIndex, origFormat),
 			parent:               sm.parent,
 		}
 		err := sf.initialize()

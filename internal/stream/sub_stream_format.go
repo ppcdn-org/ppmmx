@@ -85,7 +85,12 @@ func (ssf *subStreamFormat) initialize2(firstTimeReceived bool, lastPTS time.Dur
 func (ssf *subStreamFormat) writeUnit(u *unit.Unit) {
 	err := ssf.writeUnitInner(u)
 	if err != nil {
-		ssf.streamFormat.inboundFramesInError.Add(err)
+		// Tag the error with which media/format produced it: the Dumper
+		// aggregates every format of the stream into one "N processing
+		// errors, last was: ..." line, so without this a Simulcast path
+		// gives no clue which layer is failing to reassemble.
+		ssf.streamFormat.inboundFramesInError.Add(
+			fmt.Errorf("[%s] %w", ssf.streamFormat.mediaLabel, err))
 		return
 	}
 }
