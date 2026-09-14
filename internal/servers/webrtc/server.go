@@ -24,6 +24,7 @@ import (
 
 	"github.com/bluenviron/mediamtx/internal/conf"
 	"github.com/bluenviron/mediamtx/internal/defs"
+	"github.com/bluenviron/mediamtx/internal/degrade"
 	"github.com/bluenviron/mediamtx/internal/externalcmd"
 	"github.com/bluenviron/mediamtx/internal/logger"
 	"github.com/bluenviron/mediamtx/internal/protocols/udpreadbuffer"
@@ -224,11 +225,22 @@ type Server struct {
 	RecMgr       *recording.Manager
 	SplitHandler *recording.SplitRecHandler
 
-	// WHIP degrade protocol (see docs/obs-mmx-degrade-protocol.md)
+	// WHIP degrade protocol (see docs/obs-mmx-degrade-protocol.md and
+	// internal/degrade). DegradeManager is constructed and owned by
+	// internal/core (shared with internal/servers/srt, which feeds the same
+	// per-path state via its own thresholds) - never nil when DegradeEnable
+	// can be true, see core.go's construction gating.
+	DegradeManager        *degrade.Manager
 	DegradeEnable         bool
 	DegradeWSPathSuffix   string
 	DegradeInstantLossPct float64
 	DegradeAvgLossPct     float64
+	// RecoverInstantLossPct/RecoverAvgLossPct are the hysteresis "recover"
+	// thresholds paired with DegradeInstantLossPct/DegradeAvgLossPct above -
+	// see the Thresholds doc comment in internal/degrade for why they're
+	// separate.
+	RecoverInstantLossPct float64
+	RecoverAvgLossPct     float64
 	DegradeObservationSec int
 	DegradeWSSecret       string
 
@@ -255,9 +267,6 @@ type Server struct {
 	iceTCPMux        *webrtc.TCPMuxWrapper
 	sessions         map[*session]struct{}
 	sessionsBySecret map[uuid.UUID]*session
-
-	degradeStatesMu sync.Mutex
-	degradeStates   map[string]*degradeState
 
 	publishStatsMu sync.Mutex
 	publishStats   map[string]*publishReconnectStats
@@ -287,7 +296,6 @@ func (s *Server) Initialize() error {
 	s.ctxCancel = ctxCancel
 	s.sessions = make(map[*session]struct{})
 	s.sessionsBySecret = make(map[uuid.UUID]*session)
-	s.degradeStates = make(map[string]*degradeState)
 	s.publishStats = make(map[string]*publishReconnectStats)
 	s.chNewSession = make(chan newSessionReq)
 	s.chCloseSession = make(chan *session)

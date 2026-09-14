@@ -22,6 +22,7 @@ import (
 	"github.com/bluenviron/mediamtx/internal/auth"
 	"github.com/bluenviron/mediamtx/internal/conf"
 	"github.com/bluenviron/mediamtx/internal/defs"
+	"github.com/bluenviron/mediamtx/internal/degrade"
 	"github.com/bluenviron/mediamtx/internal/externalcmd"
 	"github.com/bluenviron/mediamtx/internal/hooks"
 	"github.com/bluenviron/mediamtx/internal/logger"
@@ -1069,8 +1070,8 @@ func (s *session) onInboundDataChannel(dc *pwebrtc.DataChannel) {
 
 // degradeStatsLogInterval is how often runDegradeSampling logs the
 // received bitrate / active simulcast layer count - independent of
-// degradeSampleInterval (the FSM's 1s loss-sampling cadence, which stays
-// fine-grained since it drives the 60s observation window).
+// degrade.SampleInterval (the FSM's 1s loss-sampling cadence, which stays
+// fine-grained since it drives the observation window).
 const degradeStatsLogInterval = 5 * time.Second
 
 // runDegradeSampling periodically feeds this publish session's cumulative
@@ -1092,7 +1093,7 @@ func (s *session) runDegradeSampling(pc *webrtc.PeerConnection) {
 	}
 	s.parent.observeDegradeSessionLayers(s.pathName, videoLayers)
 
-	sampleTicker := time.NewTicker(degradeSampleInterval)
+	sampleTicker := time.NewTicker(degrade.SampleInterval)
 	defer sampleTicker.Stop()
 	statsTicker := time.NewTicker(degradeStatsLogInterval)
 	defer statsTicker.Stop()

@@ -419,10 +419,20 @@ type Conf struct {
 	// docs/obs-mmx-degrade-protocol.md): degrades simulcast layers then
 	// bitrate on sustained RTP loss, pushed to a per-path WS the OBS-side
 	// executor connects to at "/{path}" + WebRTCDegradeWSPathSuffix.
+	//
+	// Degrade* and Recover* are separate thresholds (hysteresis): loss must
+	// rise above Degrade* to trigger degrading, and fall back to at/below
+	// Recover* to trigger recovering. Recover* <= Degrade* is enforced by
+	// Validate() below; the gap between them is a dead zone that does
+	// neither, so a loss rate hovering near a single boundary can't flap
+	// the ladder back and forth every ObservationSec. Setting Recover* ==
+	// Degrade* (the default) collapses the dead zone to zero width.
 	WebRTCDegradeEnable         bool    `json:"webrtcDegradeEnable"`
 	WebRTCDegradeWSPathSuffix   string  `json:"webrtcDegradeWSPathSuffix"`
 	WebRTCDegradeInstantLossPct float64 `json:"webrtcDegradeInstantLossPct"`
 	WebRTCDegradeAvgLossPct     float64 `json:"webrtcDegradeAvgLossPct"`
+	WebRTCRecoverInstantLossPct float64 `json:"webrtcRecoverInstantLossPct"`
+	WebRTCRecoverAvgLossPct     float64 `json:"webrtcRecoverAvgLossPct"`
 	WebRTCDegradeObservationSec int     `json:"webrtcDegradeObservationSec"`
 	WebRTCDegradeWSSecret       string  `json:"-"`
 
@@ -545,6 +555,38 @@ type Conf struct {
 	// (string/int/uint/float64/bool) - see env.go's loadEnvInternal
 	// default case.
 	SRTFC uint `json:"srtFC"`
+	// SRTLossAlarmEnable reports a publish connection's SRT loss rate to
+	// ppcenter (POST /internal/mmx/v1/alarms/srt-loss) whenever it crosses
+	// SRTLossAlarmThresholdPct, and once more when it drops back under -
+	// ppcenter raises/auto-resolves a superadmin node alarm from that (see
+	// AlarmManager.CheckSRTLoss). Requires MMXControl for the endpoint/
+	// credential, same reuse as trafficUsage/splitRecFileReporter.
+	SRTLossAlarmEnable bool `json:"srtLossAlarmEnable"`
+	// SRTLossAlarmThresholdPct is a 0-100 percentage, not a 0-1 ratio.
+	SRTLossAlarmThresholdPct float64 `json:"srtLossAlarmThresholdPct"`
+	// SRTLossDisconnectEnable forces a publish connection closed once its
+	// loss rate has stayed above SRTLossAlarmThresholdPct continuously for
+	// SRTLossDisconnectSec, so a wedged OBS publisher is made to reconnect
+	// (typically renegotiating a bitrate the link can carry) instead of
+	// degrading indefinitely. Independent of SRTLossAlarmEnable and does not
+	// require MMXControl - a node can self-heal with ppcenter unreachable.
+	SRTLossDisconnectEnable bool `json:"srtLossDisconnectEnable"`
+	SRTLossDisconnectSec    int  `json:"srtLossDisconnectSec"`
+
+	// SRT-simulcast degrade (see docs/obs-mmx-degrade-protocol.md and
+	// internal/degrade): shares the same FSM/WS channel as WebRTCDegrade*
+	// below (same WebRTCDegradeWSPathSuffix/WebRTCDegradeWSSecret) - only
+	// the trigger thresholds are configured separately per protocol, since
+	// SRT and WHIP ingest can have different loss characteristics.
+	// Requires WebRTC to also be enabled, since that's what serves the
+	// degrade WS channel (see Validate). See the WebRTCDegrade*/
+	// WebRTCRecover* comment above for why Degrade*/Recover* are split.
+	SRTDegradeEnable         bool    `json:"srtDegradeEnable"`
+	SRTDegradeInstantLossPct float64 `json:"srtDegradeInstantLossPct"`
+	SRTDegradeAvgLossPct     float64 `json:"srtDegradeAvgLossPct"`
+	SRTRecoverInstantLossPct float64 `json:"srtRecoverInstantLossPct"`
+	SRTRecoverAvgLossPct     float64 `json:"srtRecoverAvgLossPct"`
+	SRTDegradeObservationSec int     `json:"srtDegradeObservationSec"`
 
 	// MoQ server
 	MoQ               bool       `json:"moq"`
@@ -688,6 +730,11 @@ func (conf *Conf) setDefaults() {
 	conf.WebRTCDegradeWSPathSuffix = "/ws/whip"
 	conf.WebRTCDegradeInstantLossPct = 5.0
 	conf.WebRTCDegradeAvgLossPct = 1.0
+	// Recover* defaults equal to Degrade* - zero-width dead zone, i.e. the
+	// old single-threshold behavior - until an operator opts into
+	// hysteresis by lowering Recover* below Degrade*.
+	conf.WebRTCRecoverInstantLossPct = 5.0
+	conf.WebRTCRecoverAvgLossPct = 1.0
 	conf.WebRTCDegradeObservationSec = 60
 	// Default ingest source: pull mmx's own Tencent-forwarded backup domain
 	// back down and republish it locally. "tencent:" gets txSecret/txTime
@@ -719,6 +766,22 @@ func (conf *Conf) setDefaults() {
 	// gosrt's own default (25600 packets); set explicitly so it's a known,
 	// documented value rather than an implicit library default.
 	conf.SRTFC = 25600
+	// Both alarm/disconnect flags default off (opt-in, matching
+	// WebRTCDegradeEnable) so turning either on "just works" with these
+	// numbers without also having to set the threshold/duration.
+	conf.SRTLossAlarmEnable = false
+	conf.SRTLossAlarmThresholdPct = 10.0
+	conf.SRTLossDisconnectEnable = false
+	conf.SRTLossDisconnectSec = 120
+	// Same starting numbers as WebRTCDegrade*'s own defaults below, absent
+	// any SRT-specific tuning data yet - independently adjustable per
+	// protocol once real-world loss characteristics diverge.
+	conf.SRTDegradeEnable = false
+	conf.SRTDegradeInstantLossPct = 5.0
+	conf.SRTDegradeAvgLossPct = 1.0
+	conf.SRTRecoverInstantLossPct = 5.0
+	conf.SRTRecoverAvgLossPct = 1.0
+	conf.SRTDegradeObservationSec = 60
 
 	// MoQ server
 	conf.MoQ = true
@@ -1285,6 +1348,27 @@ func (conf *Conf) Validate(l logger.Writer) error {
 
 	if conf.WebRTCDegradeEnable && conf.WebRTCDegradeWSSecret == "" {
 		return fmt.Errorf("WHIP_WS_SECRET must be set when webrtcDegradeEnable is true")
+	}
+	if conf.WebRTCDegradeEnable && conf.WebRTCRecoverInstantLossPct > conf.WebRTCDegradeInstantLossPct {
+		return fmt.Errorf("'webrtcRecoverInstantLossPct' must be <= 'webrtcDegradeInstantLossPct' " +
+			"(recovering must require loss to fall back to a rate at least as strict as the one that triggered degrading)")
+	}
+	if conf.WebRTCDegradeEnable && conf.WebRTCRecoverAvgLossPct > conf.WebRTCDegradeAvgLossPct {
+		return fmt.Errorf("'webrtcRecoverAvgLossPct' must be <= 'webrtcDegradeAvgLossPct'")
+	}
+
+	if conf.SRTDegradeEnable && conf.WebRTCDegradeWSSecret == "" {
+		return fmt.Errorf("WHIP_WS_SECRET must be set when srtDegradeEnable is true")
+	}
+	if conf.SRTDegradeEnable && !conf.WebRTC {
+		return fmt.Errorf("'webrtc' must be enabled when srtDegradeEnable is true (the degrade WS channel is served by the WebRTC server)")
+	}
+	if conf.SRTDegradeEnable && conf.SRTRecoverInstantLossPct > conf.SRTDegradeInstantLossPct {
+		return fmt.Errorf("'srtRecoverInstantLossPct' must be <= 'srtDegradeInstantLossPct' " +
+			"(recovering must require loss to fall back to a rate at least as strict as the one that triggered degrading)")
+	}
+	if conf.SRTDegradeEnable && conf.SRTRecoverAvgLossPct > conf.SRTDegradeAvgLossPct {
+		return fmt.Errorf("'srtRecoverAvgLossPct' must be <= 'srtDegradeAvgLossPct'")
 	}
 
 	if conf.MMXControl {

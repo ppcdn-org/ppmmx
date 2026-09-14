@@ -49,6 +49,24 @@ rtmp: false
 hls: false
 srt: true
 srtAddress: :7890
+# 丢包率超过 srtLossAlarmThresholdPct(默认 10%)时上报告警到 ppcenter(需要
+# mmxControl 开启);srtLossDisconnectEnable 打开后,持续超阈值满
+# srtLossDisconnectSec(默认 120s)会主动断开该路 SRT 连接,逼 OBS 重新推流。
+# 两个 Enable 默认都是 false,按需单独打开。
+srtLossAlarmEnable: false
+srtLossAlarmThresholdPct: 10.0
+srtLossDisconnectEnable: false
+srtLossDisconnectSec: 120
+# SRT-simulcast degrade：与下面 webrtcDegrade* 共用同一套 FSM/WS 通道
+# (internal/degrade)，密钥/路径复用 webrtcDegradeWSPathSuffix + .env 的
+# WHIP_WS_SECRET，这里只单独配阈值。
+srtDegradeEnable: true
+srtDegradeInstantLossPct: 5.0
+srtDegradeAvgLossPct: 1.0
+# Recover* < Degrade*，同上 webrtcRecover* 的 gap/防抖动理由。
+srtRecoverInstantLossPct: 2.0
+srtRecoverAvgLossPct: 0.5
+srtDegradeObservationSec: 60
 moq: false
 
 # ── WebRTC ────────────────────────────────────
@@ -71,10 +89,14 @@ webrtcABRSwitchCooldown: 3000
 
 # WHIP degrade protocol (docs/obs-mmx-degrade-protocol.md). Secret comes
 # from .env (WHIP_WS_SECRET), not from this file.
+# Recover* < Degrade* 留出一个 gap(死区)：丢包率在两者之间时不升不降，
+# 避免在单一阈值附近来回抖动(反复升降级)。两者相等则等价于旧的单阈值行为。
 webrtcDegradeEnable: true
 webrtcDegradeWSPathSuffix: /ws/whip
 webrtcDegradeInstantLossPct: 5.0
 webrtcDegradeAvgLossPct: 1.0
+webrtcRecoverInstantLossPct: 2.0
+webrtcRecoverAvgLossPct: 0.5
 webrtcDegradeObservationSec: 60
 
 # ── Forward (腾讯云 WHIP 转推) ──────────────────

@@ -25,6 +25,7 @@ import (
 	"github.com/bluenviron/mediamtx/internal/auth"
 	"github.com/bluenviron/mediamtx/internal/conf"
 	"github.com/bluenviron/mediamtx/internal/confwatcher"
+	"github.com/bluenviron/mediamtx/internal/degrade"
 	"github.com/bluenviron/mediamtx/internal/externalcmd"
 	"github.com/bluenviron/mediamtx/internal/forward"
 	"github.com/bluenviron/mediamtx/internal/ingest"
@@ -139,6 +140,7 @@ type Core struct {
 	rtmpsServer      *rtmp.Server
 	hlsServer        *hls.Server
 	webRTCServer     *webrtc.Server
+	degradeManager   *degrade.Manager
 	recMgr           *recording.Manager
 	splitHandler     *recording.SplitRecHandler
 	mmxControl       *mmxcontrol.Client
@@ -424,6 +426,19 @@ func (p *Core) createResources(initial bool) error {
 			return err
 		}
 		p.metrics = i
+	}
+
+	// degradeManager is the shared per-path OBS-degrade FSM registry (see
+	// internal/degrade), fed by both webrtc.Server (WHIP) and srt.Server
+	// (SRT) below - constructed once here, like p.metrics above, rather
+	// than inside either protocol server's own Initialize(), so neither
+	// server's own independent reload/recreation can orphan the other's
+	// reference to it. Gated on conf.WebRTC since that's where the WS
+	// delivery channel is actually served (see webrtc.Server's
+	// DegradeManager field) - a WebRTC-only reason, not tied to whether
+	// WebRTC- or SRT-side degrade is actually enabled.
+	if p.conf.WebRTC && p.degradeManager == nil {
+		p.degradeManager = degrade.NewManager(p)
 	}
 
 	if p.conf.PPROF &&
@@ -805,10 +820,13 @@ func (p *Core) createResources(initial bool) error {
 			ABRSwitchCooldown:     p.conf.WebRTCABRSwitchCooldown,
 			RecMgr:                p.recMgr,
 			SplitHandler:          p.splitHandler,
+			DegradeManager:        p.degradeManager,
 			DegradeEnable:         p.conf.WebRTCDegradeEnable,
 			DegradeWSPathSuffix:   p.conf.WebRTCDegradeWSPathSuffix,
 			DegradeInstantLossPct: p.conf.WebRTCDegradeInstantLossPct,
 			DegradeAvgLossPct:     p.conf.WebRTCDegradeAvgLossPct,
+			RecoverInstantLossPct: p.conf.WebRTCRecoverInstantLossPct,
+			RecoverAvgLossPct:     p.conf.WebRTCRecoverAvgLossPct,
 			DegradeObservationSec: p.conf.WebRTCDegradeObservationSec,
 			DegradeWSSecret:       p.conf.WebRTCDegradeWSSecret,
 			WHIPAuthKey:           p.conf.WebRTCWHIPAuthKey,
@@ -934,7 +952,36 @@ func (p *Core) createResources(initial bool) error {
 			// shared by both ingest protocols.
 			PublishAuthKey:       p.conf.WebRTCWHIPAuthKey,
 			PublishTokenRequired: p.conf.SRTPublishTokenRequired,
-			Parent:               p,
+			// LossDisconnectEnable/Sec apply regardless of MMXControl - a
+			// node can self-heal a wedged publisher without ppcenter
+			// reachable at all. Only LossAlarmReporter (below) needs
+			// mmxControl's endpoint/credential.
+			LossAlarmEnable:       p.conf.SRTLossAlarmEnable,
+			LossAlarmThresholdPct: p.conf.SRTLossAlarmThresholdPct,
+			LossDisconnectEnable:  p.conf.SRTLossDisconnectEnable,
+			LossDisconnectSec:     p.conf.SRTLossDisconnectSec,
+			// DegradeManager is nil when WebRTC is disabled (see its
+			// construction above) - DegradeEnable is forced false in that
+			// case too, since there would be nowhere for the executor to
+			// connect (see conf.Validate's srtDegradeEnable check).
+			DegradeManager:        p.degradeManager,
+			DegradeEnable:         p.conf.SRTDegradeEnable && p.degradeManager != nil,
+			DegradeInstantLossPct: p.conf.SRTDegradeInstantLossPct,
+			DegradeAvgLossPct:     p.conf.SRTDegradeAvgLossPct,
+			RecoverInstantLossPct: p.conf.SRTRecoverInstantLossPct,
+			RecoverAvgLossPct:     p.conf.SRTRecoverAvgLossPct,
+			DegradeObservationSec: p.conf.SRTDegradeObservationSec,
+			Parent:                p,
+		}
+		// Same endpoint/credential reuse as trafficUsage/splitRecFileReporter
+		// above: every mmxControl deployment gets alarm reporting for free
+		// once SRTLossAlarmEnable is on, no separate opt-in credential.
+		if p.conf.MMXControl && p.conf.SRTLossAlarmEnable {
+			i.LossAlarmReporter = srtLossAlarmReporterAdapter{client: mmxcontrol.NewSRTLossAlarmClient(
+				mmxcontrol.DeriveFallbackURL(p.conf.MMXControlURL),
+				p.conf.MMXNodeSecret,
+				10*time.Second,
+			)}
 		}
 		err = i.Initialize()
 		if err != nil {
@@ -1125,6 +1172,20 @@ func (p *Core) closeResources(newConf *conf.Conf, calledByAPI bool) {
 		newConf.WriteTimeout != p.conf.WriteTimeout ||
 		newConf.DumpPackets != p.conf.DumpPackets ||
 		closeAuthManager ||
+		closeLogger
+
+	// closeDegradeManager governs only the shared degrade.Manager singleton
+	// (see its construction above) - deliberately excludes
+	// WebRTCDegrade{Instant,Avg}LossPct/ObservationSec/Enable and the
+	// SRTDegrade* thresholds, since those are passed as per-call parameters
+	// now (see internal/degrade.Thresholds) and don't require the shared
+	// per-path state to be wiped. closeWebRTCServer/closeSRTServer's own
+	// existing WebRTCDegrade*/SRTDegrade* conditions still fully bounce
+	// their respective server on a threshold change, exactly as before.
+	closeDegradeManager := newConf == nil ||
+		newConf.WebRTC != p.conf.WebRTC ||
+		newConf.WebRTCDegradeWSPathSuffix != p.conf.WebRTCDegradeWSPathSuffix ||
+		newConf.WebRTCDegradeWSSecret != p.conf.WebRTCDegradeWSSecret ||
 		closeLogger
 
 	closePPROF := newConf == nil ||
@@ -1328,12 +1389,15 @@ func (p *Core) closeResources(newConf *conf.Conf, calledByAPI bool) {
 		newConf.WebRTCDegradeWSPathSuffix != p.conf.WebRTCDegradeWSPathSuffix ||
 		newConf.WebRTCDegradeInstantLossPct != p.conf.WebRTCDegradeInstantLossPct ||
 		newConf.WebRTCDegradeAvgLossPct != p.conf.WebRTCDegradeAvgLossPct ||
+		newConf.WebRTCRecoverInstantLossPct != p.conf.WebRTCRecoverInstantLossPct ||
+		newConf.WebRTCRecoverAvgLossPct != p.conf.WebRTCRecoverAvgLossPct ||
 		newConf.WebRTCDegradeObservationSec != p.conf.WebRTCDegradeObservationSec ||
 		newConf.WebRTCDegradeWSSecret != p.conf.WebRTCDegradeWSSecret ||
 		newConf.WebRTCWHIPAuthKey != p.conf.WebRTCWHIPAuthKey ||
 		newConf.WebRTCForwardSecret != p.conf.WebRTCForwardSecret ||
 		newConf.DumpPackets != p.conf.DumpPackets ||
 		closeMetrics ||
+		closeDegradeManager ||
 		closePathManager ||
 		closeLogger
 
@@ -1347,7 +1411,18 @@ func (p *Core) closeResources(newConf *conf.Conf, calledByAPI bool) {
 		newConf.RunOnConnect != p.conf.RunOnConnect ||
 		newConf.RunOnConnectRestart != p.conf.RunOnConnectRestart ||
 		newConf.RunOnDisconnect != p.conf.RunOnDisconnect ||
+		newConf.SRTLossAlarmEnable != p.conf.SRTLossAlarmEnable ||
+		newConf.SRTLossAlarmThresholdPct != p.conf.SRTLossAlarmThresholdPct ||
+		newConf.SRTLossDisconnectEnable != p.conf.SRTLossDisconnectEnable ||
+		newConf.SRTLossDisconnectSec != p.conf.SRTLossDisconnectSec ||
+		newConf.SRTDegradeEnable != p.conf.SRTDegradeEnable ||
+		newConf.SRTDegradeInstantLossPct != p.conf.SRTDegradeInstantLossPct ||
+		newConf.SRTDegradeAvgLossPct != p.conf.SRTDegradeAvgLossPct ||
+		newConf.SRTRecoverInstantLossPct != p.conf.SRTRecoverInstantLossPct ||
+		newConf.SRTRecoverAvgLossPct != p.conf.SRTRecoverAvgLossPct ||
+		newConf.SRTDegradeObservationSec != p.conf.SRTDegradeObservationSec ||
 		closeMetrics ||
+		closeDegradeManager ||
 		closePathManager ||
 		closeLogger
 
@@ -1504,6 +1579,14 @@ func (p *Core) closeResources(newConf *conf.Conf, calledByAPI bool) {
 	if closeMetrics && p.metrics != nil {
 		p.metrics.Close()
 		p.metrics = nil
+	}
+
+	// No Close() call needed: Manager owns no OS resources, and
+	// closeDegradeManager always co-occurs with closeWebRTCServer (both
+	// check the same WebRTCDegradeWSPathSuffix/WSSecret fields), whose own
+	// teardown already force-closes every live degrade WS connection.
+	if closeDegradeManager && p.degradeManager != nil {
+		p.degradeManager = nil
 	}
 
 	if closeAuthManager && p.authManager != nil {

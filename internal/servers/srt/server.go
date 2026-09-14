@@ -15,6 +15,7 @@ import (
 
 	"github.com/bluenviron/mediamtx/internal/conf"
 	"github.com/bluenviron/mediamtx/internal/defs"
+	"github.com/bluenviron/mediamtx/internal/degrade"
 	"github.com/bluenviron/mediamtx/internal/externalcmd"
 	"github.com/bluenviron/mediamtx/internal/logger"
 )
@@ -97,7 +98,38 @@ type Server struct {
 	// Off by default so existing SRT publishers and third-party tools keep
 	// working; production should turn it on.
 	PublishTokenRequired bool
-	Parent               serverParent
+	// LossAlarmReporter sends a report to ppcenter whenever a publish
+	// connection's SRT loss rate crosses LossAlarmThresholdPct (and once
+	// more when it drops back under it). Nil disables reporting outright
+	// regardless of LossAlarmEnable, so a deployment with mmxControl off
+	// never needs to touch these fields at all.
+	LossAlarmReporter     srtLossAlarmReporter
+	LossAlarmEnable       bool
+	LossAlarmThresholdPct float64
+	// LossDisconnectEnable forces a publish connection closed once its loss
+	// rate has stayed above LossAlarmThresholdPct continuously for
+	// LossDisconnectSec, so a wedged OBS publisher is made to reconnect
+	// (and typically renegotiate a bitrate the link can carry) instead of
+	// silently degrading indefinitely.
+	LossDisconnectEnable bool
+	LossDisconnectSec    int
+	// DegradeManager is the shared per-path degrade FSM registry (see
+	// internal/degrade), constructed and owned by internal/core alongside
+	// the webrtc.Server that actually serves the degrade WS channel - nil
+	// when WebRTC is disabled, in which case DegradeEnable is forced false
+	// by the caller (there would be nowhere for the executor to connect).
+	DegradeManager        *degrade.Manager
+	DegradeEnable         bool
+	DegradeInstantLossPct float64
+	DegradeAvgLossPct     float64
+	// RecoverInstantLossPct/RecoverAvgLossPct are the hysteresis "recover"
+	// thresholds paired with DegradeInstantLossPct/DegradeAvgLossPct above -
+	// see the Thresholds doc comment in internal/degrade for why they're
+	// separate.
+	RecoverInstantLossPct float64
+	RecoverAvgLossPct     float64
+	DegradeObservationSec int
+	Parent                serverParent
 
 	ctx       context.Context
 	ctxCancel func()
@@ -223,6 +255,20 @@ outer:
 				publishAuthKey:      s.PublishAuthKey,
 				publishTokenReq:     s.PublishTokenRequired,
 				parent:              s,
+
+				lossAlarmReporter:     s.LossAlarmReporter,
+				lossAlarmEnable:       s.LossAlarmEnable,
+				lossAlarmThresholdPct: s.LossAlarmThresholdPct,
+				lossDisconnectEnable:  s.LossDisconnectEnable,
+				lossDisconnectSec:     s.LossDisconnectSec,
+
+				degradeManager:        s.DegradeManager,
+				degradeEnable:         s.DegradeEnable,
+				degradeInstantLossPct: s.DegradeInstantLossPct,
+				degradeAvgLossPct:     s.DegradeAvgLossPct,
+				recoverInstantLossPct: s.RecoverInstantLossPct,
+				recoverAvgLossPct:     s.RecoverAvgLossPct,
+				degradeObservationSec: s.DegradeObservationSec,
 			}
 			c.initialize()
 			s.conns[c] = struct{}{}

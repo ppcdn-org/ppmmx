@@ -16,6 +16,7 @@ import (
 	"github.com/bluenviron/mediamtx/internal/auth"
 	"github.com/bluenviron/mediamtx/internal/conf"
 	"github.com/bluenviron/mediamtx/internal/defs"
+	"github.com/bluenviron/mediamtx/internal/degrade"
 	"github.com/bluenviron/mediamtx/internal/errordumper"
 	"github.com/bluenviron/mediamtx/internal/externalcmd"
 	"github.com/bluenviron/mediamtx/internal/hooks"
@@ -58,6 +59,20 @@ type conn struct {
 	publishAuthKey      string
 	publishTokenReq     bool
 	parent              *Server
+
+	lossAlarmReporter     srtLossAlarmReporter
+	lossAlarmEnable       bool
+	lossAlarmThresholdPct float64
+	lossDisconnectEnable  bool
+	lossDisconnectSec     int
+
+	degradeManager        *degrade.Manager
+	degradeEnable         bool
+	degradeInstantLossPct float64
+	degradeAvgLossPct     float64
+	recoverInstantLossPct float64
+	recoverAvgLossPct     float64
+	degradeObservationSec int
 
 	ctx       context.Context
 	ctxCancel func()
@@ -295,6 +310,9 @@ func (c *conn) runPublishReader(sconn srt.Conn, streamID *streamID, pathConf *co
 	statsDone := make(chan struct{})
 	defer close(statsDone)
 	go c.runReceiveStatsSummary(sconn, streamID.path, statsDone)
+	if c.degradeEnable {
+		go c.runDegradeSampling(sconn, streamID.path, len(videoTracks), statsDone)
+	}
 
 	for {
 		err = r.Read()
@@ -313,6 +331,7 @@ func (c *conn) runReceiveStatsSummary(sconn srt.Conn, pathName string, done <-ch
 	defer ticker.Stop()
 
 	var sampler recvstats.Sampler
+	var lossTracker sustainedLossTracker
 	var st srt.Statistics
 	sconn.Stats(&st)
 	sampler.Sample(st.Accumulated.ByteRecv, st.Accumulated.PktRecv, st.Accumulated.PktRecvLoss, time.Now()) // seed baseline
@@ -356,7 +375,68 @@ func (c *conn) runReceiveStatsSummary(sconn srt.Conn, pathName string, done <-ch
 				lastBelated = st.Accumulated.PktRecvBelated
 
 				c.Log(logger.Info, "%s", snap.LogLine("srt", pathName))
+
+				if c.lossAlarmEnable || c.lossDisconnectEnable {
+					decision := lossTracker.update(snap.LossPct, c.lossAlarmThresholdPct, c.lossDisconnectEnable,
+						time.Duration(c.lossDisconnectSec)*time.Second, time.Now())
+
+					if c.lossAlarmEnable && decision.ShouldReport && c.lossAlarmReporter != nil {
+						reporter, path := c.lossAlarmReporter, pathName
+						lossPct, bitrateBps, sustainedSec := snap.LossPct, snap.BitrateBps, int(decision.Sustained.Seconds())
+						go func() {
+							ctx, cancel := context.WithTimeout(c.ctx, 10*time.Second)
+							defer cancel()
+							if err := reporter.ReportSRTLoss(ctx, path, lossPct, bitrateBps, sustainedSec); err != nil {
+								c.Log(logger.Debug, "SRT loss alarm report failed: %v", err)
+							}
+						}()
+					}
+
+					if decision.ShouldDisconnect {
+						c.Log(logger.Warn, "SRT loss=%.2f%% sustained %s >= %ds, forcing disconnect so the publisher reconnects",
+							snap.LossPct, decision.Sustained.Round(time.Second), c.lossDisconnectSec)
+						c.Close()
+						return
+					}
+				}
 			}
+
+		case <-done:
+			return
+
+		case <-c.ctx.Done():
+			return
+		}
+	}
+}
+
+// runDegradeSampling periodically feeds this SRT publish connection's
+// cumulative packet loss/received counters into the path's degrade FSM
+// (see internal/degrade and docs/obs-mmx-degrade-protocol.md), at the same
+// 1-second cadence WHIP's own equivalent uses (degrade.SampleInterval) -
+// the FSM's trailing average window is calibrated assuming every caller
+// samples at that exact cadence. videoLayers is this connection's
+// multiplexed video track count (see runPublishReader's
+// mpegts.ValidateVideoTracks call), SRT's analog of WHIP's inbound
+// Simulcast track count.
+func (c *conn) runDegradeSampling(sconn srt.Conn, pathName string, videoLayers int, done <-chan struct{}) {
+	c.degradeManager.ObserveSessionLayers(pathName, videoLayers)
+
+	ticker := time.NewTicker(degrade.SampleInterval)
+	defer ticker.Stop()
+
+	var st srt.Statistics
+	for {
+		select {
+		case <-ticker.C:
+			sconn.Stats(&st)
+			c.degradeManager.RecordSample(pathName, st.Accumulated.PktRecvLoss, st.Accumulated.PktRecv, degrade.Thresholds{
+				DegradeInstantLossPct: c.degradeInstantLossPct,
+				DegradeAvgLossPct:     c.degradeAvgLossPct,
+				RecoverInstantLossPct: c.recoverInstantLossPct,
+				RecoverAvgLossPct:     c.recoverAvgLossPct,
+				ObservationSec:        c.degradeObservationSec,
+			})
 
 		case <-done:
 			return

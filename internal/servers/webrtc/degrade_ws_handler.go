@@ -83,9 +83,9 @@ func (s *httpServer) handleWHIPDegradeWebSocket(ctx *gin.Context, pathName strin
 	}
 	defer conn.Close()
 
-	ds := s.parent.getOrCreateDegradeState(pathName)
-	ds.bindConn(conn)
-	defer ds.unbindConn(conn)
+	ds := s.parent.DegradeManager.GetOrCreate(pathName)
+	ds.BindConn(conn)
+	defer ds.UnbindConn(conn)
 
 	s.Log(logger.Info, "[degrade] path=%s executor connected", pathName)
 	defer s.Log(logger.Info, "[degrade] path=%s executor disconnected", pathName)
