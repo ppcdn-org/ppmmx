@@ -256,6 +256,7 @@ class MediaMTXWebRTCReader {
     this.sessionUrl = null;
     this.queuedCandidates = [];
     this.nonAdvertisedCodecs = [];
+    this.connectedFired = false;
     this.#getNonAdvertisedCodecs();
   }
 
@@ -286,6 +287,7 @@ class MediaMTXWebRTCReader {
     this.sessionUrl = null;
     this.offerData = null;
     this.queuedCandidates = [];
+    this.connectedFired = false;
     if (staleSessionUrl) {
       fetch(staleSessionUrl, { method: 'DELETE', keepalive: true }).catch(() => {});
     }
@@ -353,6 +355,7 @@ class MediaMTXWebRTCReader {
       this.offerData = null;
       this.sessionUrl = null;
       this.queuedCandidates = [];
+      this.connectedFired = false;
       if (staleSessionUrl) {
         fetch(staleSessionUrl, { method: 'DELETE', keepalive: true }).catch(() => {});
       }
@@ -381,21 +384,20 @@ class MediaMTXWebRTCReader {
   }
 
   #start() {
+    // onConnected no longer fires here: setAnswer resolving only means SDP
+    // signaling finished, not that ICE has actually connected (see
+    // #onConnectionState, which is what fires it now, gated on
+    // pc.connectionState === 'connected'). Firing it this early raced the
+    // ABR control WebSocket against the server's own "session actually
+    // ready" flag (see internal/servers/webrtc/abr_ws_handler.go's
+    // abrReady) - a caller opening /ws/control on this signal alone could,
+    // and on cross-region links regularly did, hit a 409 "media session is
+    // not ready" before ICE finished, since the server doesn't consider a
+    // reader ready until well after the SDP answer goes out.
     this.#requestICEServers()
       .then((iceServers) => this.#setupPeerConnection(iceServers))
       .then((offer) => this.#sendOffer(offer))
       .then((answer) => this.#setAnswer(answer))
-      .then(() => {
-          // close() only flips this.state; it can't cancel a promise chain
-          // already in flight. Without this check, a stale reader whose
-          // negotiation finishes *after* the user switched to a new URL
-          // and started a new session would still fire onConnected here,
-          // spinning up a control client for a session that's already
-          // gone (and that nothing will ever clean up — an endless,
-          // silently-failing WS reconnect loop against a dead session_id).
-          if (this.state !== 'running') return;
-          if (this.conf.onConnected) this.conf.onConnected();
-      })
       .catch((err) => {
         console.error(err);
         this.#handleError(err.toString());
@@ -514,6 +516,18 @@ class MediaMTXWebRTCReader {
     if (this.state !== 'running') return;
     if (this.pc.connectionState === 'failed' || this.pc.connectionState === 'closed') {
       this.#handleError('peer connection closed');
+      return;
+    }
+    // Fire onConnected once ICE has actually finished, not merely once SDP
+    // signaling has (see #start's doc comment on why this moved here).
+    // connectedFired guards against firing again on a later state
+    // fluctuation (e.g. connected -> disconnected -> connected) within the
+    // same reader lifetime; close()/#handleError reset it so a genuine new
+    // session (after a restart) fires onConnected again for its own
+    // connection.
+    if (this.pc.connectionState === 'connected' && !this.connectedFired) {
+      this.connectedFired = true;
+      if (this.conf.onConnected) this.conf.onConnected();
     }
   }
 
