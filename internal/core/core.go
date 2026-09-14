@@ -717,8 +717,14 @@ func (p *Core) createResources(initial bool) error {
 
 	if p.conf.WebRTC &&
 		p.webRTCServer == nil {
-		// Initialize recording manager (if not already done)
-		if p.recMgr == nil {
+		// Initialize recording manager (if not already done). Only a
+		// NODE_ROLE_RECORDER node ever receives split-rec calls (see
+		// docs/api/recording.md - split-rec talks directly to
+		// mmx-recorder), so origin/edge nodes have no use for
+		// data/recordings.db or /api/split-rec at all; creating it
+		// unconditionally on every role just left an unused sqlite file on
+		// every node's disk.
+		if p.recMgr == nil && p.conf.MMXNodeRole == "NODE_ROLE_RECORDER" {
 			store, err := recording.OpenStore("./data/recordings.db")
 			if err != nil {
 				// create data dir and retry
@@ -1304,6 +1310,7 @@ func (p *Core) closeResources(newConf *conf.Conf, calledByAPI bool) {
 		newConf.WebRTCHandshakeTimeout != p.conf.WebRTCHandshakeTimeout ||
 		newConf.WebRTCTrackGatherTimeout != p.conf.WebRTCTrackGatherTimeout ||
 		newConf.SplitRecAuthMode != p.conf.SplitRecAuthMode ||
+		newConf.MMXNodeRole != p.conf.MMXNodeRole ||
 		newConf.NetStorageEnv != p.conf.NetStorageEnv ||
 		newConf.NetStorageS3Bucket != p.conf.NetStorageS3Bucket ||
 		newConf.NetStorageS3Region != p.conf.NetStorageS3Region ||
@@ -1428,7 +1435,8 @@ func (p *Core) closeResources(newConf *conf.Conf, calledByAPI bool) {
 			p.trafficUsage = nil
 		}
 	}
-	if (newConf == nil || !newConf.WebRTC || closePathManager) && p.recMgr != nil {
+	if (newConf == nil || !newConf.WebRTC || closePathManager ||
+		newConf.MMXNodeRole != p.conf.MMXNodeRole) && p.recMgr != nil {
 		_ = p.recMgr.Close()
 		p.recMgr = nil
 		p.splitHandler = nil
