@@ -413,7 +413,6 @@ type Conf struct {
 	WebRTCABRWSPath         string `json:"webrtcABRWSPath"`
 	WebRTCABRSwitchCooldown int    `json:"webrtcABRSwitchCooldown"`
 	SplitRecAuthMode        string `json:"splitRecAuthMode"`
-	SplitRecAuthSecret      string `json:"-"`
 	TXSecretKeyBack         string `json:"-"`
 
 	// WHIP degrade (OBS <-> mmx RTP-loss negotiation, see
@@ -527,6 +526,25 @@ type Conf struct {
 	// controls whether omitting it is allowed, so existing publishers and
 	// third-party SRT tools keep working until it's turned on.
 	SRTPublishTokenRequired bool `json:"srtPublishTokenRequired"`
+	// SRTLatency is the SRT protocol's own retransmission buffer, i.e. how
+	// long a packet is held before TSBPD delivers it, giving NAK-triggered
+	// retransmits time to arrive over a lossy/jittery public-internet link
+	// (e.g. OBS -> origin). gosrt's default (120ms) is tuned for
+	// low-latency conferencing, not a burst-tolerant CDN ingest path;
+	// raise this first when SRT publishers see packet loss - see
+	// internal/servers/srt/server.go's Initialize() doc comment for why
+	// UDPReadBufferSize/SRTO_RCVBUF do NOT help here (gosrt v0.11.0 parses
+	// but never applies that one).
+	SRTLatency Duration `json:"srtLatency"`
+	// SRTFC is the flow control window in packets (SRTO_FC): the maximum
+	// number of packets that can be in flight unacknowledged. Too small a
+	// window silently caps effective throughput on a high-bitrate/high-RTT
+	// link before loss is even the limiting factor. uint (not gosrt's own
+	// uint32) because internal/conf/env's reflection-based loader only
+	// knows the fixed set of scalar types it special-cases
+	// (string/int/uint/float64/bool) - see env.go's loadEnvInternal
+	// default case.
+	SRTFC uint `json:"srtFC"`
 
 	// MoQ server
 	MoQ               bool       `json:"moq"`
@@ -694,6 +712,13 @@ func (conf *Conf) setDefaults() {
 	// SRT server
 	conf.SRT = true
 	conf.SRTAddress = ":8890"
+	// 300ms (vs. gosrt's 120ms default): gives NAK-triggered retransmits
+	// more time to land on a jittery public-internet publish link before
+	// TSBPD gives up on a packet - see the SRTLatency field doc above.
+	conf.SRTLatency = 300 * Duration(time.Millisecond)
+	// gosrt's own default (25600 packets); set explicitly so it's a known,
+	// documented value rather than an implicit library default.
+	conf.SRTFC = 25600
 
 	// MoQ server
 	conf.MoQ = true
@@ -727,7 +752,6 @@ func Load(fpath string, defaultConfPaths []string, l logger.Writer) (*Conf, stri
 		return nil, "", err
 	}
 	conf.TencentWHIPSecretKey = DotenvValue("TX_SECRET_KEY")
-	conf.SplitRecAuthSecret = DotenvValue("SPLIT_REC_SECRET")
 	conf.TXSecretKeyBack = DotenvValue("TX_SECRET_KEY_BACK")
 	conf.WebRTCDegradeWSSecret = DotenvValue("WHIP_WS_SECRET")
 	conf.WebRTCWHIPAuthKey = DotenvValue("WHIP_AUTH_KEY")
@@ -1257,9 +1281,6 @@ func (conf *Conf) Validate(l logger.Writer) error {
 	// Forward (Tencent Cloud WHIP relay)
 	if conf.SplitRecAuthMode != "simple" && conf.SplitRecAuthMode != "advance" {
 		return fmt.Errorf("'splitRecAuthMode' must be either 'simple' or 'advance'")
-	}
-	if conf.SplitRecAuthMode == "advance" && conf.SplitRecAuthSecret == "" {
-		return fmt.Errorf("SPLIT_REC_SECRET must be set when splitRecAuthMode is advance")
 	}
 
 	if conf.WebRTCDegradeEnable && conf.WebRTCDegradeWSSecret == "" {

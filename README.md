@@ -35,7 +35,7 @@ mmx 是基于 [MediaMTX](https://github.com/bluenviron/mediamtx) v1.19.1 二次�
 
 ### 按需录像控制 API
 
-- `POST /api/split-rec`:供上游业务系统(如 game-server)调用,按桌台/房间触发录像分段或启停,支持 `simple`(MD5)和 `advance`(HMAC-SHA256,需 `SPLIT_REC_SECRET`)两种鉴权模式。
+- `POST /api/split-rec`:供上游业务系统(如 game-server)调用,按桌台/房间触发录像分段或启停,支持 `simple`(MD5)和 `advance`(HMAC-SHA256)两种鉴权模式;签名密钥不再是部署级共享密钥,而是调用方自己的 `appSecret`(mmx 每 30s 从 ppcenter 同步 appId→appSecret,见 `GET /internal/mmx/v1/app-credentials/sync`)。
 - 详见 [doc/api/api-split-rec.md](../doc/api/api-split-rec.md)。
 
 ### 管理后台 + 双播放器
@@ -80,7 +80,6 @@ build.bat
 | `MMXADMIN_PASSWORD` | 管理后台首次启动的管理员密码 | 可选,管理后台首次启动时使用;未设置时会自动生成随机密码并打印到日志(之后密码存入本地 sqlite,不再依赖此变量) |
 | `TX_SECRET_KEY` | 腾讯云 WHIP 转推防盗链签名密钥 | `tencentWHIPEnable: true` 时必需 |
 | `TX_SECRET_KEY_BACK` | 腾讯云播放地址(backup play URI)签名密钥 | 使用 `/api/playUri` 的 backup 地址时必需 |
-| `SPLIT_REC_SECRET` | `/api/split-rec` 的 HMAC-SHA256 鉴权密钥 | `splitRecAuthMode: advance` 时必需 |
 
 ### 运行
 

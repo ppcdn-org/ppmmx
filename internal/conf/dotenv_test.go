@@ -89,9 +89,13 @@ func TestSplitRecAuthValidation(t *testing.T) {
 	conf.SplitRecAuthMode = "invalid"
 	require.EqualError(t, conf.Validate(nil), "'splitRecAuthMode' must be either 'simple' or 'advance'")
 
+	// "advance" no longer requires a deployment-wide secret - split-rec
+	// verifies against the caller's own appSecret instead (see
+	// recording.AppSecretLookup), synced from ppcenter rather than
+	// configured locally.
 	conf.setDefaults()
 	conf.SplitRecAuthMode = "advance"
-	require.EqualError(t, conf.Validate(nil), "SPLIT_REC_SECRET must be set when splitRecAuthMode is advance")
+	require.NoError(t, conf.Validate(nil))
 }
 
 func TestBackSecretFromEnvironment(t *testing.T) {

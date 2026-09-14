@@ -11,13 +11,15 @@ import (
 )
 
 // fakeViewResolver is a controllable TableViewResolver for testing
-// table-with-multiple-views fan-out.
+// table-with-multiple-views fan-out. Only returns view names - the actual
+// path (appId+"/"+table+"-"+view) is derived by tableToPaths, not by the
+// resolver (see TableViewResolver's doc comment).
 type fakeViewResolver struct {
 	views map[string][]string
 }
 
-func (f *fakeViewResolver) ViewsForStream(streamName string) ([]string, error) {
-	return f.views[streamName], nil
+func (f *fakeViewResolver) ViewsForTable(table string) ([]string, error) {
+	return f.views[table], nil
 }
 
 // multiviewTestController is a PathController whose SplitRecording result
@@ -53,9 +55,10 @@ func (c *multiviewTestController) SplitRecording(renameTo string) (string, error
 }
 
 func TestStartRoundRecordsEveryConfiguredView(t *testing.T) {
+	const appID = "app1"
 	const table = "table1"
-	pathFwh := "live/table1-fwh"
-	pathFwv := "live/table1-fwv"
+	pathFwh := "app1/table1-fwh"
+	pathFwv := "app1/table1-fwv"
 
 	mgr := newTestManager(t)
 	ctrlFwh := &multiviewTestController{}
@@ -68,19 +71,19 @@ func TestStartRoundRecordsEveryConfiguredView(t *testing.T) {
 	h := NewSplitRecHandler(mgr, nil, test.NilLogger)
 	h.SetViewResolver(&fakeViewResolver{views: map[string][]string{table: {"fwh", "fwv"}}})
 
-	startReq := splitRecRequest{Time: "9999999999", TableID: table, GameID: "game1"}
+	startReq := splitRecRequest{Time: "9999999999", AppID: appID, TableID: table, GameID: "game1"}
 	c := newSplitRecGinContext()
 	require.NoError(t, h.execute(c, startReq))
 
 	require.Equal(t, 1, ctrlFwh.splitCount, "fwh view must be started")
 	require.Equal(t, 1, ctrlFwv.splitCount, "fwv view must also be started, not just the first match")
 
-	// A concurrent start for the same table must be rejected, even though
-	// the request only names the table (no view), confirming the lock is
-	// table-scoped rather than per-path.
+	// A concurrent start for the same (appId, table) must be rejected, even
+	// though the request only names the table (no view), confirming the
+	// lock is table-scoped rather than per-path.
 	require.Error(t, h.execute(newSplitRecGinContext(), startReq))
 
-	stopReq := splitRecRequest{Time: "9999999999", TableID: table, GameID: "game1", GameRound: "round1"}
+	stopReq := splitRecRequest{Time: "9999999999", AppID: appID, TableID: table, GameID: "game1", GameRound: "round1"}
 	require.NoError(t, h.execute(newSplitRecGinContext(), stopReq))
 
 	require.Equal(t, []string{"table1-fwh-round1-game1"}, ctrlFwh.renamedTo)
@@ -88,8 +91,9 @@ func TestStartRoundRecordsEveryConfiguredView(t *testing.T) {
 }
 
 func TestStartRoundSkipsMissingViewButRecordsTheRest(t *testing.T) {
+	const appID = "app1"
 	const table = "table1"
-	pathFwh := "live/table1-fwh"
+	pathFwh := "app1/table1-fwh"
 	// pathFwv is intentionally never started with mgr.Start: it has no
 	// publisher/controller, simulating a configured view that isn't live.
 
@@ -101,39 +105,41 @@ func TestStartRoundSkipsMissingViewButRecordsTheRest(t *testing.T) {
 	h := NewSplitRecHandler(mgr, nil, test.NilLogger)
 	h.SetViewResolver(&fakeViewResolver{views: map[string][]string{table: {"fwh", "fwv"}}})
 
-	startReq := splitRecRequest{Time: "9999999999", TableID: table, GameID: "game1"}
+	startReq := splitRecRequest{Time: "9999999999", AppID: appID, TableID: table, GameID: "game1"}
 	require.NoError(t, h.execute(newSplitRecGinContext(), startReq))
 	require.Equal(t, 1, ctrlFwh.splitCount, "the view that is live must still be recorded")
 
-	stopReq := splitRecRequest{Time: "9999999999", TableID: table, GameID: "game1", GameRound: "round1"}
+	stopReq := splitRecRequest{Time: "9999999999", AppID: appID, TableID: table, GameID: "game1", GameRound: "round1"}
 	require.NoError(t, h.execute(newSplitRecGinContext(), stopReq))
 	require.Equal(t, []string{"table1-fwh-round1-game1"}, ctrlFwh.renamedTo)
 }
 
 func TestStartRoundFailsWhenNoConfiguredViewIsLive(t *testing.T) {
+	const appID = "app1"
 	const table = "table1"
 
 	mgr := newTestManager(t)
 	h := NewSplitRecHandler(mgr, nil, test.NilLogger)
 	h.SetViewResolver(&fakeViewResolver{views: map[string][]string{table: {"fwh", "fwv"}}})
 
-	startReq := splitRecRequest{Time: "9999999999", TableID: table, GameID: "game1"}
+	startReq := splitRecRequest{Time: "9999999999", AppID: appID, TableID: table, GameID: "game1"}
 	err := h.execute(newSplitRecGinContext(), startReq)
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "no path found")
+	require.Contains(t, err.Error(), "not online")
 
 	// The table lock must be released on total failure: retrying fails the
-	// same way (no path found), not with "already being recorded" - proof
-	// a failed start doesn't leave the table permanently locked.
+	// same way (not online), not with "already being recorded" - proof a
+	// failed start doesn't leave the table permanently locked.
 	err = h.execute(newSplitRecGinContext(), startReq)
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "no path found")
+	require.Contains(t, err.Error(), "not online")
 }
 
 func TestStopRoundContinuesOnPerPathFailure(t *testing.T) {
+	const appID = "app1"
 	const table = "table1"
-	pathFwh := "live/table1-fwh"
-	pathFwv := "live/table1-fwv"
+	pathFwh := "app1/table1-fwh"
+	pathFwv := "app1/table1-fwv"
 
 	mgr := newTestManager(t)
 	ctrlFwh := &multiviewTestController{}
@@ -146,20 +152,21 @@ func TestStopRoundContinuesOnPerPathFailure(t *testing.T) {
 	h := NewSplitRecHandler(mgr, nil, test.NilLogger)
 	h.SetViewResolver(&fakeViewResolver{views: map[string][]string{table: {"fwh", "fwv"}}})
 
-	startReq := splitRecRequest{Time: "9999999999", TableID: table, GameID: "game1"}
+	startReq := splitRecRequest{Time: "9999999999", AppID: appID, TableID: table, GameID: "game1"}
 	require.NoError(t, h.execute(newSplitRecGinContext(), startReq))
 
 	// fwv's stop-time split will fail; fwh's must still succeed and finalize.
 	ctrlFwv.splitErr = fmt.Errorf("split failed")
-	stopReq := splitRecRequest{Time: "9999999999", TableID: table, GameID: "game1", GameRound: "round1"}
+	stopReq := splitRecRequest{Time: "9999999999", AppID: appID, TableID: table, GameID: "game1", GameRound: "round1"}
 	require.NoError(t, h.execute(newSplitRecGinContext(), stopReq),
 		"one broken view must not prevent finalizing the others")
 	require.Equal(t, []string{"table1-fwh-round1-game1"}, ctrlFwh.renamedTo)
 }
 
 func TestAppEnvDistinguishesOwnersWithSameGame(t *testing.T) {
+	const appID = "app1"
 	const table = "table1"
-	path := "live/table1-fwh"
+	path := "app1/table1-fwh"
 
 	mgr := newTestManager(t)
 	ctrl := &multiviewTestController{}
@@ -172,22 +179,22 @@ func TestAppEnvDistinguishesOwnersWithSameGame(t *testing.T) {
 	// so the second start is rejected as "already being recorded by
 	// another game" rather than "already has an active recording" (which
 	// would imply it's the same owner retrying).
-	startReq := splitRecRequest{Time: "9999999999", TableID: table, GameID: "p2w001", AppEnv: "test"}
+	startReq := splitRecRequest{Time: "9999999999", AppID: appID, TableID: table, GameID: "p2w001", AppEnv: "test"}
 	require.NoError(t, h.execute(newSplitRecGinContext(), startReq))
 
-	otherEnvReq := splitRecRequest{Time: "9999999999", TableID: table, GameID: "p2w001", AppEnv: "prod"}
+	otherEnvReq := splitRecRequest{Time: "9999999999", AppID: appID, TableID: table, GameID: "p2w001", AppEnv: "prod"}
 	err = h.execute(newSplitRecGinContext(), otherEnvReq)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "already being recorded by another game")
 
 	// The owner that did not start the round cannot stop it either.
-	otherEnvStop := splitRecRequest{Time: "9999999999", TableID: table, GameID: "p2w001", AppEnv: "prod", GameRound: "round1"}
+	otherEnvStop := splitRecRequest{Time: "9999999999", AppID: appID, TableID: table, GameID: "p2w001", AppEnv: "prod", GameRound: "round1"}
 	err = h.execute(newSplitRecGinContext(), otherEnvStop)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "started by a different game")
 
 	// The original owner (same app_env) can still stop it.
-	stopReq := splitRecRequest{Time: "9999999999", TableID: table, GameID: "p2w001", AppEnv: "test", GameRound: "round1"}
+	stopReq := splitRecRequest{Time: "9999999999", AppID: appID, TableID: table, GameID: "p2w001", AppEnv: "test", GameRound: "round1"}
 	require.NoError(t, h.execute(newSplitRecGinContext(), stopReq))
 }
 
@@ -204,8 +211,9 @@ func TestAppEnvDistinguishesOwnersWithSameGame(t *testing.T) {
 // findController can see it), so more than one running row can exist per
 // path and FindRunning's unordered SELECT could pick either one.
 func TestStartRoundPersistsAppEnvToAuditRecord(t *testing.T) {
-	pathWithEnv := "live/table1-fwh"
-	pathWithoutEnv := "live/table2-fwh"
+	const appID = "app1"
+	pathWithEnv := "app1/table1-fwh"
+	pathWithoutEnv := "app1/table2-fwh"
 
 	mgr := newTestManager(t)
 	ctrlWithEnv := &multiviewTestController{}
@@ -217,14 +225,14 @@ func TestStartRoundPersistsAppEnvToAuditRecord(t *testing.T) {
 
 	h := NewSplitRecHandler(mgr, nil, test.NilLogger)
 
-	startWithEnv := splitRecRequest{Time: "9999999999", TableID: "table1", GameID: "p2w001", AppEnv: "uat"}
+	startWithEnv := splitRecRequest{Time: "9999999999", AppID: appID, TableID: "table1", GameID: "p2w001", AppEnv: "uat"}
 	require.NoError(t, h.execute(newSplitRecGinContext(), startWithEnv))
-	recordIDWithEnv := h.activeGames["table1"].recordIDs[pathWithEnv]
+	recordIDWithEnv := h.activeGames[tableLockKey(appID, "table1")].recordIDs[pathWithEnv]
 	require.NotEmpty(t, recordIDWithEnv)
 
-	startWithoutEnv := splitRecRequest{Time: "9999999999", TableID: "table2", GameID: "p2w002"}
+	startWithoutEnv := splitRecRequest{Time: "9999999999", AppID: appID, TableID: "table2", GameID: "p2w002"}
 	require.NoError(t, h.execute(newSplitRecGinContext(), startWithoutEnv))
-	recordIDWithoutEnv := h.activeGames["table2"].recordIDs[pathWithoutEnv]
+	recordIDWithoutEnv := h.activeGames[tableLockKey(appID, "table2")].recordIDs[pathWithoutEnv]
 	require.NotEmpty(t, recordIDWithoutEnv)
 
 	recWithEnv, err := mgr.Store().Get(recordIDWithEnv)
@@ -241,8 +249,9 @@ func TestStartRoundPersistsAppEnvToAuditRecord(t *testing.T) {
 }
 
 func TestNoAppEnvFallsBackToGameOnlyOwnership(t *testing.T) {
+	const appID = "app1"
 	const table = "table1"
-	path := "live/table1-fwh"
+	path := "app1/table1-fwh"
 
 	mgr := newTestManager(t)
 	ctrl := &multiviewTestController{}
@@ -253,10 +262,10 @@ func TestNoAppEnvFallsBackToGameOnlyOwnership(t *testing.T) {
 
 	// No app_env in either call: behaves exactly like before (game alone
 	// identifies the owner).
-	startReq := splitRecRequest{Time: "9999999999", TableID: table, GameID: "p2w001"}
+	startReq := splitRecRequest{Time: "9999999999", AppID: appID, TableID: table, GameID: "p2w001"}
 	require.NoError(t, h.execute(newSplitRecGinContext(), startReq))
 
-	stopReq := splitRecRequest{Time: "9999999999", TableID: table, GameID: "p2w001", GameRound: "round1"}
+	stopReq := splitRecRequest{Time: "9999999999", AppID: appID, TableID: table, GameID: "p2w001", GameRound: "round1"}
 	require.NoError(t, h.execute(newSplitRecGinContext(), stopReq))
 }
 
@@ -268,6 +277,7 @@ func TestNoAppEnvFallsBackToGameOnlyOwnership(t *testing.T) {
 // held by a *different* owner, which is a real conflict and must still
 // fail (see TestAppEnvDistinguishesOwnersWithSameGame).
 func TestStopRoundWithoutPriorStartIsDroppedNotAnError(t *testing.T) {
+	const appID = "app1"
 	const table = "table1"
 
 	mgr := newTestManager(t)
@@ -275,23 +285,53 @@ func TestStopRoundWithoutPriorStartIsDroppedNotAnError(t *testing.T) {
 	h.SetViewResolver(&fakeViewResolver{views: map[string][]string{table: {"fwh", "fwv"}}})
 
 	// No start round was ever issued for this table.
-	stopReq := splitRecRequest{Time: "9999999999", TableID: table, GameID: "game1", GameRound: "round1"}
+	stopReq := splitRecRequest{Time: "9999999999", AppID: appID, TableID: table, GameID: "game1", GameRound: "round1"}
 	require.NoError(t, h.execute(newSplitRecGinContext(), stopReq),
 		"a stop with no matching start must be dropped, not treated as an error")
 
 	// The table must remain free to start afterward - the dropped stop
 	// must not have left any stray lock/state behind.
-	startReq := splitRecRequest{Time: "9999999999", TableID: table, GameID: "game1"}
-	path := "live/table1-fwh"
+	startReq := splitRecRequest{Time: "9999999999", AppID: appID, TableID: table, GameID: "game1"}
+	path := "app1/table1-fwh"
 	ctrl := &multiviewTestController{}
 	_, err := mgr.Start(path, Options{Format: "fmp4"}, ctrl)
 	require.NoError(t, err)
 	require.NoError(t, h.execute(newSplitRecGinContext(), startReq))
 }
 
+// TestDifferentAppsWithSameTableIDDoNotContendForTheLock verifies that the
+// activeGames lock is scoped to (appId, tableId), not tableId alone: two
+// different apps using the identical tableId string must be able to hold
+// independent rounds at the same time, since their resolved paths
+// (appId+"/"+tableId+"-"+view) are unrelated physical streams.
+func TestDifferentAppsWithSameTableIDDoNotContendForTheLock(t *testing.T) {
+	const table = "table"
+
+	mgr := newTestManager(t)
+	ctrlA := &multiviewTestController{}
+	ctrlB := &multiviewTestController{}
+	_, err := mgr.Start("appA/table-fwh", Options{Format: "fmp4"}, ctrlA)
+	require.NoError(t, err)
+	_, err = mgr.Start("appB/table-fwh", Options{Format: "fmp4"}, ctrlB)
+	require.NoError(t, err)
+
+	h := NewSplitRecHandler(mgr, nil, test.NilLogger)
+
+	startA := splitRecRequest{Time: "9999999999", AppID: "appA", TableID: table, GameID: "game1"}
+	require.NoError(t, h.execute(newSplitRecGinContext(), startA))
+
+	startB := splitRecRequest{Time: "9999999999", AppID: "appB", TableID: table, GameID: "game1"}
+	require.NoError(t, h.execute(newSplitRecGinContext(), startB),
+		"a different app with the same tableId string must not be blocked by appA's lock")
+
+	require.Equal(t, 1, ctrlA.splitCount)
+	require.Equal(t, 1, ctrlB.splitCount)
+}
+
 func TestSingleViewTableStillWorksWithoutResolver(t *testing.T) {
+	const appID = "app1"
 	const table = "legacy-table"
-	path := "live/legacy-table-fwh"
+	path := "app1/legacy-table-fwh"
 
 	mgr := newTestManager(t)
 	ctrl := &multiviewTestController{}
@@ -299,13 +339,13 @@ func TestSingleViewTableStillWorksWithoutResolver(t *testing.T) {
 	require.NoError(t, err)
 
 	h := NewSplitRecHandler(mgr, nil, test.NilLogger)
-	// No SetViewResolver call: falls back to the legacy default.
+	// No SetViewResolver call: falls back to the single-view "fwh" default.
 
-	startReq := splitRecRequest{Time: "9999999999", TableID: table, GameID: "game1"}
+	startReq := splitRecRequest{Time: "9999999999", AppID: appID, TableID: table, GameID: "game1"}
 	require.NoError(t, h.execute(newSplitRecGinContext(), startReq))
 	require.Equal(t, 1, ctrl.splitCount)
 
-	stopReq := splitRecRequest{Time: "9999999999", TableID: table, GameID: "game1", GameRound: "round1"}
+	stopReq := splitRecRequest{Time: "9999999999", AppID: appID, TableID: table, GameID: "game1", GameRound: "round1"}
 	require.NoError(t, h.execute(newSplitRecGinContext(), stopReq))
 	require.Equal(t, []string{"legacy-table-fwh-round1-game1"}, ctrl.renamedTo)
 }

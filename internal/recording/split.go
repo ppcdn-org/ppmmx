@@ -36,13 +36,25 @@ type IngestStarter interface {
 	StopByPath(path string)
 }
 
-// TableViewResolver looks up every view configured for a stream/table name
-// (e.g. "table1" -> ["fwh", "fwv"]), so a round-start/round-end request -
-// which only ever carries the table name, not a specific view - can be
-// applied to every matching path at once instead of guessing a single
-// default. Satisfied by *internal/admin.Store.
+// TableViewResolver looks up every view configured for a table (e.g.
+// "table1" -> ["fwh", "fwv"]), so a round-start/round-end request - which
+// only ever carries the table name, not a specific view - can be applied
+// to every configured view at once instead of guessing a single default.
+// The caller (tableToPaths) combines each view with the request's appId to
+// derive the actual stream path (appId+"/"+table+"-"+view - see
+// docs/design/ppcdn-mmx-publish-whitelist.zh-CN.md): the path always lives
+// under the requesting app's own namespace, so this resolver only needs to
+// know which views a table has, not where any app's streams live.
+// Satisfied by *internal/admin.Store.
 type TableViewResolver interface {
-	ViewsForStream(streamName string) ([]string, error)
+	ViewsForTable(table string) ([]string, error)
+}
+
+// TableViewPath is one view's resolved stream path for a table, as
+// returned by TableViewResolver.
+type TableViewPath struct {
+	Path string
+	View string
 }
 
 // waitForIngestPath bounds how long a round-start request blocks for an
@@ -63,6 +75,16 @@ const (
 	advanceModeTimeTolerance = 5 * time.Minute
 )
 
+// AppSecretLookup resolves an appId's own appSecret, the credential
+// split-rec signatures are now verified against (see verifyToken) instead
+// of a single deployment-wide shared secret. Satisfied by
+// *internal/core.appPublishWhitelist, which syncs appId+appSecret pairs
+// from ppcenter alongside the publish whitelist itself (see
+// docs/design/ppcdn-mmx-publish-whitelist.zh-CN.md).
+type AppSecretLookup interface {
+	AppSecret(appID string) (string, bool)
+}
+
 // SplitRecHandler handles POST /api/split-rec requests.
 type SplitRecHandler struct {
 	mgr                  *Manager
@@ -71,7 +93,7 @@ type SplitRecHandler struct {
 	mu                   sync.Mutex
 	rateLim              map[string]*rateLimitEntry // per-IP rate limiting
 	authMode             string
-	authSecret           []byte
+	appSecrets           AppSecretLookup
 	nonces               map[string]time.Time
 	uploader             *uploader
 	splitRecFileReporter SplitRecFileReporter
@@ -86,14 +108,14 @@ type SplitRecHandler struct {
 }
 
 // activeRound identifies the owner holding a round open (see ownerKey), the
-// paths that were actually started for it (a table with N configured views
-// starts N recordings), and the per-path audit record (in mgr.Store())
-// tracking each, if any.
+// path+view pairs that were actually started for it (a table with N
+// configured views starts N recordings), and the per-path audit record (in
+// mgr.Store()) tracking each, if any.
 type activeRound struct {
 	owner     string // ownerKey(req): appEnv+":"+gameId, or just gameId if appEnv is absent
 	game      string // original gameId field, kept for messages/audit independent of appEnv
 	startedAt time.Time
-	paths     []string
+	paths     []TableViewPath
 	recordIDs map[string]string // path -> recordID
 }
 
@@ -169,17 +191,32 @@ func (h *SplitRecHandler) SetSplitRecFileReporter(r SplitRecFileReporter) {
 	}
 }
 
-// ConfigureAuth changes split-rec authentication without recreating the handler.
-func (h *SplitRecHandler) ConfigureAuth(mode, secret string) {
+// ConfigureAuth changes split-rec's signing scheme ("simple" md5 or
+// "advance" HMAC-SHA256+nonce) without recreating the handler. The secret
+// itself is no longer a deployment-wide config value - see
+// SetAppSecretLookup.
+func (h *SplitRecHandler) ConfigureAuth(mode string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.authMode = mode
-	h.authSecret = []byte(secret)
 	h.nonces = make(map[string]time.Time)
+}
+
+// SetAppSecretLookup wires in the source of truth for appId->appSecret,
+// letting verifyToken check a request's signature against the calling
+// app's own credential (see AppSecretLookup's doc comment). Not calling
+// this (appSecrets stays nil) makes every request fail closed in
+// verifyToken, the same fail-safe direction as an unset deployment secret
+// used to.
+func (h *SplitRecHandler) SetAppSecretLookup(l AppSecretLookup) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.appSecrets = l
 }
 
 type splitRecRequest struct {
 	Time      string `json:"time"`
+	AppID     string `json:"appId"`
 	TableID   string `json:"tableId"`
 	GameRound string `json:"gameRound"`
 	GameID    string `json:"gameId"`
@@ -228,16 +265,20 @@ func (h *SplitRecHandler) ServeHTTP(c *gin.Context) {
 	}
 
 	// Validate required fields. gameId is mandatory in both directions: it
-	// identifies who owns the round (see execute/activeGames).
+	// identifies who owns the round (see execute/activeGames). appId is
+	// mandatory too - it's the only input that decides which app's
+	// publish namespace this round-start/round-end resolves into (see
+	// tableToPaths), so an omitted appId can never silently fall back to
+	// some other app's stream.
 	auth := c.GetHeader("Authorization")
-	if req.Time == "" || req.TableID == "" || req.GameID == "" || auth == "" {
+	if req.Time == "" || req.AppID == "" || req.TableID == "" || req.GameID == "" || auth == "" {
 		c.JSON(http.StatusBadRequest, errResp(400, "missing parameters.", ""))
 		return
 	}
-	if !validIdentifier(req.TableID) || !validIdentifier(req.GameID) ||
+	if !validIdentifier(req.AppID) || !validIdentifier(req.TableID) || !validIdentifier(req.GameID) ||
 		(req.GameRound != "" && !validIdentifier(req.GameRound)) ||
 		(req.AppEnv != "" && !validIdentifier(req.AppEnv)) {
-		c.JSON(http.StatusBadRequest, errResp(400, "tableId/gameId/gameRound/appEnv contain invalid characters.", ""))
+		c.JSON(http.StatusBadRequest, errResp(400, "appId/tableId/gameId/gameRound/appEnv contain invalid characters.", ""))
 		return
 	}
 
@@ -274,8 +315,16 @@ func (h *SplitRecHandler) ServeHTTP(c *gin.Context) {
 		}
 	}
 
-	// Execute business logic
+	// Execute business logic. errStreamOffline gets its own code (still
+	// under HTTP 500, so existing clients that only branch on HTTP status
+	// keep working) so a caller can tell "this app owns the table but
+	// isn't streaming right now" apart from every other 500 (locking
+	// conflicts, split failures, etc.) without string-matching msg.
 	if err := h.execute(c, req); err != nil {
+		if _, ok := err.(errStreamOffline); ok {
+			c.JSON(http.StatusInternalServerError, errResp(50001, err.Error(), ""))
+			return
+		}
 		c.JSON(http.StatusInternalServerError, errResp(500, err.Error(), ""))
 		return
 	}
@@ -286,16 +335,23 @@ func (h *SplitRecHandler) ServeHTTP(c *gin.Context) {
 func (h *SplitRecHandler) verifyToken(token, nonce string, req splitRecRequest) bool {
 	h.mu.Lock()
 	mode := h.authMode
-	secret := append([]byte(nil), h.authSecret...)
+	lookup := h.appSecrets
 	h.mu.Unlock()
 
-	if len(secret) == 0 {
-		// No deployment-specific secret configured: fail closed instead of
-		// falling through to an unkeyed comparison (advance mode) or a
-		// bare/no-prefix token (simple mode), either of which an outside
-		// caller could compute without knowing anything secret at all.
+	if lookup == nil {
+		// No appSecret source wired in at all: fail closed, same direction
+		// as an unset deployment secret used to be.
 		return false
 	}
+	appSecret, ok := lookup.AppSecret(req.AppID)
+	if !ok || appSecret == "" {
+		// Unknown/ineligible appId (never synced, deleted, arrears) or an
+		// app row with no secret: fail closed rather than falling through
+		// to an unkeyed comparison, either of which an outside caller
+		// could otherwise compute without knowing anything secret at all.
+		return false
+	}
+	secret := []byte(appSecret)
 
 	if mode == "advance" {
 		if len(nonce) < 16 || len(nonce) > 128 || strings.ContainsAny(nonce, "\r\n") {
@@ -309,19 +365,28 @@ func (h *SplitRecHandler) verifyToken(token, nonce string, req splitRecRequest) 
 		if err != nil || len(signature) != sha256.Size {
 			return false
 		}
+		// AppID is included in the signed canonical JSON (not just
+		// validated for character set) - it decides which app's publish
+		// namespace a round resolves into (see tableToPaths), so leaving
+		// it unsigned would let a captured/valid signature for one appId
+		// be replayed with a different appId substituted in.
 		canonical, _ := json.Marshal(struct {
 			Time      string `json:"time"`
+			AppID     string `json:"appId"`
 			TableID   string `json:"tableId"`
 			GameRound string `json:"gameRound"`
 			GameID    string `json:"gameId"`
 			Nonce     string `json:"nonce"`
-		}{req.Time, req.TableID, req.GameRound, req.GameID, nonce})
+		}{req.Time, req.AppID, req.TableID, req.GameRound, req.GameID, nonce})
 		mac := hmac.New(sha256.New, secret)
 		mac.Write(canonical)
 		return hmac.Equal(signature, mac.Sum(nil))
 	}
 
-	base := string(secret) + req.Time + req.TableID
+	// AppID participates in the base string for the same reason it's in
+	// advance mode's canonical JSON above: it must be tamper-protected by
+	// the signature, not just character-set validated.
+	base := string(secret) + req.Time + req.AppID + req.TableID
 	if req.GameRound != "" {
 		base += req.GameRound
 	}
@@ -354,30 +419,40 @@ func (h *SplitRecHandler) useNonce(nonce string, expiry time.Time) bool {
 	return true
 }
 
+// tableLockKey scopes the activeGames lock to (appId, tableId) rather than
+// tableId alone: a table path is only unique once its owning app is known
+// (see tableToPaths - appA/table-view and appB/table-view are unrelated
+// physical streams), so two different apps using the same tableId string
+// must never contend for the same lock entry.
+func tableLockKey(appID, table string) string {
+	return appID + "/" + table
+}
+
 // execute implements the two-phase per-round protocol:
-//   - gameRound empty: round start. For every path matching req.TableID (a
-//     table with multiple configured views records all of them - see
-//     tableToPaths), cuts a fresh segment on the path's already running
-//     recording (record: yes) and locks the whole table to the caller's
-//     owner identity (see ownerKey: appEnv+gameId if appEnv was provided,
-//     otherwise just gameId). If a given path has nothing publishing to it
-//     yet and an ingest source is configured for it, this is also what
-//     brings the ingest pull online (see resolveController) - ingest only
-//     ever runs because a round started, not from process boot. A path
-//     with no resolvable controller at all is skipped with a warning
-//     rather than failing the whole round, unless every path fails, in
-//     which case the round-start itself fails.
+//   - gameRound empty: round start. For every path matching (req.AppID,
+//     req.TableID) (a table with multiple configured views records all of
+//     them - see tableToPaths), cuts a fresh segment on the path's already
+//     running recording (record: yes) and locks the whole table to the
+//     caller's owner identity (see ownerKey: appEnv+gameId if appEnv was
+//     provided, otherwise just gameId). If a given path has nothing
+//     publishing to it yet and an ingest source is configured for it,
+//     this is also what brings the ingest pull online (see
+//     resolveController) - ingest only ever runs because a round started,
+//     not from process boot. A path with no resolvable controller at all
+//     is skipped with a warning rather than failing the whole round,
+//     unless every path fails, in which case the round-start itself
+//     fails.
 //   - gameRound non-empty: round end. Cuts the segment that has been
 //     accumulating on every path started for this round since the paired
 //     start call, renames each to "$tableId-$view-$gameRound-$gameId",
 //     releases the table lock, and - if ingest was what brought a path
 //     online - stops the pull again for it.
 //
-// A table can only have one owner holding it open at a time: a second
-// start is rejected, and only the same owner (appEnv+gameId, or gameId
-// alone when appEnv is omitted) that opened the round may close it - a
-// different appEnv with the same gameId is a different owner and cannot
-// stop that round.
+// A (appId, tableId) pair can only have one owner holding it open at a
+// time: a second start is rejected, and only the same owner
+// (appEnv+gameId, or gameId alone when appEnv is omitted) that opened the
+// round may close it - a different appEnv with the same gameId is a
+// different owner and cannot stop that round.
 func (h *SplitRecHandler) execute(c *gin.Context, req splitRecRequest) error {
 	if req.GameRound == "" {
 		return h.startRound(c.Request.Context(), req)
@@ -445,49 +520,51 @@ func (h *SplitRecHandler) lookupController(path string) (PathController, bool) {
 	return nil, false
 }
 
-// startRound opens a round for every path configured for req.TableID (see
-// tableToPaths). It locks the table to the caller's owner identity first
-// (see ownerKey), so a concurrent start for the same table is rejected
-// before any path is touched; if every path then fails to resolve or
-// split, the table lock is released and the round-start fails. A path
-// that individually fails (no publisher, ingest never came online, split
-// error) is logged and skipped rather than aborting paths that did
-// succeed - the recording continues on whichever views are actually live.
+// startRound opens a round for every path configured for (req.AppID,
+// req.TableID) (see tableToPaths). It locks the table to the caller's
+// owner identity first (see ownerKey), so a concurrent start for the same
+// (appId, tableId) is rejected before any path is touched; if every path
+// then fails to resolve or split, the table lock is released and the
+// round-start fails. A path that individually fails (no publisher, ingest
+// never came online, split error) is logged and skipped rather than
+// aborting paths that did succeed - the recording continues on whichever
+// views are actually live.
 func (h *SplitRecHandler) startRound(ctx context.Context, req splitRecRequest) error {
 	owner := ownerKey(req)
+	lockKey := tableLockKey(req.AppID, req.TableID)
 	h.mu.Lock()
-	if round, active := h.activeGames[req.TableID]; active {
+	if round, active := h.activeGames[lockKey]; active {
 		h.mu.Unlock()
 		if round.owner == owner {
 			return fmt.Errorf("game %q already has an active recording on table %q", req.GameID, req.TableID)
 		}
 		return fmt.Errorf("table %q is already being recorded by another game", req.TableID)
 	}
-	h.activeGames[req.TableID] = activeRound{owner: owner, game: req.GameID, startedAt: now()}
+	h.activeGames[lockKey] = activeRound{owner: owner, game: req.GameID, startedAt: now()}
 	h.mu.Unlock()
 
 	startedAt := now()
-	paths := h.tableToPaths(req.TableID)
+	paths := h.tableToPaths(req.AppID, req.TableID)
 	recordIDs := make(map[string]string, len(paths))
-	var startedPaths []string
-	for _, path := range paths {
-		ctrl, ok := h.resolveController(ctx, path, true, waitForIngestPath, 200*time.Millisecond)
+	var startedPaths []TableViewPath
+	for _, tvp := range paths {
+		ctrl, ok := h.resolveController(ctx, tvp.Path, true, waitForIngestPath, 200*time.Millisecond)
 		if !ok {
-			h.parent.Log(logger.Warn, "[split-rec] table %q: path %q not found, skipping", req.TableID, path)
+			h.parent.Log(logger.Warn, "[split-rec] table %q: path %q not found, skipping", req.TableID, tvp.Path)
 			continue
 		}
 		if _, err := ctrl.SplitRecording(""); err != nil {
-			h.parent.Log(logger.Warn, "[split-rec] table %q: start round on path %q failed: %v", req.TableID, path, err)
+			h.parent.Log(logger.Warn, "[split-rec] table %q: start round on path %q failed: %v", req.TableID, tvp.Path, err)
 			continue
 		}
-		recordID := newRecordID(path)
-		recordIDs[path] = recordID
-		startedPaths = append(startedPaths, path)
+		recordID := newRecordID(tvp.Path)
+		recordIDs[tvp.Path] = recordID
+		startedPaths = append(startedPaths, tvp)
 
 		if h.mgr != nil {
 			_ = h.mgr.Store().Insert(Record{
 				ID:        recordID,
-				Path:      path,
+				Path:      tvp.Path,
 				Table:     req.TableID,
 				Game:      req.GameID,
 				AppEnv:    req.AppEnv,
@@ -500,13 +577,18 @@ func (h *SplitRecHandler) startRound(ctx context.Context, req splitRecRequest) e
 
 	if len(startedPaths) == 0 {
 		h.mu.Lock()
-		delete(h.activeGames, req.TableID)
+		delete(h.activeGames, lockKey)
 		h.mu.Unlock()
-		return fmt.Errorf("start round: no path found for table %q", req.TableID)
+		// Every path is deterministically derived from (appId, tableId,
+		// view) - see tableToPaths - so there's no "path not configured"
+		// failure mode left to distinguish; not finding a live controller
+		// on any of them only ever means the app isn't currently
+		// streaming to this table.
+		return errStreamOffline{appID: req.AppID, table: req.TableID}
 	}
 
 	h.mu.Lock()
-	h.activeGames[req.TableID] = activeRound{
+	h.activeGames[lockKey] = activeRound{
 		owner:     owner,
 		game:      req.GameID,
 		startedAt: startedAt,
@@ -515,6 +597,21 @@ func (h *SplitRecHandler) startRound(ctx context.Context, req splitRecRequest) e
 	}
 	h.mu.Unlock()
 	return nil
+}
+
+// errStreamOffline is returned by startRound when every configured view's
+// stream path exists (resolveController found a matching path shape to
+// even check) but none of them are currently online - distinguishing "the
+// app owns this table but isn't streaming right now" from "start round: no
+// path found", which covers configuration/routing problems instead. See
+// ServeHTTP's error-code mapping.
+type errStreamOffline struct {
+	appID string
+	table string
+}
+
+func (e errStreamOffline) Error() string {
+	return fmt.Sprintf("stream for app %q table %q is not online", e.appID, e.table)
 }
 
 // stopRound closes the round for every path that was actually started for
@@ -531,8 +628,9 @@ func (h *SplitRecHandler) startRound(ctx context.Context, req splitRecRequest) e
 // signal that fires unconditionally regardless of whether a start
 // actually preceded it.
 func (h *SplitRecHandler) stopRound(req splitRecRequest) error {
+	lockKey := tableLockKey(req.AppID, req.TableID)
 	h.mu.Lock()
-	round, active := h.activeGames[req.TableID]
+	round, active := h.activeGames[lockKey]
 	if !active {
 		h.mu.Unlock()
 		h.parent.Log(logger.Warn,
@@ -544,7 +642,7 @@ func (h *SplitRecHandler) stopRound(req splitRecRequest) error {
 		h.mu.Unlock()
 		return fmt.Errorf("recording on table %q was started by a different game", req.TableID)
 	}
-	delete(h.activeGames, req.TableID)
+	delete(h.activeGames, lockKey)
 	h.mu.Unlock()
 
 	h.mu.Lock()
@@ -553,7 +651,8 @@ func (h *SplitRecHandler) stopRound(req splitRecRequest) error {
 	h.mu.Unlock()
 
 	var stopErrs []string
-	for _, path := range round.paths {
+	for _, tvp := range round.paths {
+		path := tvp.Path
 		ctrl, ok := h.lookupController(path)
 		if !ok {
 			stopErrs = append(stopErrs, fmt.Sprintf("path %q not found", path))
@@ -561,7 +660,7 @@ func (h *SplitRecHandler) stopRound(req splitRecRequest) error {
 			continue
 		}
 
-		finalName := req.TableID + "-" + viewFromPath(req.TableID, path) + "-" + req.GameRound + "-" + req.GameID
+		finalName := req.TableID + "-" + tvp.View + "-" + req.GameRound + "-" + req.GameID
 		finalPath, err := ctrl.SplitRecording(finalName)
 		if err != nil {
 			stopErrs = append(stopErrs, fmt.Sprintf("path %q: %v", path, err))
@@ -614,51 +713,35 @@ func newRecordID(path string) string {
 	return fmt.Sprintf("splitrec_%x", md5.Sum([]byte(uuid.NewString()+path)))
 }
 
-// viewFromPath extracts the view id from a resolved path, e.g. table
-// "table1" and path "live/table1-view1" yield "fwv".
-func viewFromPath(table, path string) string {
-	segment := path
-	if idx := strings.LastIndexByte(path, '/'); idx >= 0 {
-		segment = path[idx+1:]
-	}
-	return strings.TrimPrefix(segment, table+"-")
-}
-
-// Table-to-path mapping. Override by registering externally. Used only as
-// a fallback when no TableViewResolver is wired in (see SetViewResolver).
-var tablePathMapping = map[string]string{}
-
-// SetTablePathMapping sets the table→path mapping for split-rec.
-func SetTablePathMapping(m map[string]string) {
-	tablePathMapping = m
-}
-
-// tableToPaths resolves every path a round-start/round-end request for
-// table must be applied to. If a TableViewResolver is wired in and reports
-// at least one view for table, one path per configured view is returned
-// (e.g. "table1" -> ["live/table1-view2", "live/table1-view1"]) - a table with
-// multiple views records all of them, since the request only carries the
-// table name. Otherwise falls back to the legacy single-path behavior:
-// tablePathMapping's override, or the "live/<table>-fwh" default.
-func (h *SplitRecHandler) tableToPaths(table string) []string {
+// tableToPaths resolves every path+view a round-start/round-end request for
+// (appID, table) must be applied to. If a TableViewResolver is wired in
+// and reports at least one view for table, one TableViewPath is returned
+// per configured view - a table with multiple views records all of them,
+// since the request only carries the table name, not a specific view.
+// Otherwise falls back to a single view, "fwh" (matching the convention
+// every fallback in this file already assumed before views were
+// configurable). Every path is derived the same way regardless of source:
+// appID+"/"+table+"-"+view, so it always resolves under the requesting
+// app's own WHIP-publish namespace (see docs/design/
+// ppcdn-mmx-publish-whitelist.zh-CN.md) rather than a separately
+// registered path.
+func (h *SplitRecHandler) tableToPaths(appID, table string) []TableViewPath {
 	h.mu.Lock()
 	resolver := h.viewResolver
 	h.mu.Unlock()
 
+	views := []string{"fwh"}
 	if resolver != nil {
-		if views, err := resolver.ViewsForStream(table); err == nil && len(views) > 0 {
-			paths := make([]string, len(views))
-			for i, view := range views {
-				paths[i] = "live/" + table + "-" + view
-			}
-			return paths
+		if resolved, err := resolver.ViewsForTable(table); err == nil && len(resolved) > 0 {
+			views = resolved
 		}
 	}
 
-	if p, ok := tablePathMapping[table]; ok {
-		return []string{p}
+	paths := make([]TableViewPath, len(views))
+	for i, view := range views {
+		paths[i] = TableViewPath{Path: appID + "/" + table + "-" + view, View: view}
 	}
-	return []string{"live/" + table + "-fwh"}
+	return paths
 }
 
 func (h *SplitRecHandler) findController(path string) (PathController, bool) {

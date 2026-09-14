@@ -19,7 +19,7 @@ import (
 // simpleToken mirrors §5.3's simple-mode recipe, matching
 // TestSplitRecSimpleAuth's inline construction.
 func simpleToken(secret string, req splitRecRequest) string {
-	base := secret + req.Time + req.TableID + req.GameRound + req.GameID
+	base := secret + req.Time + req.AppID + req.TableID + req.GameRound + req.GameID
 	return fmt.Sprintf("%x", md5.Sum([]byte(base)))
 }
 
@@ -55,6 +55,7 @@ func decodeSplitRecResponse(t *testing.T, rec *httptest.ResponseRecorder) splitR
 func freshnessReq(signingInstant time.Time) splitRecRequest {
 	return splitRecRequest{
 		Time:      fmt.Sprintf("%d", signingInstant.Unix()),
+		AppID:     "app1",
 		TableID:   "table",
 		GameRound: "gc",
 		GameID:    "game",
@@ -63,7 +64,8 @@ func freshnessReq(signingInstant time.Time) splitRecRequest {
 
 func TestSplitRecFreshness_SimpleModeAcceptsWithinToleranceEitherDirection(t *testing.T) {
 	h := NewSplitRecHandler(nil, nil, test.NilLogger)
-	h.ConfigureAuth("simple", "test-secret")
+	h.ConfigureAuth("simple")
+	h.SetAppSecretLookup(&fakeAppSecretLookup{secrets: map[string]string{"app1": "test-secret"}})
 
 	for _, drift := range []time.Duration{0, -simpleModeTimeTolerance + time.Second, simpleModeTimeTolerance - time.Second} {
 		req := freshnessReq(time.Now().Add(drift))
@@ -76,7 +78,8 @@ func TestSplitRecFreshness_SimpleModeAcceptsWithinToleranceEitherDirection(t *te
 
 func TestSplitRecFreshness_SimpleModeRejectsOutsideToleranceEitherDirection(t *testing.T) {
 	h := NewSplitRecHandler(nil, nil, test.NilLogger)
-	h.ConfigureAuth("simple", "test-secret")
+	h.ConfigureAuth("simple")
+	h.SetAppSecretLookup(&fakeAppSecretLookup{secrets: map[string]string{"app1": "test-secret"}})
 
 	for _, drift := range []time.Duration{-simpleModeTimeTolerance - time.Second, simpleModeTimeTolerance + time.Second} {
 		req := freshnessReq(time.Now().Add(drift))
@@ -93,7 +96,8 @@ func TestSplitRecFreshness_SimpleModeRejectsOutsideToleranceEitherDirection(t *t
 // docs/test/ppcdn-external-api-test-report.md finding 2).
 func TestSplitRecFreshness_DocExampleNowSucceeds(t *testing.T) {
 	h := NewSplitRecHandler(nil, nil, test.NilLogger)
-	h.ConfigureAuth("simple", "test-secret")
+	h.ConfigureAuth("simple")
+	h.SetAppSecretLookup(&fakeAppSecretLookup{secrets: map[string]string{"app1": "test-secret"}})
 
 	req := freshnessReq(time.Now())
 	rec := serveSplitRec(h, req, map[string]string{"Authorization": simpleToken("test-secret", req)})
@@ -102,7 +106,8 @@ func TestSplitRecFreshness_DocExampleNowSucceeds(t *testing.T) {
 
 func TestSplitRecFreshness_AdvanceModeAcceptsWithinToleranceEitherDirection(t *testing.T) {
 	h := NewSplitRecHandler(nil, nil, test.NilLogger)
-	h.ConfigureAuth("advance", "test-secret")
+	h.ConfigureAuth("advance")
+	h.SetAppSecretLookup(&fakeAppSecretLookup{secrets: map[string]string{"app1": "test-secret"}})
 
 	cases := []struct {
 		name  string
@@ -126,7 +131,8 @@ func TestSplitRecFreshness_AdvanceModeAcceptsWithinToleranceEitherDirection(t *t
 
 func TestSplitRecFreshness_AdvanceModeRejectsBeyondFiveMinutes(t *testing.T) {
 	h := NewSplitRecHandler(nil, nil, test.NilLogger)
-	h.ConfigureAuth("advance", "test-secret")
+	h.ConfigureAuth("advance")
+	h.SetAppSecretLookup(&fakeAppSecretLookup{secrets: map[string]string{"app1": "test-secret"}})
 
 	for _, drift := range []time.Duration{advanceModeTimeTolerance + time.Minute, -(advanceModeTimeTolerance + time.Minute)} {
 		req := freshnessReq(time.Now().Add(drift))
@@ -143,7 +149,8 @@ func TestSplitRecFreshness_AdvanceModeRejectsBeyondFiveMinutes(t *testing.T) {
 
 func TestSplitRecFreshness_AdvanceModeRejectsReusedNonce(t *testing.T) {
 	h := NewSplitRecHandler(nil, nil, test.NilLogger)
-	h.ConfigureAuth("advance", "test-secret")
+	h.ConfigureAuth("advance")
+	h.SetAppSecretLookup(&fakeAppSecretLookup{secrets: map[string]string{"app1": "test-secret"}})
 
 	req := freshnessReq(time.Now())
 	nonce := "nonce-replay-0123456789" // >=16 chars: verifyToken rejects shorter nonces in advance mode

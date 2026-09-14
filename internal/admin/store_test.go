@@ -8,8 +8,8 @@ import (
 
 // newTestStore opens an ephemeral in-memory Store: OpenStore creates the
 // schema and seeds the default {table, table, view} site_stream_configs row
-// on an empty database (see seedDefaultSiteStreamConfigs), so "table-view"
-// is allowed out of the box with no extra setup.
+// on an empty database (see seedDefaultSiteStreamConfigs), so "table"
+// resolves to view "view" out of the box with no extra setup.
 func newTestStore(t *testing.T) *Store {
 	t.Helper()
 	s, err := OpenStore(":memory:")
@@ -18,51 +18,49 @@ func newTestStore(t *testing.T) *Store {
 	return s
 }
 
-func TestIsStreamAllowedOutsideLivePrefixIsAlwaysAllowed(t *testing.T) {
+// TestViewsForTableDefaultSeed covers the seeded {table, table, view} row.
+func TestViewsForTableDefaultSeed(t *testing.T) {
 	s := newTestStore(t)
-	allowed, err := s.IsStreamAllowed("custom/anything")
+	views, err := s.ViewsForTable("table")
 	require.NoError(t, err)
-	require.True(t, allowed)
+	require.Equal(t, []string{"view"}, views)
 }
 
-func TestIsStreamAllowedPlainPathMatchesWhitelist(t *testing.T) {
+// TestViewsForTableMultipleViews covers a table with several configured
+// views, all returned together for split-rec's fan-out.
+func TestViewsForTableMultipleViews(t *testing.T) {
 	s := newTestStore(t)
-	allowed, err := s.IsStreamAllowed("live/table-view")
-	require.NoError(t, err)
-	require.True(t, allowed)
+	require.NoError(t, s.SetSiteStreamConfigs([]SiteStreamConfig{
+		{SiteName: "table", StreamName: "table1", ViewName: "fwh"},
+		{SiteName: "table", StreamName: "table1", ViewName: "fwv"},
+	}))
 
-	allowed, err = s.IsStreamAllowed("live/not-configured")
+	views, err := s.ViewsForTable("table1")
 	require.NoError(t, err)
-	require.False(t, allowed)
+	require.Equal(t, []string{"fwh", "fwv"}, views)
 }
 
-// TestIsStreamAllowedAcceptsCodecSuffixes covers the HEVC/H264 multitrack
-// feature: a whitelisted stream must be allowed on both its /h264 and
-// /hevc codec paths without any separate site_stream_configs row for them.
-func TestIsStreamAllowedAcceptsCodecSuffixes(t *testing.T) {
+// TestViewsForTableUnknownTableReturnsEmpty covers a table with no
+// configured rows at all.
+func TestViewsForTableUnknownTableReturnsEmpty(t *testing.T) {
 	s := newTestStore(t)
-
-	for _, path := range []string{
-		"live/table-view/h264",
-		"live/table-view/hevc",
-	} {
-		allowed, err := s.IsStreamAllowed(path)
-		require.NoError(t, err)
-		require.Truef(t, allowed, "path=%s", path)
-	}
-
-	// A codec-suffix-shaped path for a stream that isn't whitelisted at all
-	// must still be rejected - stripping the suffix must not turn into an
-	// accidental allow-everything.
-	allowed, err := s.IsStreamAllowed("live/not-configured/hevc")
+	views, err := s.ViewsForTable("not-configured")
 	require.NoError(t, err)
-	require.False(t, allowed)
+	require.Empty(t, views)
+}
 
-	// Anything other than exactly "/h264" or "/hevc" is not a recognized
-	// codec segment and must not be stripped - it's compared as-is and
-	// therefore rejected (no site_stream_configs row equals this literal
-	// suffix).
-	allowed, err = s.IsStreamAllowed("live/table-view/av1")
+// TestSiteStreamConfigsRoundTrips verifies SetSiteStreamConfigs persists
+// rows and SiteStreamConfigs reads them back.
+func TestSiteStreamConfigsRoundTrips(t *testing.T) {
+	s := newTestStore(t)
+	require.NoError(t, s.SetSiteStreamConfigs([]SiteStreamConfig{
+		{SiteName: "site1", StreamName: "table1", ViewName: "fwh"},
+	}))
+
+	configs, err := s.SiteStreamConfigs()
 	require.NoError(t, err)
-	require.False(t, allowed)
+	require.Len(t, configs, 1)
+	require.Equal(t, "site1", configs[0].SiteName)
+	require.Equal(t, "table1", configs[0].StreamName)
+	require.Equal(t, "fwh", configs[0].ViewName)
 }

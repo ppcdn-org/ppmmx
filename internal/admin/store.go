@@ -3,7 +3,6 @@ package admin
 import (
 	"database/sql"
 	"fmt"
-	"strings"
 	"sync"
 
 	_ "modernc.org/sqlite"
@@ -189,6 +188,7 @@ func (s *Store) SetAdminCredentials(username, passwordHash string) error {
 	return s.Set("admin_password_hash", passwordHash)
 }
 
+// SiteStreamConfig is one table/view row.
 type SiteStreamConfig struct {
 	ID         int64  `json:"id"`
 	SiteName   string `json:"site_name"`
@@ -216,49 +216,15 @@ func (s *Store) SiteStreamConfigs() ([]SiteStreamConfig, error) {
 	return configs, rows.Err()
 }
 
-// IsStreamAllowed reports whether pathName (e.g. "live/table-view", or
-// "live/table-view/h264"/"live/table-view/hevc" for the HEVC/H264
-// multitrack feature) matches one of the configured stream_name-view_name
-// combinations, i.e. whether a publisher should be allowed to start
-// streaming to it. Only paths under "live/" are whitelist-checked, since
-// site_stream_configs only ever generates "live/<stream>-<view>" names;
-// paths outside "live/" (custom path configs, tests, other deployments,
-// ...) are never restricted by this table and are reported as always
-// allowed. A trailing "/h264" or "/hevc" codec segment is stripped before
-// the comparison below, so one whitelist entry authorizes both codec paths
-// of a multitrack stream without needing separate rows per codec.
-func (s *Store) IsStreamAllowed(pathName string) (bool, error) {
-	const prefix = "live/"
-	if !strings.HasPrefix(pathName, prefix) {
-		return true, nil
-	}
-	suffix := pathName[len(prefix):]
-	suffix = strings.TrimSuffix(strings.TrimSuffix(suffix, "/h264"), "/hevc")
-
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	rows, err := s.db.Query(`SELECT stream_name, view_name FROM site_stream_configs`)
-	if err != nil {
-		return false, err
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var streamName, viewName string
-		if err := rows.Scan(&streamName, &viewName); err != nil {
-			return false, err
-		}
-		if suffix == streamName+"-"+viewName {
-			return true, nil
-		}
-	}
-	return false, rows.Err()
-}
-
-// ViewsForStream returns every view_name configured for streamName across
+// ViewsForTable returns every view_name configured for streamName across
 // all sites (e.g. "table" -> ["fwh", "fwv"]), for split-rec: a table with
 // multiple views must record all of them, since a round-start/round-end
-// request only ever carries the table name, not a specific view.
-func (s *Store) ViewsForStream(streamName string) ([]string, error) {
+// request only ever carries the table name, not a specific view. The
+// caller (recording.SplitRecHandler.tableToPaths) combines each view with
+// the request's own appId to derive the actual stream path - this store
+// only needs to know which views exist, not where any app's streams live
+// (see recording.TableViewResolver's doc comment).
+func (s *Store) ViewsForTable(streamName string) ([]string, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	rows, err := s.db.Query(`SELECT DISTINCT view_name FROM site_stream_configs

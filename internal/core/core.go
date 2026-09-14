@@ -121,37 +121,38 @@ var cli struct {
 
 // Core is an instance of MediaMTX.
 type Core struct {
-	ctx             context.Context
-	ctxCancel       func()
-	confPath        string
-	conf            *conf.Conf
-	logger          *logger.Logger
-	externalCmdPool *externalcmd.Pool
-	authManager     *auth.Manager
-	metrics         *metrics.Metrics
-	pprof           *pprof.PPROF
-	recordCleaner   *recordcleaner.Cleaner
-	playbackServer  *playback.Server
-	pathManager     *pathManager
-	rtspServer      *rtsp.Server
-	rtspsServer     *rtsp.Server
-	rtmpServer      *rtmp.Server
-	rtmpsServer     *rtmp.Server
-	hlsServer       *hls.Server
-	webRTCServer    *webrtc.Server
-	recMgr          *recording.Manager
-	splitHandler    *recording.SplitRecHandler
-	mmxControl      *mmxcontrol.Client
-	recordingSync   *mmxcontrol.RecordingSyncClient
-	segmentReporter *mmxcontrol.SegmentReporter
-	trafficUsage    *TrafficUsageSampler
-	srtServer       *srt.Server
-	moqServer       *moq.Server
-	api             *api.API
-	adminSrv        *admin.Server
-	adminStore      *admin.Store
-	ingestMgr       *ingest.Manager
-	confWatcher     *confwatcher.ConfWatcher
+	ctx              context.Context
+	ctxCancel        func()
+	confPath         string
+	conf             *conf.Conf
+	logger           *logger.Logger
+	externalCmdPool  *externalcmd.Pool
+	authManager      *auth.Manager
+	metrics          *metrics.Metrics
+	pprof            *pprof.PPROF
+	recordCleaner    *recordcleaner.Cleaner
+	playbackServer   *playback.Server
+	pathManager      *pathManager
+	rtspServer       *rtsp.Server
+	rtspsServer      *rtsp.Server
+	rtmpServer       *rtmp.Server
+	rtmpsServer      *rtmp.Server
+	hlsServer        *hls.Server
+	webRTCServer     *webrtc.Server
+	recMgr           *recording.Manager
+	splitHandler     *recording.SplitRecHandler
+	mmxControl       *mmxcontrol.Client
+	recordingSync    *mmxcontrol.RecordingSyncClient
+	segmentReporter  *mmxcontrol.SegmentReporter
+	trafficUsage     *TrafficUsageSampler
+	srtServer        *srt.Server
+	moqServer        *moq.Server
+	api              *api.API
+	adminSrv         *admin.Server
+	adminStore       *admin.Store
+	publishWhitelist *appPublishWhitelist
+	ingestMgr        *ingest.Manager
+	confWatcher      *confwatcher.ConfWatcher
 
 	// in
 	chAPIConfigSet chan *conf.Conf
@@ -740,10 +741,18 @@ func (p *Core) createResources(initial bool) error {
 				if p.adminStore != nil {
 					p.splitHandler.SetViewResolver(p.adminStore)
 				}
+				// Same reasoning for publishWhitelist (the appId->appSecret
+				// source split-rec now verifies signatures against, see
+				// AppSecretLookup) - it's created further down, after
+				// mmxControl; wire it in immediately if it already exists
+				// from an earlier pass.
+				if p.publishWhitelist != nil {
+					p.splitHandler.SetAppSecretLookup(p.publishWhitelist)
+				}
 			}
 		}
 		if p.splitHandler != nil {
-			p.splitHandler.ConfigureAuth(p.conf.SplitRecAuthMode, p.conf.SplitRecAuthSecret)
+			p.splitHandler.ConfigureAuth(p.conf.SplitRecAuthMode)
 			p.splitHandler.ConfigureUpload(recording.UploadConfig{
 				Env:            p.conf.NetStorageEnv,
 				S3Bucket:       p.conf.NetStorageS3Bucket,
@@ -830,6 +839,27 @@ func (p *Core) createResources(initial bool) error {
 		p.mmxControl.SetHTTPFallback(mmxcontrol.DeriveFallbackURL(p.conf.MMXControlURL),
 			p.conf.MMXNodeSecret, 10*time.Second)
 	}
+	// Publish whitelist (see docs/design/ppcdn-mmx-publish-whitelist.zh-CN.md):
+	// every publish path on this node - not just split-rec/recording paths -
+	// must be "<appId>/<tableId>-<viewName>" with appId one ppcenter
+	// currently reports as eligible. Reuses mmxControl's own
+	// endpoint/credential like the other node-to-ppcenter clients above.
+	// Requires MMXControl (the only source of MMXControlURL/MMXNodeSecret);
+	// a node without it configured keeps the pathManager's adminStore-less
+	// open-by-default behavior.
+	if p.conf.MMXControl && p.publishWhitelist == nil {
+		p.publishWhitelist = newAppPublishWhitelist(
+			mmxcontrol.NewAppSyncClient(
+				mmxcontrol.DeriveFallbackURL(p.conf.MMXControlURL),
+				p.conf.MMXNodeSecret,
+				10*time.Second,
+			), p)
+		p.publishWhitelist.start()
+		p.pathManager.SetAdminStore(p.publishWhitelist)
+		if p.splitHandler != nil {
+			p.splitHandler.SetAppSecretLookup(p.publishWhitelist)
+		}
+	}
 	if p.conf.WebRTC && p.conf.MMXRecordingSyncEnabled && p.recordingSync == nil {
 		p.recordingSync = mmxcontrol.NewRecordingSyncClient(
 			p.conf.MMXRecordingSyncURL,
@@ -886,6 +916,8 @@ func (p *Core) createResources(initial bool) error {
 			ReadTimeout:         p.conf.ReadTimeout,
 			WriteTimeout:        p.conf.WriteTimeout,
 			UDPMaxPayloadSize:   p.conf.UDPMaxPayloadSize,
+			Latency:             p.conf.SRTLatency,
+			FC:                  p.conf.SRTFC,
 			RunOnConnect:        p.conf.RunOnConnect,
 			RunOnConnectRestart: p.conf.RunOnConnectRestart,
 			RunOnDisconnect:     p.conf.RunOnDisconnect,
@@ -1013,7 +1045,10 @@ func (p *Core) createResources(initial bool) error {
 				p.Log(logger.Warn, "admin store failed: %v", err2)
 			} else {
 				p.adminStore = st
-				p.pathManager.SetAdminStore(st)
+				// Publish whitelist (pathManager.SetAdminStore) is wired
+				// separately from p.publishWhitelist above, not from
+				// admin.Store - only site_stream_configs' table->view
+				// fan-out for split-rec comes from here.
 				if p.splitHandler != nil {
 					p.splitHandler.SetViewResolver(st)
 				}
@@ -1269,7 +1304,6 @@ func (p *Core) closeResources(newConf *conf.Conf, calledByAPI bool) {
 		newConf.WebRTCHandshakeTimeout != p.conf.WebRTCHandshakeTimeout ||
 		newConf.WebRTCTrackGatherTimeout != p.conf.WebRTCTrackGatherTimeout ||
 		newConf.SplitRecAuthMode != p.conf.SplitRecAuthMode ||
-		newConf.SplitRecAuthSecret != p.conf.SplitRecAuthSecret ||
 		newConf.NetStorageEnv != p.conf.NetStorageEnv ||
 		newConf.NetStorageS3Bucket != p.conf.NetStorageS3Bucket ||
 		newConf.NetStorageS3Region != p.conf.NetStorageS3Region ||
@@ -1403,6 +1437,10 @@ func (p *Core) closeResources(newConf *conf.Conf, calledByAPI bool) {
 	if p.mmxControl != nil {
 		p.mmxControl.Close()
 		p.mmxControl = nil
+	}
+	if p.publishWhitelist != nil {
+		p.publishWhitelist.stop()
+		p.publishWhitelist = nil
 	}
 	if p.segmentReporter != nil {
 		p.segmentReporter.Close()

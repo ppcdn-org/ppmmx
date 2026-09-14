@@ -186,7 +186,7 @@ func newSplitRecGinContext() *gin.Context {
 }
 
 func TestExecuteStartAndStopDriveIngest(t *testing.T) {
-	const path = "live/table1-fwh"
+	const path = "app1/table1-fwh"
 
 	mgr := newTestManager(t)
 	h := NewSplitRecHandler(mgr, nil, test.NilLogger)
@@ -199,20 +199,20 @@ func TestExecuteStartAndStopDriveIngest(t *testing.T) {
 	}}
 	h.SetIngestManager(fake)
 
-	startReq := splitRecRequest{Time: "9999999999", TableID: "table1", GameID: "game1"}
+	startReq := splitRecRequest{Time: "9999999999", AppID: "app1", TableID: "table1", GameID: "game1"}
 	c := newSplitRecGinContext()
 	require.NoError(t, h.execute(c, startReq))
 	require.Equal(t, []string{path}, fake.starts(), "round start with no existing publisher must trigger ingest")
 	require.Empty(t, fake.stops())
 
-	stopReq := splitRecRequest{Time: "9999999999", TableID: "table1", GameID: "game1", GameRound: "round1"}
+	stopReq := splitRecRequest{Time: "9999999999", AppID: "app1", TableID: "table1", GameID: "game1", GameRound: "round1"}
 	c = newSplitRecGinContext()
 	require.NoError(t, h.execute(c, stopReq))
 	require.Equal(t, []string{path}, fake.stops(), "round end must stop ingest for the path")
 }
 
 func TestExecuteStopAlwaysCallsStopByPathEvenWithoutIngest(t *testing.T) {
-	const path = "live/direct-publish"
+	const path = "app1/direct-publish-fwh"
 
 	mgr := newTestManager(t)
 	_, err := mgr.Start(path, Options{Format: "fmp4"}, &managerTestController{})
@@ -222,17 +222,16 @@ func TestExecuteStopAlwaysCallsStopByPathEvenWithoutIngest(t *testing.T) {
 	fake := &fakeIngestManager{} // never asked to start anything - path was already live
 	h.SetIngestManager(fake)
 
-	startReq := splitRecRequest{Time: "9999999999", TableID: "direct-publish", GameID: "game1"}
-	// tableToPath default is "live/<table>-fwh"; override via mapping so
-	// this test's "direct-publish" table resolves to our pre-started path.
-	SetTablePathMapping(map[string]string{"direct-publish": path})
-	defer SetTablePathMapping(map[string]string{})
+	// tableToPath's default (no resolver) is "<appId>/<table>-fwh", which
+	// this test's (appId, table) already resolves to the pre-started path
+	// above without needing any override.
+	startReq := splitRecRequest{Time: "9999999999", AppID: "app1", TableID: "direct-publish", GameID: "game1"}
 
 	c := newSplitRecGinContext()
 	require.NoError(t, h.execute(c, startReq))
 	require.Empty(t, fake.starts(), "path was already live, ingest must not be touched")
 
-	stopReq := splitRecRequest{Time: "9999999999", TableID: "direct-publish", GameID: "game1", GameRound: "round1"}
+	stopReq := splitRecRequest{Time: "9999999999", AppID: "app1", TableID: "direct-publish", GameID: "game1", GameRound: "round1"}
 	c = newSplitRecGinContext()
 	require.NoError(t, h.execute(c, stopReq))
 	require.Equal(t, []string{path}, fake.stops(), "StopByPath is called unconditionally on round end; it's a no-op if ingest wasn't involved")

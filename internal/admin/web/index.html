@@ -340,17 +340,19 @@ async function saveConfig() {
 }
 
 function renderSiteStreamConfigTable(configs, editable) {
-  let html = `<table class="path-config-table"><thead><tr><th>Site Name</th><th>Generated Site</th><th>Stream Name</th><th>View Name</th><th>Generated Stream</th>${editable?'<th></th>':''}</tr></thead><tbody>`;
+  let html = `<table class="path-config-table"><thead><tr><th>Site Name</th><th>Generated Site</th><th>Stream Name</th><th>View Name</th><th>Stream Path Override</th><th>Generated Stream</th>${editable?'<th></th>':''}</tr></thead><tbody>`;
   if (!configs.length) {
-    html += `<tr class="empty-config"><td colspan="${editable?6:5}" class="status">No stream configuration</td></tr>`;
+    html += `<tr class="empty-config"><td colspan="${editable?7:6}" class="status">No stream configuration</td></tr>`;
   }
   configs.forEach((item, index) => {
+    const generated = item.stream_path ? esc(item.stream_path) : `live/${esc(item.stream_name||'')}-${esc(item.view_name||'')}`;
     html += `<tr class="site-stream-row">
       <td><input class="path-config-input site-name" value="${esc(item.site_name||'')}" disabled></td>
       <td class="generated-site"><code>studio_${esc(item.site_name||'')}</code></td>
       <td><input class="path-config-input stream-name" value="${esc(item.stream_name||'')}" disabled></td>
       <td><input class="path-config-input view-name" value="${esc(item.view_name||'')}" disabled></td>
-      <td class="generated-stream"><code>live/${esc(item.stream_name||'')}-${esc(item.view_name||'')}</code></td>
+      <td><input class="path-config-input stream-path" placeholder="e.g. appId/streamName (optional)" value="${esc(item.stream_path||'')}" disabled></td>
+      <td class="generated-stream"><code>${generated}</code></td>
       ${editable?'<td><button class="btn-danger" onclick="this.closest(\'tr\').remove()">Remove</button></td>':''}
     </tr>`;
   });
@@ -362,7 +364,8 @@ function editPathConfig() {
   const rows = [...table.querySelectorAll('.site-stream-row')].map(row => ({
     site_name: row.querySelector('.site-name').value,
     stream_name: row.querySelector('.stream-name').value,
-    view_name: row.querySelector('.view-name').value
+    view_name: row.querySelector('.view-name').value,
+    stream_path: row.querySelector('.stream-path').value
   }));
   table.innerHTML = renderSiteStreamConfigTable(rows, true);
   table.querySelectorAll('.path-config-input').forEach(input => input.disabled = false);
@@ -377,7 +380,7 @@ function addPathConfigRow() {
   const body = table.querySelector('tbody');
   const row = document.createElement('tr');
   row.className = 'site-stream-row';
-  row.innerHTML = `<td><input class="path-config-input site-name" disabled></td><td class="generated-site"><code>studio_</code></td><td><input class="path-config-input stream-name" disabled></td><td><input class="path-config-input view-name" disabled></td><td class="generated-stream"><code>live/-</code></td><td><button class="btn-danger" onclick="this.closest('tr').remove()">Remove</button></td>`;
+  row.innerHTML = `<td><input class="path-config-input site-name" disabled></td><td class="generated-site"><code>studio_</code></td><td><input class="path-config-input stream-name" disabled></td><td><input class="path-config-input view-name" disabled></td><td><input class="path-config-input stream-path" placeholder="e.g. appId/streamName (optional)" disabled></td><td class="generated-stream"><code>live/-</code></td><td><button class="btn-danger" onclick="this.closest('tr').remove()">Remove</button></td>`;
   body.appendChild(row);
   row.querySelectorAll('.path-config-input').forEach(input => input.disabled = false);
 }
@@ -387,7 +390,8 @@ async function savePathConfig() {
   const configs = rows.map(row => ({
     site_name: row.querySelector('.site-name').value.trim(),
     stream_name: row.querySelector('.stream-name').value.trim(),
-    view_name: row.querySelector('.view-name').value.trim()
+    view_name: row.querySelector('.view-name').value.trim(),
+    stream_path: row.querySelector('.stream-path').value.trim()
   }));
   if (configs.some(item => !item.site_name || !item.stream_name || !item.view_name)) {
     alert('Site name, stream name and view name are required.');

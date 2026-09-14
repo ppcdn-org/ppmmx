@@ -345,8 +345,13 @@ func (s *Server) siteConfigHandler(c *gin.Context) {
 		for _, item := range stored {
 			configs = append(configs, adminSiteStreamConfig{
 				ID: item.ID, SiteName: item.SiteName, StreamName: item.StreamName, ViewName: item.ViewName,
-				GeneratedSite:   "studio_" + item.SiteName,
-				GeneratedStream: "live/" + item.StreamName + "-" + item.ViewName,
+				GeneratedSite: "studio_" + item.SiteName,
+				// The actual stream path is only known per split-rec
+				// request now (appId+"/"+StreamName+"-"+ViewName - see
+				// recording.SplitRecHandler.tableToPaths), since it
+				// depends on which app is calling, not on this row alone.
+				// Shown as a template rather than a fixed value.
+				GeneratedStream: "{appId}/" + item.StreamName + "-" + item.ViewName,
 			})
 		}
 	}
@@ -398,7 +403,9 @@ func (s *Server) siteStreamConfigSetHandler(c *gin.Context) {
 			return
 		}
 		seen[key] = struct{}{}
-		configs = append(configs, SiteStreamConfig{SiteName: item.SiteName, StreamName: item.StreamName, ViewName: item.ViewName})
+		configs = append(configs, SiteStreamConfig{
+			SiteName: item.SiteName, StreamName: item.StreamName, ViewName: item.ViewName,
+		})
 	}
 	if err := s.Store.SetSiteStreamConfigs(configs); err != nil {
 		respErr(c, http.StatusInternalServerError, err.Error(), "")

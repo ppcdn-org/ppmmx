@@ -79,6 +79,8 @@ type Server struct {
 	ReadTimeout         conf.Duration
 	WriteTimeout        conf.Duration
 	UDPMaxPayloadSize   int
+	Latency             conf.Duration
+	FC                  uint
 	RunOnConnect        string
 	RunOnConnectRestart bool
 	RunOnDisconnect     string
@@ -118,6 +120,29 @@ func (s *Server) Initialize() error {
 	conf.ConnectionTimeout = time.Duration(s.ReadTimeout)
 	conf.PeerIdleTimeout = time.Duration(s.ReadTimeout)
 	conf.PayloadSize = uint32(srtMaxPayloadSize(s.UDPMaxPayloadSize))
+
+	// Latency sets gosrt's Config.Latency, which in turn drives both
+	// PeerLatency and ReceiverLatency (see gosrt's Config.Validate()) -
+	// the TSBPD delivery delay that gives a NAK-triggered retransmit time
+	// to arrive before its packet is considered lost. gosrt's own default
+	// is 120ms; raise this (not UDPReadBufferSize - see note below) when
+	// SRT publishers see packet loss on lossy/jittery links.
+	if s.Latency > 0 {
+		conf.Latency = time.Duration(s.Latency)
+	}
+	if s.FC > 0 {
+		conf.FC = uint32(s.FC)
+	}
+
+	// Deliberately not set here: gosrt v0.11.0's Config.ReceiverBufferSize
+	// (SRTO_RCVBUF) is parsed from srt:// query strings but never actually
+	// applied to the socket - neither ListenControl() (net.go, which only
+	// sets SO_REUSEADDR/IP_TOS/IP_TTL) nor anything else in the library
+	// calls setsockopt(SO_RCVBUF) with it. Unlike WebRTC/RTSP-UDP/MoQ
+	// (internal/protocols/udpreadbuffer), there is no OS-level UDP read
+	// buffer tuning available for SRT without patching or forking gosrt -
+	// Latency/FC above are the only effective loss-mitigation knobs mmx
+	// can turn for this protocol today.
 
 	var err error
 	s.ln, err = srt.Listen("srt", s.Address, conf)
