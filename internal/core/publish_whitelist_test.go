@@ -83,6 +83,34 @@ func TestAppPublishWhitelistAllowsMultipleHyphensInEitherSegment(t *testing.T) {
 	require.True(t, allowed)
 }
 
+// TestAppPublishWhitelistAllowsCodecSuffixedPath covers the HEVC/H264
+// multitrack WHIP convention ("/{appId}/{streamName}/{codecType}/whip" -
+// see internal/servers/webrtc/session.go's pathCodecFromName): a publish
+// path ending in "/h264" or "/hevc" after the tableId-view segment must
+// still be accepted, not rejected as a malformed 3-segment path.
+func TestAppPublishWhitelistAllowsCodecSuffixedPath(t *testing.T) {
+	w := newTestWhitelist(&fakeAppFetcher{appIDs: []string{"app1"}})
+	w.refresh()
+
+	for _, path := range []string{"app1/table-view/h264", "app1/table-view/hevc"} {
+		allowed, err := w.IsStreamAllowed(path)
+		require.NoError(t, err)
+		require.Truef(t, allowed, "path=%q must be allowed", path)
+	}
+}
+
+// TestAppPublishWhitelistRejectsUnknownCodecSuffix covers that only the
+// two recognized codec segments are stripped - any other trailing segment
+// is still a malformed (extra-segment) path and must be rejected.
+func TestAppPublishWhitelistRejectsUnknownCodecSuffix(t *testing.T) {
+	w := newTestWhitelist(&fakeAppFetcher{appIDs: []string{"app1"}})
+	w.refresh()
+
+	allowed, err := w.IsStreamAllowed("app1/table-view/av1")
+	require.NoError(t, err)
+	require.False(t, allowed)
+}
+
 func TestAppPublishWhitelistEmptyCacheRejectsEverything(t *testing.T) {
 	// A whitelist that has never successfully synced (or has an empty
 	// eligible-app list) must fail closed, not open - see the doc comment

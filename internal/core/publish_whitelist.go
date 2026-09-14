@@ -28,6 +28,16 @@ type publishWhitelistAppFetcher interface {
 // a path split-rec could never resolve back to a round.
 var tableViewPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}-[A-Za-z0-9_-]{1,64}$`)
 
+// codecSuffixes are the trailing path segments the HEVC/H264 multitrack
+// WHIP convention appends after tableId-view (see internal/servers/webrtc/
+// session.go's pathCodecFromName and docs/design/
+// whip-hevc-h264-multitrack-simulcast-design.zh-CN.md:
+// "/{appId}/{streamName}/{codecType}/whip"). Stripped before matching
+// tableViewPattern below so a codec-suffixed publish isn't rejected as
+// malformed - this check only cares about the appId/tableId-view shape,
+// not which codec segment (if any) follows it.
+var codecSuffixes = [...]string{"/h264", "/hevc"}
+
 // appPublishWhitelist implements pathManagerStreamChecker (see
 // path_manager.go) and recording.AppSecretLookup (see split.go). It
 // replaces the old *admin.Store-backed site_stream_configs "live/"
@@ -149,6 +159,9 @@ func (w *appPublishWhitelist) IsStreamAllowed(pathName string) (bool, error) {
 	}
 	if !w.appAllowed(appID) {
 		return false, nil
+	}
+	for _, suffix := range codecSuffixes {
+		rest = strings.TrimSuffix(rest, suffix)
 	}
 	return tableViewPattern.MatchString(rest), nil
 }
