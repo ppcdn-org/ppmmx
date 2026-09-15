@@ -7,7 +7,7 @@
    CONFIG / 全局参数
    ------------------------ */
 const CONFIG_API = {
-  API_GET_WEBRTC_URL: '/api/play/url',
+  API_GET_WEBRTC_URL: '/api/play/txUrl',
   API_START_PLAY_URL: '/play/start',
   API_STOP_PLAY_URL: '/play/end',
   API_PLAY_LAG_URL: '/lag'

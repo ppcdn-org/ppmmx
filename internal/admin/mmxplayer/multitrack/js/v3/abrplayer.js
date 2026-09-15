@@ -82,16 +82,20 @@ function getAudioOnlyPlaybackStreamName(logicalStreamName) {
     return economic || logicalStreamName;
 }
 
+// streamName is already the real Tencent stream key (see
+// internal/forward/layers.go's layerSuffixes: ""/"_standard"/"_economic"/
+// "_lite" for high/standard/economic/bottom-adjacent layers respectively),
+// so no further suffix rewriting is needed here - just resolve the
+// audio-only alias to its real backing stream.
 function getPlaybackStreamForRequest(streamName) {
     if (isAudioOnlyStream(streamName, '')) return getAudioOnlyPlaybackStreamName(streamName);
     return streamName;
 }
 
-let nativeReader = null;
+let tcplayer = null;
 let autoSelectActive = false;
 let currentWebrtcUrl = null;
 let monitorTimer = null;
-let statsInterval = null;
 let playTimer = null;
 let startPlayTime = 0;
 let startPlayTimeLast = -1;
@@ -101,8 +105,6 @@ let audioOnlyReconnectTimer = null;
 let audioOnlyReconnectAttempts = 0;
 let localAudioOnlyMode = false;
 let localAudioOnlySourceStream = null;
-let lastStats = { videoBytes: 0, audioBytes: 0, videoPacketsLost: 0, audioPacketsLost: 0, timestamp: 0 };
-let nativeStallTimer = null;
 
 const ABRState = {
   currentStream: null,
@@ -325,7 +327,7 @@ function setLocalVideoTracksEnabled(enabled) {
 }
 
 function enterLocalAudioOnlyMode(audioStreamName, reason) {
-    if (!nativeReader || isAudioOnlyStream(ABRState.currentStream, currentWebrtcUrl)) {
+    if (!tcplayer || isAudioOnlyStream(ABRState.currentStream, currentWebrtcUrl)) {
         return false;
     }
 
@@ -359,6 +361,10 @@ function exitLocalAudioOnlyMode() {
     setVideoPlaybackVisible(true);
 }
 
+function isFatalPlayerError(errCode) {
+    return [14, 1001, 1002, -2001, -2004, -2005].includes(Number(errCode));
+}
+
 function cleanupPlayerDom() {
     const container = document.getElementById('local-video');
     if (!container) return;
@@ -373,8 +379,11 @@ function cleanupPlayerDom() {
 }
 
 function clearPlayerErrorState() {
-    ABRState.lastErrorCode = null;
-    ABRState.lastErrorTime = 0;
+    try {
+        if (tcplayer && typeof tcplayer.error === 'function') {
+            tcplayer.error(null);
+        }
+    } catch (e) {}
 
     document.querySelectorAll('.vjs-error, .vjs-error-display, .vjs-modal-dialog')
         .forEach(el => {
@@ -488,10 +497,17 @@ function updateMuteButton() {
 }
 
 function applyPlayerAudioSettings() {
-    const videoEl = document.getElementById('player-container-id');
-    if (!videoEl) return;
-    try { videoEl.muted = playerMuted; } catch (e) {}
-    try { videoEl.volume = getPlayerVolume(); } catch (e) {}
+    if (!tcplayer) return;
+    try {
+        if (typeof tcplayer.muted === 'function') {
+            tcplayer.muted(playerMuted);
+        }
+    } catch (e) {}
+    try {
+        if (typeof tcplayer.volume === 'function') {
+            tcplayer.volume(getPlayerVolume());
+        }
+    } catch (e) {}
     updateMuteButton();
 }
 
@@ -541,7 +557,7 @@ function logAudioStats(data) {
     const packetsReceived = audio && Number.isFinite(Number(audio.packetsReceived)) ? Number(audio.packetsReceived) : 0;
     const hasAudioSignal = hasAudioStats && (bitrate > 0 || packetsReceived > 0 || Number(audio.audioLevel) > 0);
     if (!hasAudioStats) {
-        console.warn(`[PlayerAudio] no active audio stats. stream=${ABRState.currentStream}, muted=${playerMuted}, volume=${getPlayerVolume()}, stats=${compactAudioStats(audio)}`);
+        console.warn(`[PlayerAudio] no active audio stats from Tencent player. stream=${ABRState.currentStream}, muted=${playerMuted}, volume=${getPlayerVolume()}, stats=${compactAudioStats(audio)}`);
         return;
     }
     if (bitrate <= 0 && hasAudioSignal) {
@@ -738,188 +754,205 @@ function performUpgrade(targetStream, reason) {
 }
 
 /* ------------------------
-   Player Lifecycle & Events (native WebRTC)
+   Player Lifecycle & Events
    ------------------------ */
+
+const playerHandlers = {
+  debug: null,
+  webrtcstats: null,
+  events: new Map()
+};
 
 function destroyPlayer() {
   if (monitorTimer) { clearInterval(monitorTimer); monitorTimer = null; }
-  if (statsInterval) { clearInterval(statsInterval); statsInterval = null; }
-  if (nativeStallTimer) { clearTimeout(nativeStallTimer); nativeStallTimer = null; }
   clearAudioOnlyReconnectTimer();
   localAudioOnlyMode = false;
   localAudioOnlySourceStream = null;
   if (typeof stopSnapshotStoreLoop === 'function') stopSnapshotStoreLoop();
-  if (nativeReader) {
-    nativeReader.close();
-    nativeReader = null;
-  }
-  const videoEl = document.getElementById('player-container-id');
-  if (videoEl) videoEl.srcObject = null;
+  try {
+    if (tcplayer) {
+      if (playerHandlers.debug) tcplayer.off('debug', playerHandlers.debug);
+      if (playerHandlers.webrtcstats) tcplayer.off('webrtcstats', playerHandlers.webrtcstats);
+      for (const [evt, h] of playerHandlers.events) {
+        tcplayer.off(evt, h);
+      }
+    }
+  } catch(e){}
+  try { if (tcplayer && tcplayer.dispose) tcplayer.dispose(); } catch(e){}
+  tcplayer = null;
   cleanupPlayerDom();
 }
 
 function attachPlayer(options) {
   destroyPlayer();
   applyCanvasLayout(currentCanvasProfile);
-  const videoEl = createVideoElementIfMissing();
-  if (!videoEl) {
-    console.error('attachPlayer: video element not found');
-    ABRState.isSwitching = false;
-    return;
-  }
+  createVideoElementIfMissing();
 
   const audioOnly = !!options.audioOnly || isAudioOnlyStream(ABRState.currentStream, options.source);
   localAudioOnlyMode = audioOnly;
   localAudioOnlySourceStream = audioOnly ? (options.audioOnlySourceStream || getBareStreamNameFromUrl(options.source) || null) : null;
   setVideoPlaybackVisible(!audioOnly);
-
-  const url = options.source;
-  if (!url) {
-    console.error('attachPlayer: no source URL');
-    ABRState.isSwitching = false;
-    return;
-  }
-
-  nativeReader = new MediaMTXWebRTCReader({
-    url: url,
-    maxBitrate: 2500,
-    onTrack: (evt) => {
-      if (evt.track.kind === 'video' || evt.track.kind === 'audio') {
-        if (videoEl.srcObject !== evt.streams[0]) {
-          videoEl.srcObject = evt.streams[0];
-        }
-      }
+  
+  const cfg = {
+    autoplay: true,
+    webrtcConfig: {
+      connectTimeout: 5,
+      connectRetryDelay: 1,
+      connectRetryCount: 1,
+      receiveVideo: !audioOnly,
+      receiveAudio: true,
+      fallback: false,
+      showLog: false
     },
-    onError: (err) => {
-      console.error('[Player Error]', err);
-      ABRState.lastErrorTime = Date.now();
-      const audioOnlyError = isAudioOnlyStream(ABRState.currentStream, currentWebrtcUrl);
-      if (audioOnlyError) {
-        console.warn(`[ABR] Ignored error on audio-only stream.`);
-        clearPlayerErrorState();
-        ABRState.isSwitching = false;
-        if (!localAudioOnlyMode) {
-          scheduleAudioOnlyReconnect(`Player Error: ${err}`);
-        }
-        return;
-      }
-      cleanupPlayerDom();
-      performDowngrade(`Player Error: ${err}`, true);
-    },
-    onConnected: () => {
-      console.log('[Player] WHEP Connected');
-      applyPlayerAudioSettings();
-      startPlayTime = Date.now();
+    language: 'zh-CN',
+    reportable: false,
+    sources: [options.source]
+  };
 
-      const runtimeAudioOnly = audioOnly || localAudioOnlyMode || isAudioOnlyStream(ABRState.currentStream, currentWebrtcUrl);
-      if (!runtimeAudioOnly) {
-        updateCanvasProfile(videoEl.videoWidth, videoEl.videoHeight);
-      }
-      const diffMs = Date.now() - startPlayTime;
-      const playback = describePlaybackStream(videoEl.videoWidth, videoEl.videoHeight);
-      console.log(`[Player] playing stream=${playback.stream}, quality=${playback.quality}, codec=${playback.codec}, resolution=${playback.resolution}, loadTime=${diffMs} ms`);
-
-      if (runtimeAudioOnly) {
-        setVideoPlaybackVisible(false);
-        if (typeof renderAudioFallbackSnapshot === 'function') {
-          renderAudioFallbackSnapshot(ABRState.currentStream);
-        }
-      } else {
-        setVideoPlaybackVisible(true);
-        unfreezeLastFrame();
-        if (shouldStoreFallbackSnapshot(ABRState.currentStream) && typeof startSnapshotStoreLoop === 'function') {
-          startSnapshotStoreLoop(ABRState.currentStream);
-        } else if (typeof stopSnapshotStoreLoop === 'function') {
-          stopSnapshotStoreLoop();
-        }
-      }
-
-      let diffFromLastPlay = -1;
-      if (startPlayTimeLast !== -1) diffFromLastPlay = startPlayTime - startPlayTimeLast;
-      if (diffMs >= 50) ApiPostStartPlay(currentWebrtcUrl, true, "ok", diffMs, diffFromLastPlay, false);
-      startPlayTimeLast = new Date();
-
-      if (playTimer) clearInterval(playTimer);
-      playTimer = setInterval(() => { ApiPostEndPlay(currentWebrtcUrl, 6000); }, 6000);
-
+  try { tcplayer = new TCPlayer('player-container-id', cfg); } 
+  catch (e) { 
+      console.error('TCPlayer init fail', e); 
       ABRState.isSwitching = false;
-      ABRState.consecutiveHighCount = 0;
-    }
-  });
-
-  // Stall detection via video element events
-  videoEl.addEventListener('waiting', () => {
-    if (!nativeStallTimer) nativeStallTimer = Date.now();
-  });
-  videoEl.addEventListener('playing', () => {
-    if (nativeStallTimer) {
-      const buffTime = Date.now() - nativeStallTimer;
-      nativeStallTimer = null;
-      if (buffTime > CONFIG.STALL_THRESHOLD_MS) {
-        console.warn(`[Stall] Heavy lag detected: ${buffTime}ms`);
-        ABRState.lastStallTime = Date.now();
-        markNetworkIssue(`stall ${buffTime}ms`);
-        performDowngrade(`Stall > ${CONFIG.STALL_THRESHOLD_MS}ms (${buffTime}ms)`, false);
-        ApiPostPlayLag(currentWebrtcUrl, buffTime);
-      }
-    }
-  });
-
-  // Resolution monitoring
-  videoEl.addEventListener('resize', () => {
-    updateCanvasProfile(videoEl.videoWidth, videoEl.videoHeight);
-  });
-
-  // Stats collection via getStats() polling
-  if (statsInterval) clearInterval(statsInterval);
-  lastStats = { videoBytes: 0, audioBytes: 0, videoPacketsLost: 0, audioPacketsLost: 0, timestamp: Date.now() };
-  statsInterval = setInterval(async () => {
-    if (!nativeReader || !nativeReader.pc) return;
-    const pc = nativeReader.pc;
-    if (pc.connectionState !== 'connected' && pc.connectionState !== 'checking') return;
-    try {
-      const stats = await pc.getStats();
-      const now = Date.now();
-      const deltaTime = (now - lastStats.timestamp) / 1000;
-      if (deltaTime <= 0) return;
-
-      let videoStats = null, audioStats = null;
-      stats.forEach(report => {
-        if (report.type === 'inbound-rtp' && report.kind === 'video') videoStats = report;
-        if (report.type === 'inbound-rtp' && report.kind === 'audio') audioStats = report;
+      return; 
+  }
+  applyPlayerAudioSettings();
+  try {
+      tcplayer.ready(function() {
+          applyPlayerAudioSettings();
+          const playResult = tcplayer.play && tcplayer.play();
+          if (playResult && typeof playResult.catch === 'function') {
+              playResult.catch(err => console.warn(`[PlayerAudio] play request rejected: ${err && err.message ? err.message : err}`));
+          }
       });
+  } catch (e) {}
 
-      let vBitrate = 0;
-      if (videoStats) {
-        vBitrate = ((videoStats.bytesReceived - lastStats.videoBytes) * 8 / deltaTime / 1000);
-        ABRState.currentReceiveKbps = vBitrate;
-        lastStats.videoBytes = videoStats.bytesReceived;
-        lastStats.videoPacketsLost = videoStats.packetsLost || 0;
+  let stBuffTime = 0;
+  playerHandlers.debug = async function(event) {
+    try {
+      const d = event && event.data;
+      if (!d) return;
+      if (d.code === 1009) {
+          stBuffTime = Date.now();
+      } 
+      else if (d.code === 1010) {
+          let buffTime = Date.now() - stBuffTime;
+          if (buffTime > CONFIG.STALL_THRESHOLD_MS) {
+              console.warn(`[Stall] Heavy lag detected: ${buffTime}ms`);
+              ABRState.lastStallTime = Date.now();
+              markNetworkIssue(`stall ${buffTime}ms`);
+              performDowngrade(`Stall > 5000ms (${buffTime}ms)`, false);
+              ApiPostPlayLag(currentWebrtcUrl, buffTime);
+          }
       }
-      if (audioStats) {
-        lastStats.audioBytes = audioStats.bytesReceived;
-        lastStats.audioPacketsLost = audioStats.packetsLost || 0;
-      }
-      lastStats.timestamp = now;
+    } catch(e){}
+  };
+  tcplayer.on('debug', playerHandlers.debug);
 
-      const statsData = {
-        video: videoStats ? { bitrate: vBitrate * 1000, bytesReceived: videoStats.bytesReceived, packetsLost: videoStats.packetsLost, framesPerSecond: videoStats.framesPerSecond } : null,
-        audio: audioStats ? { bitrate: Math.max(0, ((audioStats.bytesReceived - (lastStats.audioBytesBefore || 0)) * 8 / deltaTime / 1000) * 1000), bytesReceived: audioStats.bytesReceived, packetsLost: audioStats.packetsLost, jitter: audioStats.jitter, audioLevel: 1 } : null
-      };
-      lastStats.audioBytesBefore = lastStats.audioBytes;
-      logAudioStats(statsData);
-      if (hasActiveAudioStats(statsData && statsData.audio)) {
-        ABRState.lastErrorCode = null;
-        audioOnlyReconnectAttempts = 0;
-        clearAudioOnlyReconnectTimer();
+  playerHandlers.webrtcstats = function(event){
+    try {
+      const data = event.data;
+      const vBitrate = (data.video && data.video.bitrate) ? parseInt(data.video.bitrate / 1000) : 0;
+      ABRState.currentReceiveKbps = vBitrate; 
+      logAudioStats(data);
+      if (hasActiveAudioStats(data && data.audio)) {
+          ABRState.lastErrorCode = null;
+          audioOnlyReconnectAttempts = 0;
+          clearAudioOnlyReconnectTimer();
       }
-      if (typeof onPlayStats === 'function') onPlayStats(statsData);
-    } catch (e) {
-      console.warn('[Stats] getStats error:', e);
-    }
-  }, 1000);
+      
+      if (typeof onPlayStats === 'function') onPlayStats(data);
+    } catch(e){}
+  };
+  tcplayer.on('webrtcstats', playerHandlers.webrtcstats);
 
-  if (!monitorTimer) startMonitorLoop();
+  const commonEvents = ['loadstart','error','playing','play','pause','ended'];
+  commonEvents.forEach(function(evt){
+    const handler = async function(event){
+        if (evt === 'play') {
+          startPlayTime = Date.now();
+        } else if (evt === 'playing') {
+          const runtimeAudioOnly = audioOnly || localAudioOnlyMode || isAudioOnlyStream(ABRState.currentStream, currentWebrtcUrl);
+          if (!runtimeAudioOnly) {
+            updateCanvasProfile(tcplayer.videoWidth(), tcplayer.videoHeight());
+          }
+          const diffMs = Date.now() - startPlayTime;
+          const playback = describePlaybackStream(tcplayer.videoWidth(), tcplayer.videoHeight());
+          const sourceSuffix = playback.source && playback.source !== playback.stream ? `, source=${playback.source}` : '';
+          console.log(`[Player] playing stream=${playback.stream}${sourceSuffix}, quality=${playback.quality}, level=${playback.level}, codec=${playback.codec}, resolution=${playback.resolution}, loadTime=${diffMs} ms`);
+          applyPlayerAudioSettings();
+          if (runtimeAudioOnly) {
+            setVideoPlaybackVisible(false);
+            console.log('[Player] audio-only stream active, video playback stopped.');
+            if (typeof renderAudioFallbackSnapshot === 'function') {
+              renderAudioFallbackSnapshot(ABRState.currentStream);
+            }
+          } else {
+            setVideoPlaybackVisible(true);
+            unfreezeLastFrame();
+            if (shouldStoreFallbackSnapshot(ABRState.currentStream) && typeof startSnapshotStoreLoop === 'function') {
+              startSnapshotStoreLoop(ABRState.currentStream);
+            } else if (typeof stopSnapshotStoreLoop === 'function') {
+              stopSnapshotStoreLoop();
+            }
+          }
+
+          let diffFromLastPlay = -1;
+          if (startPlayTimeLast !== -1){
+              diffFromLastPlay = startPlayTime - startPlayTimeLast;
+          }
+          if (diffMs >= 50) {
+              ApiPostStartPlay(currentWebrtcUrl, true, "ok", diffMs, diffFromLastPlay, false);
+          }
+          startPlayTimeLast = new Date();
+          
+          if (playTimer) clearInterval(playTimer);
+          playTimer = setInterval(() => {
+              ApiPostEndPlay(currentWebrtcUrl, 6000);
+          }, 6000);
+
+          ABRState.isSwitching = false;
+          ABRState.consecutiveHighCount = 0;
+
+        } else if (evt === 'error') {
+            const errCode = event && event.data && event.data.code;
+            const audioOnlyError = isAudioOnlyStream(ABRState.currentStream, currentWebrtcUrl);
+            const logFn = audioOnlyError ? console.warn : console.error;
+            logFn(`[Player Error] CODE:${errCode}`);
+            ABRState.lastErrorTime = Date.now();
+            ABRState.lastErrorCode = errCode;
+            
+            if (isFatalPlayerError(errCode)) {
+                if (audioOnlyError) {
+                    console.warn(`[ABR] Ignored player error ${errCode} on audio-only fallback stream.`);
+                    clearPlayerErrorState();
+                    ABRState.isSwitching = false;
+                    if (!localAudioOnlyMode) {
+                        scheduleAudioOnlyReconnect(`Player Error Code: ${errCode}`);
+                    }
+                    return;
+                }
+                cleanupPlayerDom();
+                if (errCode === -2004 && fallbackUnderscoreToLegacy(`Player Error Code: ${errCode}`)) {
+                    return;
+                }
+                // console.error(`[Health] Marking ${ABRState.currentStream} as DEAD (Offline).`);
+                // ABRState.isSwitching = false;
+
+                // const currentProfile = getStreamProfile(ABRState.currentStream);
+                // if (currentProfile) {
+                //     currentProfile.online = false;
+                // }
+                performDowngrade(`Player Error Code: ${errCode}`, true);
+            }
+      }
+    };
+    playerHandlers.events.set(evt, handler);
+    tcplayer.on(evt, handler);
+  });
+
+  if (!monitorTimer) { 
+    startMonitorLoop();
+  }
 }
 
 function startMonitorLoop() {
@@ -928,7 +961,7 @@ function startMonitorLoop() {
     resetAbrCounters();
     
     monitorTimer = setInterval(async () => {
-        if (!nativeReader || !autoSelectActive || !ABRState.currentStream) return;
+        if (!tcplayer || !autoSelectActive || !ABRState.currentStream) return;
 
         if (ABRState.isSwitching) return;
 

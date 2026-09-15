@@ -3,6 +3,8 @@
  * UI bindings for site-based ABR playback.
  */
 
+window.VConsole && new window.VConsole();
+
 let pageSiteName = currentSiteName;
 let pageViewName = 'fwh';
 let pageStreamNames = null;
@@ -404,7 +406,8 @@ async function startManualStream(streamName) {
 function clearPreviewGridPlayers() {
   for (const player of previewGridPlayers) {
     try {
-      if (player && typeof player.close === 'function') player.close();
+      if (player && typeof player.dispose === 'function') player.dispose();
+      else if (player && typeof player.destroy === 'function') player.destroy();
     } catch (e) {}
   }
   previewGridPlayers = [];
@@ -491,16 +494,23 @@ async function startPreviewGrid() {
     try {
       let connectingTimer = null;
       let failTimer = null;
-      const vid = document.getElementById(playerId);
-      const gridReader = new MediaMTXWebRTCReader({
-        url: url,
-        onTrack: (evt) => {
-          if (vid.srcObject !== evt.streams[0]) vid.srcObject = evt.streams[0];
+      const player = new TCPlayer(playerId, {
+        autoplay: true,
+        muted: true,
+        webrtcConfig: {
+          connectTimeout: 12,
+          connectRetryDelay: 2,
+          connectRetryCount: 2,
+          receiveVideo: !audioOnly,
+          receiveAudio: true,
+          fallback: false,
+          showLog: false
         },
-        onError: () => { setPreviewTileState(tile, 'error', 'error'); },
-        onConnected: () => { setPreviewTileState(tile, 'playing', 'playing'); }
+        language: 'zh-CN',
+        reportable: false,
+        sources: [url]
       });
-      previewGridPlayers.push(gridReader);
+      previewGridPlayers.push(player);
       connectingTimer = setTimeout(function() {
         if (!tile.classList.contains('is-playing') && !tile.classList.contains('is-error')) {
           setPreviewTileState(tile, 'loading', 'connecting');
@@ -511,6 +521,37 @@ async function startPreviewGrid() {
           setPreviewTileState(tile, 'error', 'timeout');
         }
       }, PREVIEW_GRID_HARD_TIMEOUT_MS);
+      player.on('playing', function() {
+        if (connectingTimer) clearTimeout(connectingTimer);
+        if (failTimer) clearTimeout(failTimer);
+        setPreviewTileState(tile, 'playing', 'playing');
+      });
+      player.on('error', function(event) {
+        if (connectingTimer) clearTimeout(connectingTimer);
+        if (failTimer) clearTimeout(failTimer);
+        const code = event && event.data && event.data.code;
+        setPreviewTileState(tile, 'error', code ? `error ${code}` : 'error');
+      });
+      player.ready(function() {
+        try {
+          if (typeof player.muted === 'function') player.muted(true);
+          if (typeof player.volume === 'function') player.volume(0);
+          const result = player.play && player.play();
+          if (result && typeof result.catch === 'function') {
+            result.catch(function(err) {
+              if (isRecoverablePreviewPlayError(err)) {
+                if (!tile.classList.contains('is-playing') && !tile.classList.contains('is-error')) {
+                  setPreviewTileState(tile, 'loading', 'starting');
+                }
+                return;
+              }
+              setPreviewTileState(tile, 'error', err && err.message ? err.message : 'play rejected');
+            });
+          }
+        } catch (err) {
+          setPreviewTileState(tile, 'error', err && err.message ? err.message : 'play failed');
+        }
+      });
     } catch (err) {
       setPreviewTileState(tile, 'error', err && err.message ? err.message : 'init failed');
     }
@@ -631,7 +672,7 @@ function buildAudioStatData(data, audioOnly) {
   }
   if (!audioOnly || typeof ABRState === 'undefined') return data && data.audio;
   return {
-    status: 'No active audio stats',
+    status: 'No active audio stats from Tencent player',
     stream: ABRState.currentStream || '-',
     quality: 'bottom',
     codec: 'OPUS',
@@ -700,7 +741,7 @@ $('#mutePlay').on('click', function() {
   if (typeof togglePlayerMuted === 'function') togglePlayerMuted();
 });
 $('.close-icon').on('click', function() { $('.stat-info').hide(); });
-$('#enterFullScreen').on('click', function() { try { const el = document.getElementById('player-container-id'); if (el && el.requestFullscreen) el.requestFullscreen(); else if (el && el.webkitRequestFullscreen) el.webkitRequestFullscreen(); } catch(e){} });
+$('#enterFullScreen').on('click', function() { try { if (tcplayer) tcplayer.requestFullscreen(true); } catch(e){} });
 
 document.addEventListener('DOMContentLoaded', async function() {
     const params = new URLSearchParams(window.location.search);
