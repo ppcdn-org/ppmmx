@@ -6,13 +6,21 @@
 # what caused "requested 2097152, got 212992" on this host's default Ubuntu
 # sysctl config.
 #
-# Usage: sudo ./tune-udp-buffers.sh [size_bytes]
+# Also raises net.core.netdev_max_backlog, the per-CPU queue of packets the
+# kernel holds between the NIC driver and the protocol stack. Its default of
+# 1000 is easily overrun by a multi-layer simulcast ingest burst (e.g. 3 x
+# 5Mbps SRT/WHIP layers), and packets dropped there never reach the socket
+# at all - so no amount of SO_RCVBUF or SRT latency tuning can recover them.
+#
+# Usage: sudo ./tune-udp-buffers.sh [size_bytes] [netdev_backlog]
 #   size_bytes defaults to 8388608 (8MB). Pass 0 to only print the current
 #   values without changing anything.
+#   netdev_backlog defaults to 5000.
 
 set -euo pipefail
 
 TARGET_BYTES="${1:-8388608}"
+NETDEV_BACKLOG="${2:-5000}"
 SYSCTL_FILE=/etc/sysctl.d/99-mmx-udp-buffers.conf
 
 if [[ $EUID -ne 0 ]]; then
@@ -21,7 +29,7 @@ if [[ $EUID -ne 0 ]]; then
 fi
 
 echo "current values:"
-sysctl net.core.rmem_max net.core.rmem_default net.core.wmem_max net.core.wmem_default
+sysctl net.core.rmem_max net.core.rmem_default net.core.wmem_max net.core.wmem_default net.core.netdev_max_backlog
 
 if [[ "$TARGET_BYTES" -eq 0 ]]; then
   exit 0
@@ -45,13 +53,17 @@ net.core.rmem_max = ${TARGET_BYTES}
 net.core.rmem_default = ${TARGET_BYTES}
 net.core.wmem_max = ${TARGET_BYTES}
 net.core.wmem_default = ${TARGET_BYTES}
+# NIC-to-stack queue depth; default 1000 is too shallow for multi-layer
+# simulcast ingest bursts. Drops here happen before the socket, so they are
+# invisible to SO_RCVBUF/SRT latency tuning.
+net.core.netdev_max_backlog = ${NETDEV_BACKLOG}
 EOF
 
 sysctl -p "$SYSCTL_FILE"
 
 echo
 echo "applied. new values:"
-sysctl net.core.rmem_max net.core.rmem_default net.core.wmem_max net.core.wmem_default
+sysctl net.core.rmem_max net.core.rmem_default net.core.wmem_max net.core.wmem_default net.core.netdev_max_backlog
 
 echo
 echo "persisted to $SYSCTL_FILE (survives reboot via /etc/sysctl.d)."

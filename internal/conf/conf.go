@@ -553,21 +553,37 @@ type Conf struct {
 	// SRTLatency is the SRT protocol's own retransmission buffer, i.e. how
 	// long a packet is held before TSBPD delivers it, giving NAK-triggered
 	// retransmits time to arrive over a lossy/jittery public-internet link
-	// (e.g. OBS -> origin). gosrt's default (120ms) is tuned for
-	// low-latency conferencing, not a burst-tolerant CDN ingest path;
-	// raise this first when SRT publishers see packet loss - see
-	// internal/servers/srt/server.go's Initialize() doc comment for why
-	// UDPReadBufferSize/SRTO_RCVBUF do NOT help here (gosrt v0.11.0 parses
-	// but never applies that one).
+	// (e.g. OBS -> origin). See internal/servers/srt/server.go's
+	// Initialize() doc comment for why UDPReadBufferSize/SRTO_RCVBUF do
+	// NOT help here (gosrt v0.11.0 parses but never applies that one).
+	//
+	// Sizing rule: SRT needs latency >= ~2.5-4x RTT to fit a full
+	// retransmit round trip. gosrt's 120ms default is tuned for
+	// low-latency conferencing and, on a ~32ms-RTT ingest link, lands at
+	// only ~3.75x - right at the theoretical floor. Any jitter that
+	// briefly pushes RTT to 40-50ms then puts the retransmit past the
+	// TSBPD deadline and the packet is *counted as lost even though it
+	// arrived*. That failure mode is diagnostic: loss rate spikes while
+	// RTT stays flat. Hence the deliberately generous default below -
+	// comparable commercial SRT ingest (e.g. Tencent Cloud Live) runs
+	// 2000-4000ms for the same reason.
 	SRTLatency Duration `json:"srtLatency"`
 	// SRTFC is the flow control window in packets (SRTO_FC): the maximum
 	// number of packets that can be in flight unacknowledged. Too small a
 	// window silently caps effective throughput on a high-bitrate/high-RTT
-	// link before loss is even the limiting factor. uint (not gosrt's own
-	// uint32) because internal/conf/env's reflection-based loader only
-	// knows the fixed set of scalar types it special-cases
-	// (string/int/uint/float64/bool) - see env.go's loadEnvInternal
-	// default case.
+	// link before loss is even the limiting factor, and it has to scale
+	// *with* SRTLatency - a large latency window is useless if flow
+	// control won't let that many packets be outstanding in the first
+	// place. gosrt advertises this to the peer as MaxFlowWindowSize and
+	// uses it for AvailableBufferSize, which is the closest thing the
+	// library offers to a receive-buffer size knob (Config's own
+	// ReceiverBufferSize/SRTO_RCVBUF is parsed but never applied - see
+	// server.go).
+	//
+	// uint (not gosrt's own uint32) because internal/conf/env's
+	// reflection-based loader only knows the fixed set of scalar types it
+	// special-cases (string/int/uint/float64/bool) - see env.go's
+	// loadEnvInternal default case.
 	SRTFC uint `json:"srtFC"`
 	// SRTLossAlarmEnable reports a publish connection's SRT loss rate to
 	// ppcenter (POST /internal/mmx/v1/alarms/srt-loss) whenever it crosses
@@ -779,13 +795,22 @@ func (conf *Conf) setDefaults() {
 	// SRT server
 	conf.SRT = true
 	conf.SRTAddress = ":8890"
-	// 300ms (vs. gosrt's 120ms default): gives NAK-triggered retransmits
-	// more time to land on a jittery public-internet publish link before
-	// TSBPD gives up on a packet - see the SRTLatency field doc above.
-	conf.SRTLatency = 300 * Duration(time.Millisecond)
-	// gosrt's own default (25600 packets); set explicitly so it's a known,
-	// documented value rather than an implicit library default.
-	conf.SRTFC = 25600
+	// 2000ms, vs. gosrt's 120ms default and the 300ms this used to be.
+	// At a measured ~32ms RTT, 120ms is only ~3.75x RTT (the bare
+	// theoretical minimum for one retransmit round trip) and 300ms is
+	// ~9x - both leave a burst of jitter able to push retransmits past
+	// the TSBPD deadline, which SRT then counts as loss even though the
+	// packets arrived. 2000ms is ~60x RTT, matching what commercial SRT
+	// ingest uses, and costs only added ingest latency - not a concern on
+	// a publish path that is already buffered downstream. See the
+	// SRTLatency field doc for the full reasoning.
+	conf.SRTLatency = 2000 * Duration(time.Millisecond)
+	// 65536 packets (vs. gosrt's 25600 default): the flow-control window
+	// has to scale with SRTLatency above, otherwise the sender is capped
+	// on in-flight packets long before the bigger latency window can
+	// actually be used. At 5Mbps x 3 simulcast layers with a 2s window,
+	// 25600 packets is not enough headroom.
+	conf.SRTFC = 65536
 	// Both alarm/disconnect flags default off (opt-in, matching
 	// WebRTCDegradeEnable) so turning either on "just works" with these
 	// numbers without also having to set the threshold/duration.

@@ -156,25 +156,43 @@ func (s *Server) Initialize() error {
 	// Latency sets gosrt's Config.Latency, which in turn drives both
 	// PeerLatency and ReceiverLatency (see gosrt's Config.Validate()) -
 	// the TSBPD delivery delay that gives a NAK-triggered retransmit time
-	// to arrive before its packet is considered lost. gosrt's own default
-	// is 120ms; raise this (not UDPReadBufferSize - see note below) when
-	// SRT publishers see packet loss on lossy/jittery links.
+	// to arrive before its packet is considered lost.
+	//
+	// This is the single most important setting for SRT ingest loss.
+	// gosrt defaults it to 120ms, which on a typical ~32ms-RTT publish
+	// link is only ~3.75x RTT - the bare minimum for one retransmit round
+	// trip, with no margin for jitter. When RTT briefly rises, retransmits
+	// miss the TSBPD deadline and get counted as loss despite having
+	// arrived, which shows up as a loss-rate spike with a flat RTT graph.
+	// conf.SRTLatency defaults to 2000ms for that reason; see its field
+	// doc in internal/conf for the sizing rule.
 	if s.Latency > 0 {
 		conf.Latency = time.Duration(s.Latency)
 	}
+	// FC must scale with Latency: it bounds how many packets may be in
+	// flight unacknowledged, so a large latency window is unusable if
+	// flow control won't permit that many outstanding packets. gosrt also
+	// advertises it to the peer as MaxFlowWindowSize and reports it as
+	// AvailableBufferSize.
 	if s.FC > 0 {
 		conf.FC = uint32(s.FC)
 	}
 
 	// Deliberately not set here: gosrt v0.11.0's Config.ReceiverBufferSize
-	// (SRTO_RCVBUF) is parsed from srt:// query strings but never actually
-	// applied to the socket - neither ListenControl() (net.go, which only
-	// sets SO_REUSEADDR/IP_TOS/IP_TTL) nor anything else in the library
-	// calls setsockopt(SO_RCVBUF) with it. Unlike WebRTC/RTSP-UDP/MoQ
-	// (internal/protocols/udpreadbuffer), there is no OS-level UDP read
-	// buffer tuning available for SRT without patching or forking gosrt -
-	// Latency/FC above are the only effective loss-mitigation knobs mmx
-	// can turn for this protocol today.
+	// (SRTO_RCVBUF) is a dead field - it appears only in the struct, its
+	// zero default, and srt:// query-string parse/marshal. Nothing in the
+	// library ever applies it to the socket or to any internal buffer
+	// (ListenControl() in net.go only sets SO_REUSEADDR/IP_TOS/IP_TTL,
+	// and no code path calls setsockopt(SO_RCVBUF)). Setting it would be
+	// a silent no-op, so FC above carries the receive-window sizing
+	// instead. Likewise there is no OS-level UDP read buffer tuning for
+	// SRT the way there is for WebRTC/RTSP-UDP/MoQ
+	// (internal/protocols/udpreadbuffer), short of forking gosrt.
+	//
+	// The OS-side counterpart to these settings is
+	// net.core.netdev_max_backlog, which defaults to 1000 and should be
+	// >= 5000 for multi-layer simulcast ingest - see
+	// scripts/tune-udp-buffers.sh.
 
 	var err error
 	s.ln, err = srt.Listen("srt", s.Address, conf)
