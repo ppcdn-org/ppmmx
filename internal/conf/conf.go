@@ -399,13 +399,24 @@ type Conf struct {
 	WebRTCTrackGatherTimeout    Duration          `json:"webrtcTrackGatherTimeout"`
 	// WebRTCInboundRTPBufferSize sets rtpreceiver.Receiver.BufferSize (the
 	// packet-reordering buffer) for every WHIP-published inbound track -
-	// see internal/protocols/webrtc/inbound_track.go. Zero/unset keeps
-	// gortsplib's own default of 64. Origin nodes, which take the first
-	// (and often only) hop from an OBS/ppobs publisher and so see the
-	// roughest jitter/reordering, are the deployment this is meant to be
-	// raised for (128, see bin/conf/origin.local.yml) - edge and record
-	// nodes only ever receive an already-cleaned-up mmx-to-mmx forward and
-	// don't need it.
+	// see internal/protocols/webrtc/inbound_track.go.
+	//
+	// This is WHIP's structural equivalent of SRTLatency: it bounds how
+	// far out of order (or how late, via NACK retransmit) a packet may
+	// arrive and still be recovered. gortsplib sizes a flat
+	// []*rtp.Packet of exactly this length and treats any sequence gap
+	// wider than it as unrecoverable loss, so the same failure mode
+	// applies - a retransmit that arrives after the window has moved on
+	// is *counted as lost even though it arrived*, showing up as a loss
+	// spike with flat RTT.
+	//
+	// Sizing: gortsplib's own default is 64 packets, which at ~5Mbps/30fps
+	// is only ~200ms of recovery window - barely more than one NACK
+	// detection interval (100ms) plus an RTT, and a single keyframe burst
+	// can consume most of it on its own. Defaulted to 512 below for the
+	// same reason SRTLatency is 2000ms: the cost is bounded reordering
+	// delay on an already-buffered publish path, and the benefit is
+	// retransmits actually landing inside the window.
 	WebRTCInboundRTPBufferSize int `json:"webrtcInboundRTPBufferSize"`
 
 	// ABR (Adaptive Bitrate)
@@ -752,6 +763,13 @@ func (conf *Conf) setDefaults() {
 	conf.WebRTCSTUNGatherTimeout = 5 * Duration(time.Second)
 	conf.WebRTCHandshakeTimeout = 10 * Duration(time.Second)
 	conf.WebRTCTrackGatherTimeout = 2 * Duration(time.Second)
+	// 512 packets (vs. gortsplib's 64 default). 64 is only ~200ms of
+	// reorder/retransmit window at 5Mbps/30fps, which a NACK round trip
+	// plus one keyframe burst can exhaust - the WHIP-side analogue of the
+	// too-small SRT latency fixed alongside this. Previously unset here,
+	// so every node that didn't override it in YAML silently ran on 64.
+	// See the field doc for the sizing rationale.
+	conf.WebRTCInboundRTPBufferSize = 512
 	conf.WebRTCABREnable = false
 	conf.WebRTCABRWSPath = "/ws/control"
 	conf.WebRTCABRSwitchCooldown = 3000

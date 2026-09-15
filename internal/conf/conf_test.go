@@ -350,11 +350,16 @@ func TestConfWebRTCIPsFromInterfacesFallback(t *testing.T) {
 }
 
 // TestConfWebRTCInboundRTPBufferSize verifies webrtcInboundRTPBufferSize
-// parses from YAML and defaults to 0 (which lets rtpreceiver.Receiver fall
-// back to its own built-in default of 64 - see
-// internal/protocols/webrtc/inbound_track.go) when left unset, as origin
-// nodes are the only deployment meant to raise it (see
-// bin/conf/origin.local.yml).
+// parses from YAML and, when left unset, defaults to 512 rather than to 0.
+//
+// It used to default to 0, which let rtpreceiver.Receiver fall back to its
+// own built-in 64 (see internal/protocols/webrtc/inbound_track.go) on the
+// assumption that only origin nodes needed a larger reorder/retransmit
+// window. That was wrong: record and edge nodes receive mmx-to-mmx WHIP
+// forwards over the same inbound track path, so they were silently running
+// on a ~200ms window too, and any deployment that didn't hand-edit its YAML
+// got the small value. 512 is now the floor everywhere - see the field doc
+// in conf.go.
 func TestConfWebRTCInboundRTPBufferSize(t *testing.T) {
 	conf, _, err := Load(createTempFile(t, []byte("webrtcInboundRTPBufferSize: 128\n")), nil, nil)
 	require.NoError(t, err)
@@ -362,7 +367,7 @@ func TestConfWebRTCInboundRTPBufferSize(t *testing.T) {
 
 	conf, _, err = Load(createTempFile(t, []byte("{}")), nil, nil)
 	require.NoError(t, err)
-	require.Equal(t, 0, conf.WebRTCInboundRTPBufferSize)
+	require.Equal(t, 512, conf.WebRTCInboundRTPBufferSize)
 }
 
 func TestConfErrors(t *testing.T) {
