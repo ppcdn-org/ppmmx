@@ -136,6 +136,7 @@ type Server struct {
 	wg        sync.WaitGroup
 	ln        srt.Listener
 	conns     map[*conn]struct{}
+	srtLogger srt.Logger
 
 	// in
 	chNewConnRequest chan srt.ConnRequest
@@ -178,6 +179,19 @@ func (s *Server) Initialize() error {
 		conf.FC = uint32(s.FC)
 	}
 
+	// Debug-only visibility into gosrt's own NAK control-packet trace, for
+	// diagnosing cases where gosrt's receive-side loss/retrans/drop
+	// accounting doesn't reconcile against the publisher's own SRT stack
+	// (e.g. a libsrt sender reporting ~0% retransmitted while gosrt records
+	// real retrans/drop activity - seen on a real publish session, most
+	// consistent with reordering/duplication on the wire being attributed
+	// to loss+retransmit by gosrt without libsrt ever actually
+	// retransmitting for it). Always subscribed; genuinely silent unless
+	// logLevel is set to debug, same as every other logger.Debug call in
+	// this package - see internal/logger.Logger.Log's level filter.
+	conf.Logger = srt.NewLogger([]string{"control:send:NAK", "control:recv:NAK"})
+	s.srtLogger = conf.Logger
+
 	// Deliberately not set here: gosrt v0.11.0's Config.ReceiverBufferSize
 	// (SRTO_RCVBUF) is a dead field - it appears only in the struct, its
 	// zero default, and srt:// query-string parse/marshal. Nothing in the
@@ -211,6 +225,29 @@ func (s *Server) Initialize() error {
 	s.chAPIConnsKick = make(chan serverAPIConnsKickReq)
 
 	s.Log(logger.Info, "started with listener on "+s.Address+" (UDP/SRT)")
+
+	// Forwards gosrt's NAK trace into our own logger. Exits via s.ctx rather
+	// than draining s.srtLogger.Listen() to closure - closing a gosrt
+	// Logger while a connection goroutine might still be calling Print() on
+	// it panics (send on closed channel), and s.ctx is already the
+	// mechanism that guarantees every conn goroutine has stopped by the
+	// time Close() returns (see s.wg.Wait() there), so there's nothing to
+	// gain from also calling srtLogger.Close().
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		for {
+			select {
+			case <-s.ctx.Done():
+				return
+			case m, ok := <-s.srtLogger.Listen():
+				if !ok {
+					return
+				}
+				s.Log(logger.Debug, "nak socket=%#08x topic=%s: %s", m.SocketId, m.Topic, m.Message)
+			}
+		}
+	}()
 
 	l := &listener{
 		ln:     s.ln,
