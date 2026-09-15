@@ -575,9 +575,8 @@ type Conf struct {
 	// briefly pushes RTT to 40-50ms then puts the retransmit past the
 	// TSBPD deadline and the packet is *counted as lost even though it
 	// arrived*. That failure mode is diagnostic: loss rate spikes while
-	// RTT stays flat. Hence the deliberately generous default below -
-	// comparable commercial SRT ingest (e.g. Tencent Cloud Live) runs
-	// 2000-4000ms for the same reason.
+	// RTT stays flat. Configurable per-node via the srtLatency YAML key;
+	// the default of 300ms gives ~9x RTT margin on a typical link.
 	SRTLatency Duration `json:"srtLatency"`
 	// SRTFC is the flow control window in packets (SRTO_FC): the maximum
 	// number of packets that can be in flight unacknowledged. Too small a
@@ -813,16 +812,12 @@ func (conf *Conf) setDefaults() {
 	// SRT server
 	conf.SRT = true
 	conf.SRTAddress = ":8890"
-	// 2000ms, vs. gosrt's 120ms default and the 300ms this used to be.
-	// At a measured ~32ms RTT, 120ms is only ~3.75x RTT (the bare
-	// theoretical minimum for one retransmit round trip) and 300ms is
-	// ~9x - both leave a burst of jitter able to push retransmits past
-	// the TSBPD deadline, which SRT then counts as loss even though the
-	// packets arrived. 2000ms is ~60x RTT, matching what commercial SRT
-	// ingest uses, and costs only added ingest latency - not a concern on
-	// a publish path that is already buffered downstream. See the
-	// SRTLatency field doc for the full reasoning.
-	conf.SRTLatency = 2000 * Duration(time.Millisecond)
+	// 300ms default (~9x a typical ~32ms RTT), configurable per-node via
+	// the srtLatency YAML key. The previous 2000ms was ~60x RTT and
+	// pushed end-to-end P2P delay past 2 seconds for HEVC viewers; 300ms
+	// still leaves enough margin for NAK-triggered retransmits on a
+	// clean public-internet link while keeping ingest latency reasonable.
+	conf.SRTLatency = 300 * Duration(time.Millisecond)
 	// 65536 packets (vs. gosrt's 25600 default): the flow-control window
 	// has to scale with SRTLatency above, otherwise the sender is capped
 	// on in-flight packets long before the bigger latency window can
