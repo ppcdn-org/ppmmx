@@ -450,6 +450,20 @@ type Conf struct {
 	// WebRTCDegradeWSSecret (degrade WS channel).
 	WebRTCForwardSecret string `json:"-"`
 
+	// RTPLossAlarmEnable reports a WHIP publish session's RTP packet-loss
+	// rate (the same figure logged every recvstats.Interval as
+	// "[recv-stats] proto=whip ... loss=") to ppcenter (POST
+	// /internal/mmx/v1/alarms/rtp-loss) whenever it crosses
+	// RTPLossAlarmThresholdPct, and once more when it drops back under -
+	// ppcenter raises/auto-resolves a superadmin node alarm from that (see
+	// AlarmManager.CheckRTPLoss). Requires MMXControl for the endpoint/
+	// credential, same reuse as SRTLossAlarmEnable/trafficUsage. Named RTP
+	// rather than WebRTC since it's specifically the RTP-layer loss figure,
+	// not a broader WebRTC/ICE/DTLS health signal.
+	RTPLossAlarmEnable bool `json:"rtpLossAlarmEnable"`
+	// RTPLossAlarmThresholdPct is a 0-100 percentage, not a 0-1 ratio.
+	RTPLossAlarmThresholdPct float64 `json:"rtpLossAlarmThresholdPct"`
+
 	// CDN ingest (pull external CDN sources, re-publish them locally over
 	// RTMP loopback so they're recorded/distributed like any other
 	// publisher). Defaults to false (see setDefaults) - opt in per
@@ -736,6 +750,12 @@ func (conf *Conf) setDefaults() {
 	conf.WebRTCRecoverInstantLossPct = 5.0
 	conf.WebRTCRecoverAvgLossPct = 1.0
 	conf.WebRTCDegradeObservationSec = 60
+	// Opt-in, matching SRTLossAlarmEnable - 2.0% chosen as a first-cut
+	// default, distinct from SRT's own 10.0% (RTP and SRT loss have
+	// different underlying transports/error-recovery, no reason to assume
+	// the same number is right for both).
+	conf.RTPLossAlarmEnable = false
+	conf.RTPLossAlarmThresholdPct = 2.0
 	// Default ingest source: pull mmx's own Tencent-forwarded backup domain
 	// back down and republish it locally. "tencent:" gets txSecret/txTime
 	// signed with TX_SECRET_KEY_BACK (see internal/ingest); other prefixes

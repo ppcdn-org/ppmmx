@@ -37,6 +37,7 @@ import (
 	"github.com/bluenviron/mediamtx/internal/recordcleaner"
 	"github.com/bluenviron/mediamtx/internal/recording"
 	"github.com/bluenviron/mediamtx/internal/rlimit"
+	"github.com/bluenviron/mediamtx/internal/selfstats"
 	"github.com/bluenviron/mediamtx/internal/servers/hls"
 	"github.com/bluenviron/mediamtx/internal/servers/moq"
 	"github.com/bluenviron/mediamtx/internal/servers/rtmp"
@@ -130,6 +131,7 @@ type Core struct {
 	externalCmdPool  *externalcmd.Pool
 	authManager      *auth.Manager
 	metrics          *metrics.Metrics
+	selfStats        *selfstats.Reporter
 	pprof            *pprof.PPROF
 	recordCleaner    *recordcleaner.Cleaner
 	playbackServer   *playback.Server
@@ -358,6 +360,14 @@ func (p *Core) createResources(initial bool) error {
 			return err
 		}
 		p.logger = i
+	}
+
+	// selfStats has no configuration dependency (fixed interval, reads
+	// process/OS facts) - construct it once and never recreate it on
+	// reload, same as p.logger/p.authManager above.
+	if p.selfStats == nil {
+		p.selfStats = selfstats.NewReporter(p, ".", selfstats.Interval)
+		p.selfStats.Start()
 	}
 
 	if initial {
@@ -791,46 +801,58 @@ func (p *Core) createResources(initial bool) error {
 			})
 		}
 		i := &webrtc.Server{
-			Address:               p.conf.WebRTCAddress,
-			DumpPackets:           p.conf.DumpPackets,
-			Encryption:            p.conf.WebRTCEncryption,
-			ServerKey:             p.conf.WebRTCServerKey,
-			ServerCert:            p.conf.WebRTCServerCert,
-			AllowOrigins:          p.conf.WebRTCAllowOrigins,
-			TrustedProxies:        p.conf.WebRTCTrustedProxies,
-			ReadTimeout:           p.conf.ReadTimeout,
-			WriteTimeout:          p.conf.WriteTimeout,
-			UDPReadBufferSize:     p.conf.UDPReadBufferSize,
-			LocalUDPAddress:       p.conf.WebRTCLocalUDPAddress,
-			LocalTCPAddress:       p.conf.WebRTCLocalTCPAddress,
-			IPsFromInterfaces:     p.conf.WebRTCIPsFromInterfaces,
-			IPsFromInterfacesList: p.conf.WebRTCIPsFromInterfacesList,
-			AdditionalHosts:       p.conf.WebRTCAdditionalHosts,
-			ICEServers:            p.conf.WebRTCICEServers2,
-			STUNGatherTimeout:     p.conf.WebRTCSTUNGatherTimeout,
-			HandshakeTimeout:      p.conf.WebRTCHandshakeTimeout,
-			TrackGatherTimeout:    p.conf.WebRTCTrackGatherTimeout,
-			InboundRTPBufferSize:  p.conf.WebRTCInboundRTPBufferSize,
-			ExternalCmdPool:       p.externalCmdPool,
-			Metrics:               p.metrics,
-			PathManager:           p.pathManager,
-			Parent:                p,
-			ABREnable:             p.conf.WebRTCABREnable,
-			ABRWSPath:             p.conf.WebRTCABRWSPath,
-			ABRSwitchCooldown:     p.conf.WebRTCABRSwitchCooldown,
-			RecMgr:                p.recMgr,
-			SplitHandler:          p.splitHandler,
-			DegradeManager:        p.degradeManager,
-			DegradeEnable:         p.conf.WebRTCDegradeEnable,
-			DegradeWSPathSuffix:   p.conf.WebRTCDegradeWSPathSuffix,
-			DegradeInstantLossPct: p.conf.WebRTCDegradeInstantLossPct,
-			DegradeAvgLossPct:     p.conf.WebRTCDegradeAvgLossPct,
-			RecoverInstantLossPct: p.conf.WebRTCRecoverInstantLossPct,
-			RecoverAvgLossPct:     p.conf.WebRTCRecoverAvgLossPct,
-			DegradeObservationSec: p.conf.WebRTCDegradeObservationSec,
-			DegradeWSSecret:       p.conf.WebRTCDegradeWSSecret,
-			WHIPAuthKey:           p.conf.WebRTCWHIPAuthKey,
-			ForwardSecret:         p.conf.WebRTCForwardSecret,
+			Address:                  p.conf.WebRTCAddress,
+			DumpPackets:              p.conf.DumpPackets,
+			Encryption:               p.conf.WebRTCEncryption,
+			ServerKey:                p.conf.WebRTCServerKey,
+			ServerCert:               p.conf.WebRTCServerCert,
+			AllowOrigins:             p.conf.WebRTCAllowOrigins,
+			TrustedProxies:           p.conf.WebRTCTrustedProxies,
+			ReadTimeout:              p.conf.ReadTimeout,
+			WriteTimeout:             p.conf.WriteTimeout,
+			UDPReadBufferSize:        p.conf.UDPReadBufferSize,
+			LocalUDPAddress:          p.conf.WebRTCLocalUDPAddress,
+			LocalTCPAddress:          p.conf.WebRTCLocalTCPAddress,
+			IPsFromInterfaces:        p.conf.WebRTCIPsFromInterfaces,
+			IPsFromInterfacesList:    p.conf.WebRTCIPsFromInterfacesList,
+			AdditionalHosts:          p.conf.WebRTCAdditionalHosts,
+			ICEServers:               p.conf.WebRTCICEServers2,
+			STUNGatherTimeout:        p.conf.WebRTCSTUNGatherTimeout,
+			HandshakeTimeout:         p.conf.WebRTCHandshakeTimeout,
+			TrackGatherTimeout:       p.conf.WebRTCTrackGatherTimeout,
+			InboundRTPBufferSize:     p.conf.WebRTCInboundRTPBufferSize,
+			ExternalCmdPool:          p.externalCmdPool,
+			Metrics:                  p.metrics,
+			PathManager:              p.pathManager,
+			Parent:                   p,
+			ABREnable:                p.conf.WebRTCABREnable,
+			ABRWSPath:                p.conf.WebRTCABRWSPath,
+			ABRSwitchCooldown:        p.conf.WebRTCABRSwitchCooldown,
+			RecMgr:                   p.recMgr,
+			SplitHandler:             p.splitHandler,
+			DegradeManager:           p.degradeManager,
+			DegradeEnable:            p.conf.WebRTCDegradeEnable,
+			DegradeWSPathSuffix:      p.conf.WebRTCDegradeWSPathSuffix,
+			DegradeInstantLossPct:    p.conf.WebRTCDegradeInstantLossPct,
+			DegradeAvgLossPct:        p.conf.WebRTCDegradeAvgLossPct,
+			RecoverInstantLossPct:    p.conf.WebRTCRecoverInstantLossPct,
+			RecoverAvgLossPct:        p.conf.WebRTCRecoverAvgLossPct,
+			DegradeObservationSec:    p.conf.WebRTCDegradeObservationSec,
+			DegradeWSSecret:          p.conf.WebRTCDegradeWSSecret,
+			RTPLossAlarmEnable:       p.conf.RTPLossAlarmEnable,
+			RTPLossAlarmThresholdPct: p.conf.RTPLossAlarmThresholdPct,
+			WHIPAuthKey:              p.conf.WebRTCWHIPAuthKey,
+			ForwardSecret:            p.conf.WebRTCForwardSecret,
+		}
+		// Same endpoint/credential reuse as trafficUsage/srtLossAlarmReporter
+		// above: every mmxControl deployment gets alarm reporting for free
+		// once RTPLossAlarmEnable is on, no separate opt-in credential.
+		if p.conf.MMXControl && p.conf.RTPLossAlarmEnable {
+			i.RTPLossAlarmReporter = rtpLossAlarmReporterAdapter{client: mmxcontrol.NewRTPLossAlarmClient(
+				mmxcontrol.DeriveFallbackURL(p.conf.MMXControlURL),
+				p.conf.MMXNodeSecret,
+				10*time.Second,
+			)}
 		}
 		err = i.Initialize()
 		if err != nil {
@@ -1395,6 +1417,8 @@ func (p *Core) closeResources(newConf *conf.Conf, calledByAPI bool) {
 		newConf.WebRTCDegradeWSSecret != p.conf.WebRTCDegradeWSSecret ||
 		newConf.WebRTCWHIPAuthKey != p.conf.WebRTCWHIPAuthKey ||
 		newConf.WebRTCForwardSecret != p.conf.WebRTCForwardSecret ||
+		newConf.RTPLossAlarmEnable != p.conf.RTPLossAlarmEnable ||
+		newConf.RTPLossAlarmThresholdPct != p.conf.RTPLossAlarmThresholdPct ||
 		newConf.DumpPackets != p.conf.DumpPackets ||
 		closeMetrics ||
 		closeDegradeManager ||
@@ -1579,6 +1603,16 @@ func (p *Core) closeResources(newConf *conf.Conf, calledByAPI bool) {
 	if closeMetrics && p.metrics != nil {
 		p.metrics.Close()
 		p.metrics = nil
+	}
+
+	// selfStats has no configuration dependency, so unlike every other
+	// resource here it's only ever torn down on a genuine final shutdown
+	// (newConf == nil, which also covers a partial-startup failure - see
+	// New()'s createResources error path) - never recreated on a config
+	// reload.
+	if newConf == nil && p.selfStats != nil {
+		p.selfStats.Stop()
+		p.selfStats = nil
 	}
 
 	// No Close() call needed: Manager owns no OS resources, and

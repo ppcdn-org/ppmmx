@@ -429,6 +429,13 @@ type sessionParent interface {
 	recordDegradeSample(pathName string, cumLost, cumReceived uint64)
 	observeDegradeSessionLayers(pathName string, realLayers int)
 
+	// RTP loss alarm (see rtp_loss_alarm.go): reports a WHIP publish
+	// session's RTP loss rate to ppcenter as a superadmin node alarm,
+	// independent of the degrade protocol.
+	rtpLossAlarmEnabled() bool
+	rtpLossAlarmThresholdPct() float64
+	rtpLossAlarmReporterHook() rtpLossAlarmReporter
+
 	// WHIP publish reconnect tracking (see publishstats.go) - independent
 	// of the degrade protocol, gives operators plain visibility into how
 	// often a publisher has reconnected during a streaming period.
@@ -1178,6 +1185,8 @@ func (s *session) runReceiveStatsSummary(pc *webrtc.PeerConnection) {
 	var nackSampler nackDeltaSampler
 	nackSampler.seed(st)
 
+	var lossTracker recvstats.SustainedLossTracker
+
 	for {
 		select {
 		case <-ticker.C:
@@ -1185,6 +1194,27 @@ func (s *session) runReceiveStatsSummary(pc *webrtc.PeerConnection) {
 			if snap, ok := sampler.Sample(st.BytesReceived, st.RTPPacketsReceived, st.RTPPacketsLost, time.Now()); ok {
 				snap.Extra = nackSampler.extra(st, pc.InboundTrackStats())
 				s.Log(logger.Info, "%s", snap.LogLine("whip", s.pathName))
+
+				if s.parent.rtpLossAlarmEnabled() {
+					// No disconnect feature for RTP (disconnectEnable=false,
+					// disconnectAfter unused) - unlike SRT's sustained-loss
+					// tracker, this is report-only.
+					decision := lossTracker.Update(snap.LossPct, s.parent.rtpLossAlarmThresholdPct(), false, 0, time.Now())
+					if decision.ShouldReport {
+						if reporter := s.parent.rtpLossAlarmReporterHook(); reporter != nil {
+							path := s.pathName
+							lossPct, bitrateBps := snap.LossPct, snap.BitrateBps
+							sustainedSec := int(decision.Sustained.Seconds())
+							go func() {
+								ctx, cancel := context.WithTimeout(s.ctx, 10*time.Second)
+								defer cancel()
+								if err := reporter.ReportRTPLoss(ctx, path, lossPct, bitrateBps, sustainedSec); err != nil {
+									s.Log(logger.Debug, "RTP loss alarm report failed: %v", err)
+								}
+							}()
+						}
+					}
+				}
 			}
 
 		case <-s.ctx.Done():

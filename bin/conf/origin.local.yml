@@ -99,6 +99,10 @@ webrtcRecoverInstantLossPct: 2.0
 webrtcRecoverAvgLossPct: 0.5
 webrtcDegradeObservationSec: 60
 
+# RTP loss alarm (POST /internal/mmx/v1/alarms/rtp-loss)。
+rtpLossAlarmEnable: true
+rtpLossAlarmThresholdPct: 2.0
+
 # ── Forward (腾讯云 WHIP 转推) ──────────────────
 # 默认关闭。开启前必须在下面填好账号级信息，且每条要转推的 path
 # 还要单独设置 forwardTencent: true (见下方 paths 示例)。

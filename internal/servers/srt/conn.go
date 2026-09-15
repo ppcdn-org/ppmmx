@@ -331,7 +331,7 @@ func (c *conn) runReceiveStatsSummary(sconn srt.Conn, pathName string, done <-ch
 	defer ticker.Stop()
 
 	var sampler recvstats.Sampler
-	var lossTracker sustainedLossTracker
+	var lossTracker recvstats.SustainedLossTracker
 	var st srt.Statistics
 	sconn.Stats(&st)
 	sampler.Sample(st.Accumulated.ByteRecv, st.Accumulated.PktRecv, st.Accumulated.PktRecvLoss, time.Now()) // seed baseline
@@ -377,7 +377,7 @@ func (c *conn) runReceiveStatsSummary(sconn srt.Conn, pathName string, done <-ch
 				c.Log(logger.Info, "%s", snap.LogLine("srt", pathName))
 
 				if c.lossAlarmEnable || c.lossDisconnectEnable {
-					decision := lossTracker.update(snap.LossPct, c.lossAlarmThresholdPct, c.lossDisconnectEnable,
+					decision := lossTracker.Update(snap.LossPct, c.lossAlarmThresholdPct, c.lossDisconnectEnable,
 						time.Duration(c.lossDisconnectSec)*time.Second, time.Now())
 
 					if c.lossAlarmEnable && decision.ShouldReport && c.lossAlarmReporter != nil {

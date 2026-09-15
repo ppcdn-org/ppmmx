@@ -244,6 +244,16 @@ type Server struct {
 	DegradeObservationSec int
 	DegradeWSSecret       string
 
+	// RTP loss alarm (see rtp_loss_alarm.go): reports a WHIP publish
+	// session's RTP loss rate to ppcenter as a superadmin node alarm,
+	// independent of the degrade protocol above. RTPLossAlarmReporter is
+	// nil unless MMXControl and RTPLossAlarmEnable are both set (see
+	// core.go's construction gating) - session.go's hook treats a nil
+	// reporter as "nothing to send to" rather than a bug.
+	RTPLossAlarmEnable       bool
+	RTPLossAlarmThresholdPct float64
+	RTPLossAlarmReporter     rtpLossAlarmReporter
+
 	// WHIP publish auth (see docs/obs-whip-publish-auth-protocol.md): shared
 	// AES key used by checkWHIPDeviceID to decrypt the ppcenter-issued
 	// bearer token every ppobs publish request must carry. Distinct from
