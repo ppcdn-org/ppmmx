@@ -50,6 +50,7 @@ type streamFormat struct {
 	mediaLabel string
 	inboundBytes         *atomic.Uint64
 	outboundBytes        *atomic.Uint64
+	inboundRTPPackets    *atomic.Uint64
 	updateLastTime       func(time.Duration)
 	writeRTSP            func([]*rtp.Packet, time.Time)
 	updateOutDesc        func(func())

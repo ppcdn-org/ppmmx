@@ -272,6 +272,7 @@ type Stream struct {
 	offlineSubStream     *offlineSubStream
 	inboundBytes         atomic.Uint64
 	outboundBytes        atomic.Uint64
+	inboundRTPPackets    atomic.Uint64
 	medias               map[*description.Media]*streamMedia
 	rtspStream           *gortsplib.ServerStream
 	rtspsStream          *gortsplib.ServerStream
@@ -321,7 +322,13 @@ func (s *Stream) Initialize() error {
 
 	s.inboundFramesInError = &errordumper.Dumper{
 		OnReport: func(val uint64, last error) {
-			if val == 1 {
+			rtpPkts := s.inboundRTPPackets.Swap(0)
+			if rtpPkts > 0 {
+				pct := float64(val) / float64(rtpPkts) * 100
+				s.Parent.Log(logger.Warn,
+					"%d processing errors (%.2f%% of %d RTP packets), last was: %v",
+					val, pct, rtpPkts, last)
+			} else if val == 1 {
 				s.Parent.Log(logger.Warn, "processing error: %v", last)
 			} else {
 				s.Parent.Log(logger.Warn, "%d processing errors, last was: %v", val, last)
@@ -345,6 +352,7 @@ func (s *Stream) Initialize() error {
 			replaceNTP:           s.ReplaceNTP,
 			inboundBytes:         &s.inboundBytes,
 			outboundBytes:        &s.outboundBytes,
+			inboundRTPPackets:    &s.inboundRTPPackets,
 			updateLastTime:       s.updateLastTime,
 			writeRTSP:            s.writeRTSP,
 			updateOutDesc:        s.updateOutDesc,

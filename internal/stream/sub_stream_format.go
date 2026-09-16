@@ -166,6 +166,9 @@ func (ssf *subStreamFormat) writeUnitInner(u *unit.Unit) error {
 
 	size := unitSize(u)
 	ssf.streamFormat.inboundBytes.Add(size)
+	if n := len(u.RTPPackets); n > 0 {
+		ssf.streamFormat.inboundRTPPackets.Add(uint64(n))
+	}
 
 	ssf.streamFormat.writeRTSP(u.RTPPackets, u.NTP)
 
