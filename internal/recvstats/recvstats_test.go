@@ -23,6 +23,7 @@ func TestSamplerSeedThenInterval(t *testing.T) {
 	require.Equal(t, 60*time.Second, snap.Window)
 	require.Equal(t, uint64(60_000_000), snap.TotalBytes)
 	require.Equal(t, uint64(10), snap.TotalLost)
+	require.Equal(t, uint64(1010), snap.PacketsExpected)
 }
 
 func TestSamplerUsesDeltasNotCumulative(t *testing.T) {

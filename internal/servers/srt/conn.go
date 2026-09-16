@@ -322,6 +322,25 @@ func (c *conn) runPublishReader(sconn srt.Conn, streamID *streamID, pathConf *co
 	}
 }
 
+// unrecoverableLossPct computes the share of packets this interval expected
+// to receive (packetsExpected, recvstats.Snapshot's own LossPct denominator)
+// that gosrt's ARQ never recovered: NAK-detected gaps (dLost) minus the ones
+// a retransmit actually filled (dRetrans). See the call site in
+// runReceiveStatsSummary for why this - not PktRecvDrop - is the right
+// numerator: PktDrop only covers packets that DID arrive (too late, or a
+// second time); a sequence number that never arrives at all isn't added to
+// any counter except PktLoss, so subtracting what ARQ recovered from it is
+// the only way to surface real, permanent loss.
+func unrecoverableLossPct(dLost, dRetrans, packetsExpected uint64) (unrecovered uint64, pct float64) {
+	if dLost > dRetrans {
+		unrecovered = dLost - dRetrans
+	}
+	if packetsExpected > 0 {
+		pct = float64(unrecovered) / float64(packetsExpected) * 100
+	}
+	return unrecovered, pct
+}
+
 // runReceiveStatsSummary periodically logs this SRT publish connection's
 // receive bitrate and packet-loss rate, computed from the SRT socket's
 // accumulated byte/packet counters (same format as every other ingest
@@ -337,11 +356,15 @@ func (c *conn) runReceiveStatsSummary(sconn srt.Conn, pathName string, done <-ch
 	sampler.Sample(st.Accumulated.ByteRecv, st.Accumulated.PktRecv, st.Accumulated.PktRecvLoss, time.Now()) // seed baseline
 
 	// SRT's ARQ counterpart to the WHIP hops' NACK counters: retrans is
-	// loss the protocol repaired, drop is loss it gave up on. Reporting
-	// both makes the SRT ingest hop and the WHIP forward hops directly
-	// comparable, instead of only the raw loss rate they already share.
+	// packets ARQ recovered, drop is packets gosrt received but discarded
+	// (too late/duplicate/already-ACKed - not the same thing as loss that
+	// was never recovered at all; see the unrecoverableLoss comment below).
+	// Reporting all of them makes the SRT ingest hop and the WHIP forward
+	// hops directly comparable, instead of only the raw loss rate they
+	// already share.
 	lastRetrans, lastDrop := st.Accumulated.PktRecvRetrans, st.Accumulated.PktRecvDrop
 	lastBelated := st.Accumulated.PktRecvBelated
+	lastLoss := st.Accumulated.PktRecvLoss
 
 	for {
 		select {
@@ -350,12 +373,22 @@ func (c *conn) runReceiveStatsSummary(sconn srt.Conn, pathName string, done <-ch
 			if snap, ok := sampler.Sample(
 				st.Accumulated.ByteRecv, st.Accumulated.PktRecv, st.Accumulated.PktRecvLoss, time.Now(),
 			); ok {
-				if st.Accumulated.PktRecvRetrans >= lastRetrans && st.Accumulated.PktRecvDrop >= lastDrop {
-					snap.Extra = fmt.Sprintf(" retrans=%d drop=%d",
-						st.Accumulated.PktRecvRetrans-lastRetrans,
-						st.Accumulated.PktRecvDrop-lastDrop)
+				if st.Accumulated.PktRecvRetrans >= lastRetrans && st.Accumulated.PktRecvDrop >= lastDrop &&
+					st.Accumulated.PktRecvLoss >= lastLoss {
+					dRetrans := st.Accumulated.PktRecvRetrans - lastRetrans
+					dDrop := st.Accumulated.PktRecvDrop - lastDrop
+					dLost := st.Accumulated.PktRecvLoss - lastLoss
+
+					// RTT (tens of ms) is far shorter than the 60s sample
+					// window, so a retransmit for a gap detected in this
+					// window overwhelmingly lands within it too - dRetrans
+					// is not a windowed replay of NAKs from a prior interval.
+					unrecovered, unrecoveredPct := unrecoverableLossPct(dLost, dRetrans, snap.PacketsExpected)
+
+					snap.Extra = fmt.Sprintf(" retrans=%d drop=%d unrecoverableLoss=%d(%.2f%%)",
+						dRetrans, dDrop, unrecovered, unrecoveredPct)
 				}
-				lastRetrans, lastDrop = st.Accumulated.PktRecvRetrans, st.Accumulated.PktRecvDrop
+				lastRetrans, lastDrop, lastLoss = st.Accumulated.PktRecvRetrans, st.Accumulated.PktRecvDrop, st.Accumulated.PktRecvLoss
 
 				// Link diagnostics, to tell a bandwidth ceiling apart from
 				// the other things that produce the same loss figure:

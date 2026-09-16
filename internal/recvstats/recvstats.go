@@ -34,6 +34,13 @@ type Snapshot struct {
 	LossPct    float64       // 100 * lost / (received + lost) over the interval
 	Window     time.Duration // wall-clock length of the interval
 
+	// PacketsExpected is (received + lost) over the interval, i.e.
+	// LossPct's own denominator - exposed so a caller with its own
+	// finer-grained loss breakdown (e.g. SRT's retrans/drop/belated
+	// split, see conn.go) can compute a rate against the exact same
+	// basis LossPct uses, rather than recomputing or approximating it.
+	PacketsExpected uint64
+
 	TotalBytes    uint64 // cumulative received bytes
 	TotalReceived uint64 // cumulative received packets
 	TotalLost     uint64 // cumulative lost packets
@@ -67,20 +74,22 @@ func (s *Sampler) Sample(bytesRecv, pktsRecv, pktsLost uint64, now time.Time) (S
 	if window > 0 {
 		bitrate = float64(dBytes) * 8 / window.Seconds()
 	}
+	expected := dRecv + dLost
 	var loss float64
-	if denom := dRecv + dLost; denom > 0 {
-		loss = float64(dLost) / float64(denom) * 100
+	if expected > 0 {
+		loss = float64(dLost) / float64(expected) * 100
 	}
 
 	s.lastBytes, s.lastRecv, s.lastLost, s.lastAt = bytesRecv, pktsRecv, pktsLost, now
 
 	return Snapshot{
-		BitrateBps:    bitrate,
-		LossPct:       loss,
-		Window:        window,
-		TotalBytes:    bytesRecv,
-		TotalReceived: pktsRecv,
-		TotalLost:     pktsLost,
+		BitrateBps:      bitrate,
+		LossPct:         loss,
+		Window:          window,
+		PacketsExpected: expected,
+		TotalBytes:      bytesRecv,
+		TotalReceived:   pktsRecv,
+		TotalLost:       pktsLost,
 	}, true
 }
 
