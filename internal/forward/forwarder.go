@@ -7,8 +7,6 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"sort"
-	"strings"
 	"time"
 
 	"github.com/bluenviron/gortsplib/v5/pkg/description"
@@ -23,10 +21,6 @@ const (
 	whipHandshakeTimeout = 10 * time.Second
 	whipHTTPTimeout      = 10 * time.Second
 	restartPause         = 3 * time.Second
-	// sendStatsInterval matches recvstats.Interval so a forward session's
-	// "[send-stats]" line and the receiving node's "[recv-stats]" line
-	// describe comparable windows.
-	sendStatsInterval = 60 * time.Second
 )
 
 // forwardTarget is what a single forwarderInstance actually POSTs the WHIP
@@ -285,13 +279,6 @@ func (fi *forwarderInstance) runInner() error {
 	fi.stream.AddReader(reader)
 	defer fi.stream.RemoveReader(reader)
 
-	// Send-side counterpart of the receiving node's "[recv-stats]" line:
-	// lets the same hop be compared from both ends, which is what
-	// separates "origin emitted bad/missing packets" from "the link
-	// between them dropped packets" when a downstream node reports RTP
-	// reassembly errors.
-	go fi.runSendStatsSummary(pc)
-
 	select {
 	case <-pc.Failed():
 		return fmt.Errorf("peer connection closed")
@@ -302,73 +289,6 @@ func (fi *forwarderInstance) runInner() error {
 	case <-fi.ctx.Done():
 		return nil
 	}
-}
-
-// runSendStatsSummary logs, once per sendStatsInterval, what this forward
-// session put on the wire and how much of it the receiving node reported
-// lost (ReportedLost comes from that node's own RTCP receiver reports).
-//
-// Pairing this with the receiving node's "[recv-stats]" line is what makes
-// an RTP-reassembly warning there diagnosable: matching send/receive counts
-// with non-zero loss means the hop dropped packets in flight, while a clean
-// receive count alongside reassembly errors would instead point at what was
-// sent. Runs until the peer connection's context is cancelled.
-func (fi *forwarderInstance) runSendStatsSummary(pc *webrtc.PeerConnection) {
-	ticker := time.NewTicker(sendStatsInterval)
-	defer ticker.Stop()
-
-	last := map[string]sentCounters{}
-
-	for {
-		select {
-		case <-ticker.C:
-			perTrack := pc.OutboundTrackStats()
-			if len(perTrack) == 0 {
-				continue
-			}
-
-			labels := make([]string, 0, len(perTrack))
-			for label := range perTrack {
-				labels = append(labels, label)
-			}
-			sort.Strings(labels)
-
-			parts := make([]string, 0, len(labels))
-			for _, label := range labels {
-				st := perTrack[label]
-				prev, ok := last[label]
-				last[label] = sentCounters{sent: st.Sent, reportedLost: st.ReportedLost}
-
-				if !ok || st.Sent < prev.sent || st.ReportedLost < prev.reportedLost {
-					// first sighting or counter reset: no delta yet
-					continue
-				}
-
-				dSent := st.Sent - prev.sent
-				dLost := st.ReportedLost - prev.reportedLost
-				loss := float64(0)
-				if denom := dSent + dLost; denom > 0 {
-					loss = float64(dLost) / float64(denom) * 100
-				}
-
-				parts = append(parts,
-					fmt.Sprintf("%s:sent=%d reportedLost=%d (%.2f%%)", label, dSent, dLost, loss))
-			}
-
-			if len(parts) != 0 {
-				fi.Log(logger.Info, "[send-stats] target=%s %s",
-					fi.target.logLabel, strings.Join(parts, " "))
-			}
-
-		case <-fi.ctx.Done():
-			return
-		}
-	}
-}
-
-type sentCounters struct {
-	sent         uint64
-	reportedLost uint64
 }
 
 // postWebrtc POSTs a SDP offer to a WHIP endpoint and returns the SDP answer
