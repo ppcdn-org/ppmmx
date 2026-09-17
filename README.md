@@ -2,6 +2,11 @@
 
 mmx 是基于 [MediaMTX](https://github.com/bluenviron/mediamtx) v1.19.1 二次开发的直播媒体服务器,面向"OBS 同播推流 → 自适应码率播放 → 视频云备份分发"这一具体业务场景。保留了 MediaMTX 原有的多协议转发能力,在此之上新增了 WebRTC Simulcast ABR、Origin/Edge 分层组网、腾讯云转推、按需录像控制、以及一套配套的管理后台 + 播放器。
 
+## 官方链接
+
+- 官方在线 demo: <https://www.pp-cdn.org/>
+- 官方 TG 运营群: <https://t.me/+oEpcmaGXdihjMzY1>
+
 ## 这是什么
 
 - **底座**:MediaMTX v1.19.1(纯 Go、零依赖的媒体路由服务器),支持 RTSP、RTMP、HLS、SRT、WebRTC、Media-over-QUIC 之间的协议互转、录像、回放、鉴权、Hook、Prometheus 指标等全部原生能力保持不变。
