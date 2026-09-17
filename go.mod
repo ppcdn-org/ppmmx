@@ -188,3 +188,8 @@ require (
 )
 
 replace github.com/quic-go/webtransport-go => github.com/aler9/webtransport-go v0.0.0-20260604211153-27af9c338497
+
+// Adds ConnRequest.SetLatency so a per-path receive latency can be applied
+// before Accept() without touching the listener's shared config - see
+// third_party/gosrt/FORK.md and docs/srt-adaptive-latency-design.md.
+replace github.com/datarhei/gosrt => ./third_party/gosrt
