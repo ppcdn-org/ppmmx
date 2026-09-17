@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"reflect"
 	"sort"
 	"sync"
@@ -13,6 +14,7 @@ import (
 	srt "github.com/datarhei/gosrt"
 	"github.com/google/uuid"
 
+	"code.cloudfoundry.org/bytefmt"
 	"github.com/bluenviron/mediamtx/internal/conf"
 	"github.com/bluenviron/mediamtx/internal/defs"
 	"github.com/bluenviron/mediamtx/internal/degrade"
@@ -23,12 +25,50 @@ import (
 // ErrConnNotFound is returned when a connection is not found.
 var ErrConnNotFound = errors.New("connection not found")
 
+// srtLatencyAssumedBitrateBps and srtLatencyBufferSafetyFactor size the
+// receive buffer/FC for the worst case a path can ever be tuned to
+// (SRTLatencyMax), rather than per-connection for the currently tuned
+// value - see docs/srt-adaptive-latency-design.md's "Buffer sizing"
+// section for why: a later raise could otherwise outgrow a buffer already
+// allocated for a lower value, which is exactly the problem this whole
+// mechanism exists to avoid for latency itself. The bitrate is a
+// conservative estimate for a 3-layer simulcast ingest, doubled for
+// headroom.
+const (
+	srtLatencyAssumedBitrateBps  = 12e6
+	srtLatencyBufferSafetyFactor = 2
+
+	// srtWorstCasePayloadSize mirrors conf.srtMinPayloadSize (7 MPEG-TS
+	// packets of 188 bytes, the smallest payload a sender is likely to
+	// use) - duplicated here rather than imported since that constant is
+	// unexported and this package must stay decoupled from conf's
+	// internals for the same worst-case-packet-count reasoning.
+	srtWorstCasePayloadSize = 7 * 188
+)
+
 func interfaceIsEmpty(i any) bool {
 	return reflect.ValueOf(i).Kind() != reflect.Pointer || reflect.ValueOf(i).IsNil()
 }
 
 func srtMaxPayloadSize(u int) int {
 	return ((u - 16) / 188) * 188 // 16 = SRT header, 188 = MPEG-TS packet
+}
+
+// srtWorstCaseBuffer returns the receive buffer size (bytes) and flow
+// control window (packets) needed to hold latencyMax worth of stream at
+// srtLatencyAssumedBitrateBps, never going below the configured minimums.
+func srtWorstCaseBuffer(latencyMax time.Duration, minBufBytes uint64, minFC int) (uint64, int) {
+	bufBytes := uint64(latencyMax.Seconds() * srtLatencyAssumedBitrateBps / 8 * srtLatencyBufferSafetyFactor)
+	if bufBytes < minBufBytes {
+		bufBytes = minBufBytes
+	}
+
+	fc := int(math.Ceil(float64(bufBytes) / srtWorstCasePayloadSize))
+	if fc < minFC {
+		fc = minFC
+	}
+
+	return bufBytes, fc
 }
 
 type serverAPIConnsListRes struct {
@@ -80,14 +120,33 @@ type Server struct {
 	ReadTimeout         conf.Duration
 	WriteTimeout        conf.Duration
 	UDPMaxPayloadSize   int
-	Latency             conf.Duration
-	FC                  uint
 	RunOnConnect        string
 	RunOnConnectRestart bool
 	RunOnDisconnect     string
 	ExternalCmdPool     *externalcmd.Pool
 	Metrics             serverMetrics
 	PathManager         serverPathManager
+
+	// SRT transport tuning, applied to every accepted connection (see
+	// conf.SRTLatency's doc comment for why gosrt's own 120ms/unset
+	// defaults are unusable for a WAN ingest). Latency is applied to
+	// both the receiver and peer latency socket options.
+	Latency            conf.Duration
+	ReceiverBufferSize conf.StringSize
+	FlowControlWindow  int
+
+	// SRT adaptive receive latency (see conf.SRTLatencyAutoTune's doc
+	// comment and docs/srt-adaptive-latency-design.md). When disabled,
+	// every connection uses Latency/ReceiverBufferSize/FlowControlWindow
+	// above unchanged - byte for byte the pre-existing behavior.
+	LatencyAutoTune     bool
+	LatencyMin          conf.Duration
+	LatencyMax          conf.Duration
+	LatencyEvalInterval conf.Duration
+	LatencyStep         conf.Duration
+	LatencyRaisePct     float64
+	LatencyLowerPct     float64
+	LatencyMinSamples   int
 	// PublishAuthKey is the shared secret ppcenter seals publish tokens
 	// with - the same key the WHIP server uses (see the HEVC/H264
 	// multitrack design §3.2: both ingest protocols share one token
@@ -131,12 +190,13 @@ type Server struct {
 	DegradeObservationSec int
 	Parent                serverParent
 
-	ctx       context.Context
-	ctxCancel func()
-	wg        sync.WaitGroup
-	ln        srt.Listener
-	conns     map[*conn]struct{}
-	srtLogger srt.Logger
+	ctx            context.Context
+	ctxCancel      func()
+	wg             sync.WaitGroup
+	ln             srt.Listener
+	conns          map[*conn]struct{}
+	srtLogger      srt.Logger
+	latencyManager *latencyManager
 
 	// in
 	chNewConnRequest chan srt.ConnRequest
@@ -149,15 +209,22 @@ type Server struct {
 
 // Initialize initializes the server.
 func (s *Server) Initialize() error {
+	bufSize := uint64(s.ReceiverBufferSize)
+	fc := s.FlowControlWindow
+	if s.LatencyAutoTune {
+		// Sized for LatencyMax (the worst case any path can ever be tuned
+		// to), not for Latency - see srtWorstCaseBuffer's doc comment.
+		bufSize, fc = srtWorstCaseBuffer(time.Duration(s.LatencyMax), bufSize, fc)
+	}
+
 	conf := srt.DefaultConfig()
 	conf.ConnectionTimeout = time.Duration(s.ReadTimeout)
 	conf.PeerIdleTimeout = time.Duration(s.ReadTimeout)
 	conf.PayloadSize = uint32(srtMaxPayloadSize(s.UDPMaxPayloadSize))
 
-	// Latency sets gosrt's Config.Latency, which in turn drives both
-	// PeerLatency and ReceiverLatency (see gosrt's Config.Validate()) -
-	// the TSBPD delivery delay that gives a NAK-triggered retransmit time
-	// to arrive before its packet is considered lost.
+	// Latency sets both PeerLatency and ReceiverLatency - the TSBPD
+	// delivery delay that gives a NAK-triggered retransmit time to arrive
+	// before its packet is considered lost.
 	//
 	// This is the single most important setting for SRT ingest loss.
 	// gosrt defaults it to 120ms, which on a typical ~32ms-RTT publish
@@ -165,18 +232,16 @@ func (s *Server) Initialize() error {
 	// trip, with no margin for jitter. When RTT briefly rises, retransmits
 	// miss the TSBPD deadline and get counted as loss despite having
 	// arrived, which shows up as a loss-rate spike with a flat RTT graph.
-	// conf.SRTLatency defaults to 2000ms for that reason; see its field
-	// doc in internal/conf for the sizing rule.
+	// This is the listener-wide starting point; if LatencyAutoTune is on,
+	// newConnRequest overrides it per path per connection - see
+	// docs/srt-adaptive-latency-design.md.
 	if s.Latency > 0 {
-		conf.Latency = time.Duration(s.Latency)
+		conf.ReceiverLatency = time.Duration(s.Latency)
+		conf.PeerLatency = time.Duration(s.Latency)
 	}
-	// FC must scale with Latency: it bounds how many packets may be in
-	// flight unacknowledged, so a large latency window is unusable if
-	// flow control won't permit that many outstanding packets. gosrt also
-	// advertises it to the peer as MaxFlowWindowSize and reports it as
-	// AvailableBufferSize.
-	if s.FC > 0 {
-		conf.FC = uint32(s.FC)
+	conf.ReceiverBufferSize = uint32(bufSize)
+	if fc > 0 {
+		conf.FC = uint32(fc)
 	}
 
 	// Debug-only visibility into gosrt's own NAK control-packet trace, for
@@ -191,22 +256,6 @@ func (s *Server) Initialize() error {
 	// this package - see internal/logger.Logger.Log's level filter.
 	conf.Logger = srt.NewLogger([]string{"control:send:NAK", "control:recv:NAK"})
 	s.srtLogger = conf.Logger
-
-	// Deliberately not set here: gosrt v0.11.0's Config.ReceiverBufferSize
-	// (SRTO_RCVBUF) is a dead field - it appears only in the struct, its
-	// zero default, and srt:// query-string parse/marshal. Nothing in the
-	// library ever applies it to the socket or to any internal buffer
-	// (ListenControl() in net.go only sets SO_REUSEADDR/IP_TOS/IP_TTL,
-	// and no code path calls setsockopt(SO_RCVBUF)). Setting it would be
-	// a silent no-op, so FC above carries the receive-window sizing
-	// instead. Likewise there is no OS-level UDP read buffer tuning for
-	// SRT the way there is for WebRTC/RTSP-UDP/MoQ
-	// (internal/protocols/udpreadbuffer), short of forking gosrt.
-	//
-	// The OS-side counterpart to these settings is
-	// net.core.netdev_max_backlog, which defaults to 1000 and should be
-	// >= 5000 for multi-layer simulcast ingest - see
-	// scripts/tune-udp-buffers.sh.
 
 	var err error
 	s.ln, err = srt.Listen("srt", s.Address, conf)
@@ -225,6 +274,29 @@ func (s *Server) Initialize() error {
 	s.chAPIConnsKick = make(chan serverAPIConnsKickReq)
 
 	s.Log(logger.Info, "started with listener on "+s.Address+" (UDP/SRT)")
+	s.Log(logger.Info, "SRT receive window: latency %v, buffer %s, flow control window %d packets",
+		time.Duration(s.Latency), bytefmt.ByteSize(bufSize), fc)
+
+	if s.LatencyAutoTune {
+		s.latencyManager = newLatencyManager(srtLatencyConfig{
+			Initial:      time.Duration(s.Latency),
+			Min:          time.Duration(s.LatencyMin),
+			Max:          time.Duration(s.LatencyMax),
+			Step:         time.Duration(s.LatencyStep),
+			EvalInterval: time.Duration(s.LatencyEvalInterval),
+			RaisePct:     s.LatencyRaisePct,
+			LowerPct:     s.LatencyLowerPct,
+			MinSamples:   s.LatencyMinSamples,
+		}, s.Log)
+
+		s.Log(logger.Info, "SRT adaptive latency: enabled, range [%v, %v], step %v, "+
+			"eval interval %v, raise/lower thresholds %.2f%%/%.2f%%",
+			time.Duration(s.LatencyMin), time.Duration(s.LatencyMax), time.Duration(s.LatencyStep),
+			time.Duration(s.LatencyEvalInterval), s.LatencyRaisePct, s.LatencyLowerPct)
+
+		s.wg.Add(1)
+		go s.latencyManager.Run(s.ctx, &s.wg)
+	}
 
 	// Forwards gosrt's NAK trace into our own logger. Exits via s.ctx rather
 	// than draining s.srtLogger.Listen() to closure - closing a gosrt
@@ -294,6 +366,20 @@ outer:
 			break outer
 
 		case req := <-s.chNewConnRequest:
+			if s.latencyManager != nil {
+				// StreamId is available before Accept, so the path can be
+				// resolved and this connection's latency overridden ahead
+				// of the handshake completing - see streamID.unmarshal
+				// (conn.go) for the format and docs/srt-adaptive-latency-
+				// design.md for why this must be per-request, not
+				// per-listener.
+				var sid streamID
+				if err := sid.unmarshal(req.StreamId()); err == nil {
+					latency := s.latencyManager.LatencyFor(sid.path)
+					req.SetLatency(latency, latency)
+				}
+			}
+
 			c := &conn{
 				parentCtx:           s.ctx,
 				rtspAddress:         s.RTSPAddress,
@@ -310,6 +396,7 @@ outer:
 				publishAuthKey:      s.PublishAuthKey,
 				publishTokenReq:     s.PublishTokenRequired,
 				parent:              s,
+				latencyManager:      s.latencyManager,
 
 				lossAlarmReporter:     s.LossAlarmReporter,
 				lossAlarmEnable:       s.LossAlarmEnable,

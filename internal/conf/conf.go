@@ -35,6 +35,13 @@ var ErrPathNotFound = errors.New("path not found")
 // executor is configured with.
 const DefaultWHIPWSSecret = "test-only-placeholder-not-a-real-secret"
 
+// srtMinPayloadSize is the smallest SRT payload a sender is likely to use
+// (7 MPEG-TS packets of 188 bytes). Only used to convert a receive buffer
+// size in bytes into a worst-case packet count when validating
+// SRTFlowControlWindow - the smallest payload gives the largest, i.e.
+// safest, packet count.
+const srtMinPayloadSize = 7 * 188
+
 func sortedKeys(paths map[string]*OptionalPath) []string {
 	ret := make([]string, len(paths))
 	i := 0
@@ -561,40 +568,71 @@ type Conf struct {
 	// controls whether omitting it is allowed, so existing publishers and
 	// third-party SRT tools keep working until it's turned on.
 	SRTPublishTokenRequired bool `json:"srtPublishTokenRequired"`
-	// SRTLatency is the SRT protocol's own retransmission buffer, i.e. how
-	// long a packet is held before TSBPD delivers it, giving NAK-triggered
-	// retransmits time to arrive over a lossy/jittery public-internet link
-	// (e.g. OBS -> origin). See internal/servers/srt/server.go's
-	// Initialize() doc comment for why UDPReadBufferSize/SRTO_RCVBUF do
-	// NOT help here (gosrt v0.11.0 parses but never applies that one).
+	// SRT transport tuning. These map to the corresponding SRT socket
+	// options (SRTO_RCVLATENCY / SRTO_PEERLATENCY / SRTO_RCVBUF /
+	// SRTO_FC) and exist because gosrt's own defaults are far too tight
+	// for a WAN ingest: 120ms of latency at a real-world ~30ms RTT is
+	// only ~4x RTT, barely one retransmission round-trip. Any jitter
+	// that pushes a retransmitted packet past that window makes SRT
+	// declare it lost even though it did arrive - which shows up as a
+	// sudden packet-loss spike while RTT itself stays flat (the
+	// signature of a too-small receive window, not of real congestion).
 	//
-	// Sizing rule: SRT needs latency >= ~2.5-4x RTT to fit a full
-	// retransmit round trip. gosrt's 120ms default is tuned for
-	// low-latency conferencing and, on a ~32ms-RTT ingest link, lands at
-	// only ~3.75x - right at the theoretical floor. Any jitter that
-	// briefly pushes RTT to 40-50ms then puts the retransmit past the
-	// TSBPD deadline and the packet is *counted as lost even though it
-	// arrived*. That failure mode is diagnostic: loss rate spikes while
-	// RTT stays flat. Configurable per-node via the srtLatency YAML key;
-	// the default of 300ms gives ~9x RTT margin on a typical link.
-	SRTLatency Duration `json:"srtLatency"`
-	// SRTFC is the flow control window in packets (SRTO_FC): the maximum
-	// number of packets that can be in flight unacknowledged. Too small a
-	// window silently caps effective throughput on a high-bitrate/high-RTT
-	// link before loss is even the limiting factor, and it has to scale
-	// *with* SRTLatency - a large latency window is useless if flow
-	// control won't let that many packets be outstanding in the first
-	// place. gosrt advertises this to the peer as MaxFlowWindowSize and
-	// uses it for AvailableBufferSize, which is the closest thing the
-	// library offers to a receive-buffer size knob (Config's own
-	// ReceiverBufferSize/SRTO_RCVBUF is parsed but never applied - see
-	// server.go).
+	// SRTLatency is the receiver-side buffering window; it is applied to
+	// both RCVLATENCY and PEERLATENCY (the negotiated latency is the max
+	// of the two ends' requests anyway). Rule of thumb: at least 3-4x
+	// the worst-case RTT. It is also the price paid in end-to-end
+	// glass-to-glass delay, since TSBPD holds every packet for the full
+	// window before delivering it upstream - so it should be the
+	// smallest value that still leaves room for a retransmission round
+	// (which costs ~1 RTT), not the largest value that fits.
+	// SRTReceiverBufferSize must be large enough to hold SRTLatency
+	// worth of stream at the expected bitrate, otherwise the buffer,
+	// not the latency, becomes the limit.
+	SRTLatency            Duration   `json:"srtLatency"`
+	SRTReceiverBufferSize StringSize `json:"srtReceiverBufferSize"`
+	// SRTFlowControlWindow is SRTO_FC in packets. It must be able to
+	// cover SRTLatency worth of in-flight packets; SRT itself requires
+	// FC >= the receive buffer expressed in packets, and silently
+	// clamps the usable buffer to FC otherwise.
+	SRTFlowControlWindow int `json:"srtFlowControlWindow"`
+
+	// SRT adaptive receive latency (see docs/srt-adaptive-latency-design.md):
+	// per publish path, every SRTLatencyEvalInterval mmx looks at the p95
+	// unrecovered drop rate observed on that path over the preceding
+	// interval and adjusts that path's own tuned latency up or down by
+	// SRTLatencyStep, clamped to [SRTLatencyMin, SRTLatencyMax]. A path
+	// seeds its tuned value from SRTLatency the first time it is seen.
 	//
-	// uint (not gosrt's own uint32) because internal/conf/env's
-	// reflection-based loader only knows the fixed set of scalar types it
-	// special-cases (string/int/uint/float64/bool) - see env.go's
-	// loadEnvInternal default case.
-	SRTFC uint `json:"srtFC"`
+	// The new value is not applied to the connection that is currently
+	// publishing - SRT negotiates TSBPD delay once at handshake time and
+	// it cannot be changed for the life of a connection - it only takes
+	// effect the next time that path's publisher reconnects. This is
+	// deliberate: forcing a reconnect to apply a tuned value costs far
+	// more (measured ~27-28s of dead air, see the design doc) than the
+	// benefit of a few hundred ms of latency adjustment.
+	//
+	// SRTLatencyRaisePct/SRTLatencyLowerPct form a hysteresis band
+	// (SRTLatencyLowerPct < SRTLatencyRaisePct, enforced by Validate) so a
+	// path hovering near one threshold doesn't oscillate every interval.
+	// SRTLatencyMinSamples guards against tuning off a path that has only
+	// been up for a few minutes in the interval.
+	//
+	// SRTReceiverBufferSize/SRTFlowControlWindow are not tuned per path:
+	// they are sized once at startup for SRTLatencyMax (the worst case a
+	// path can ever be tuned to), since sizing them for a path's current
+	// (possibly lower) tuned value would mean a later raise could outgrow
+	// a buffer already allocated - the same problem this whole mechanism
+	// exists to avoid for latency itself.
+	SRTLatencyAutoTune     bool     `json:"srtLatencyAutoTune"`
+	SRTLatencyMin          Duration `json:"srtLatencyMin"`
+	SRTLatencyMax          Duration `json:"srtLatencyMax"`
+	SRTLatencyEvalInterval Duration `json:"srtLatencyEvalInterval"`
+	SRTLatencyStep         Duration `json:"srtLatencyStep"`
+	SRTLatencyRaisePct     float64  `json:"srtLatencyRaisePct"`
+	SRTLatencyLowerPct     float64  `json:"srtLatencyLowerPct"`
+	SRTLatencyMinSamples   int      `json:"srtLatencyMinSamples"`
+
 	// SRTLossAlarmEnable reports a publish connection's SRT loss rate to
 	// ppcenter (POST /internal/mmx/v1/alarms/srt-loss) whenever it crosses
 	// SRTLossAlarmThresholdPct, and once more when it drops back under -
@@ -817,13 +855,28 @@ func (conf *Conf) setDefaults() {
 	// pushed end-to-end P2P delay past 2 seconds for HEVC viewers; 300ms
 	// still leaves enough margin for NAK-triggered retransmits on a
 	// clean public-internet link while keeping ingest latency reasonable.
+	// Only the seed value for a path not yet tuned by SRTLatencyAutoTune
+	// below - it is never rewritten.
 	conf.SRTLatency = 300 * Duration(time.Millisecond)
+	conf.SRTReceiverBufferSize = 2 * 1024 * 1024
 	// 65536 packets (vs. gosrt's 25600 default): the flow-control window
 	// has to scale with SRTLatency above, otherwise the sender is capped
 	// on in-flight packets long before the bigger latency window can
 	// actually be used. At 5Mbps x 3 simulcast layers with a 2s window,
-	// 25600 packets is not enough headroom.
-	conf.SRTFC = 65536
+	// 25600 packets is not enough headroom. Also the floor srtWorstCaseBuffer
+	// sizes up from for SRTLatencyMax below.
+	conf.SRTFlowControlWindow = 65536
+	// SRT adaptive receive latency (see docs/srt-adaptive-latency-design.md).
+	// SRTLatencyMin matches SRTLatency above so the seed value starts
+	// inside its own tunable range (enforced by Validate).
+	conf.SRTLatencyAutoTune = true
+	conf.SRTLatencyMin = 300 * Duration(time.Millisecond)
+	conf.SRTLatencyMax = 3000 * Duration(time.Millisecond)
+	conf.SRTLatencyEvalInterval = 8 * Duration(time.Hour)
+	conf.SRTLatencyStep = 200 * Duration(time.Millisecond)
+	conf.SRTLatencyRaisePct = 0.8
+	conf.SRTLatencyLowerPct = 0.4
+	conf.SRTLatencyMinSamples = 60
 	// Both alarm/disconnect flags default off (opt-in, matching
 	// WebRTCDegradeEnable) so turning either on "just works" with these
 	// numbers without also having to set the threshold/duration.
@@ -1413,6 +1466,53 @@ func (conf *Conf) Validate(l logger.Writer) error {
 	}
 	if conf.WebRTCDegradeEnable && conf.WebRTCRecoverAvgLossPct > conf.WebRTCDegradeAvgLossPct {
 		return fmt.Errorf("'webrtcRecoverAvgLossPct' must be <= 'webrtcDegradeAvgLossPct'")
+	}
+
+	// SRT transport tuning (see the field doc comments). The FC-vs-buffer
+	// check mirrors SRT's own requirement: a receive buffer bigger than
+	// the flow-control window is silently clamped to it, so a config
+	// where they disagree would not actually buffer what it claims to.
+	// srtReceiverBufferSize needs no >0 check: StringSize's own parser
+	// already rejects zero/negative values with a clearer message.
+	if conf.SRTLatency <= 0 {
+		return fmt.Errorf("'srtLatency' must be greater than zero")
+	}
+	if conf.SRTFlowControlWindow <= 0 {
+		return fmt.Errorf("'srtFlowControlWindow' must be greater than zero")
+	}
+	if bufPackets := int(conf.SRTReceiverBufferSize) / srtMinPayloadSize; conf.SRTFlowControlWindow < bufPackets {
+		return fmt.Errorf("'srtFlowControlWindow' (%d) is too small for 'srtReceiverBufferSize' (%d): "+
+			"it must be at least %d packets, otherwise SRT clamps the usable receive buffer to the window",
+			conf.SRTFlowControlWindow, int(conf.SRTReceiverBufferSize), bufPackets)
+	}
+
+	// SRT adaptive receive latency (see the field doc comments and
+	// docs/srt-adaptive-latency-design.md). Only validated when enabled -
+	// an auto-tune-disabled deployment never reads these.
+	if conf.SRTLatencyAutoTune {
+		if conf.SRTLatencyMin <= 0 {
+			return fmt.Errorf("'srtLatencyMin' must be greater than zero")
+		}
+		if conf.SRTLatencyMax < conf.SRTLatencyMin {
+			return fmt.Errorf("'srtLatencyMax' must be >= 'srtLatencyMin'")
+		}
+		if conf.SRTLatency < conf.SRTLatencyMin {
+			return fmt.Errorf("'srtLatency' must be >= 'srtLatencyMin', otherwise a newly seen " +
+				"path's initial value is immediately out of its own tunable range")
+		}
+		if conf.SRTLatencyEvalInterval <= 0 {
+			return fmt.Errorf("'srtLatencyEvalInterval' must be greater than zero")
+		}
+		if conf.SRTLatencyStep <= 0 {
+			return fmt.Errorf("'srtLatencyStep' must be greater than zero")
+		}
+		if conf.SRTLatencyMinSamples <= 0 {
+			return fmt.Errorf("'srtLatencyMinSamples' must be greater than zero")
+		}
+		if conf.SRTLatencyLowerPct >= conf.SRTLatencyRaisePct {
+			return fmt.Errorf("'srtLatencyLowerPct' must be < 'srtLatencyRaisePct', " +
+				"otherwise there is no hysteresis band and the tuned value oscillates")
+		}
 	}
 
 	if conf.SRTDegradeEnable && conf.WebRTCDegradeWSSecret == "" {
