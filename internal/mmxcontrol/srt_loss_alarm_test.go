@@ -30,18 +30,18 @@ func TestSRTLossAlarmClientReport(t *testing.T) {
 
 	client := NewSRTLossAlarmClient(server.URL, "secret", time.Second)
 	err := client.Report(context.Background(), SRTLossAlarmReport{
-		PathName: "app1/table-view", LossPct: 14.2, BitrateBps: 5_300_000, SustainedSec: 120,
+		PathName: "app1/table-view", UnrecoveredPct: 14.2, BitrateBps: 5_300_000, SustainedSec: 120,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if received.PathName != "app1/table-view" || received.LossPct != 14.2 || received.SustainedSec != 120 {
+	if received.PathName != "app1/table-view" || received.UnrecoveredPct != 14.2 || received.SustainedSec != 120 {
 		t.Fatalf("unexpected server-received report: %+v", received)
 	}
 }
 
-// A zero LossPct is the legitimate "resolved" report and must still reach
-// the server, unlike TrafficUsageClient's zero-delta skip.
+// A zero UnrecoveredPct is the legitimate "resolved" report and must still
+// reach the server, unlike TrafficUsageClient's zero-delta skip.
 func TestSRTLossAlarmClientSendsZeroLossResolve(t *testing.T) {
 	called := false
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -51,7 +51,7 @@ func TestSRTLossAlarmClientSendsZeroLossResolve(t *testing.T) {
 	defer server.Close()
 
 	client := NewSRTLossAlarmClient(server.URL, "secret", time.Second)
-	if err := client.Report(context.Background(), SRTLossAlarmReport{PathName: "app1/table-view", LossPct: 0}); err != nil {
+	if err := client.Report(context.Background(), SRTLossAlarmReport{PathName: "app1/table-view", UnrecoveredPct: 0}); err != nil {
 		t.Fatal(err)
 	}
 	if !called {
@@ -63,8 +63,8 @@ func TestSRTLossAlarmClientRejectsInvalidReport(t *testing.T) {
 	client := NewSRTLossAlarmClient("http://example.invalid", "secret", time.Second)
 
 	cases := []SRTLossAlarmReport{
-		{PathName: "", LossPct: 10},
-		{PathName: "app1/table-view", LossPct: -1},
+		{PathName: "", UnrecoveredPct: 10},
+		{PathName: "app1/table-view", UnrecoveredPct: -1},
 	}
 	for _, tc := range cases {
 		if err := client.Report(context.Background(), tc); err == nil {
@@ -80,7 +80,7 @@ func TestSRTLossAlarmClientPropagatesServerError(t *testing.T) {
 	defer server.Close()
 
 	client := NewSRTLossAlarmClient(server.URL, "secret", time.Second)
-	err := client.Report(context.Background(), SRTLossAlarmReport{PathName: "app1/table-view", LossPct: 15})
+	err := client.Report(context.Background(), SRTLossAlarmReport{PathName: "app1/table-view", UnrecoveredPct: 15})
 	if err == nil {
 		t.Fatal("expected error on non-200 response")
 	}

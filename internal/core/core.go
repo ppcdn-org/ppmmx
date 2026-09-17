@@ -1059,6 +1059,17 @@ func (p *Core) createResources(initial bool) error {
 				10*time.Second,
 			)}
 		}
+		// Per-minute loss breakdown persistence (see srt's loss_sample.go).
+		// Gated on MMXControl alone, unlike the alarm above: there is no
+		// separate enable flag because this is the trend record, not an
+		// alert - a deployment that talks to ppcenter at all wants it.
+		if p.conf.MMXControl {
+			i.LossSampleReporter = srtLossSampleReporterAdapter{client: mmxcontrol.NewSRTLossSampleClient(
+				mmxcontrol.DeriveFallbackURL(p.conf.MMXControlURL),
+				p.conf.MMXNodeSecret,
+				10*time.Second,
+			)}
+		}
 		err = i.Initialize()
 		if err != nil {
 			return err

@@ -633,21 +633,29 @@ type Conf struct {
 	SRTLatencyLowerPct     float64  `json:"srtLatencyLowerPct"`
 	SRTLatencyMinSamples   int      `json:"srtLatencyMinSamples"`
 
-	// SRTLossAlarmEnable reports a publish connection's SRT loss rate to
-	// ppcenter (POST /internal/mmx/v1/alarms/srt-loss) whenever it crosses
-	// SRTLossAlarmThresholdPct, and once more when it drops back under -
-	// ppcenter raises/auto-resolves a superadmin node alarm from that (see
-	// AlarmManager.CheckSRTLoss). Requires MMXControl for the endpoint/
-	// credential, same reuse as trafficUsage/splitRecFileReporter.
+	// SRTLossAlarmEnable reports a publish connection's SRT UNRECOVERABLE
+	// loss rate to ppcenter (POST /internal/mmx/v1/alarms/srt-loss) whenever
+	// it crosses SRTLossAlarmThresholdPct, and once more when it drops back
+	// under - ppcenter raises/auto-resolves a superadmin node alarm from
+	// that (see AlarmManager.CheckSRTLoss). Requires MMXControl for the
+	// endpoint/credential, same reuse as trafficUsage/splitRecFileReporter.
+	//
+	// Unrecoverable, not raw SRT loss: raw loss counts packets ARQ
+	// retransmits away, so alarming on it pages operators for conditions
+	// SRT is designed to absorb. Only packets lost and never retransmitted
+	// are counted (see conn.go's runReceiveStatsSummary).
 	SRTLossAlarmEnable bool `json:"srtLossAlarmEnable"`
-	// SRTLossAlarmThresholdPct is a 0-100 percentage, not a 0-1 ratio.
+	// SRTLossAlarmThresholdPct is a 0-100 percentage, not a 0-1 ratio. It
+	// applies to the UNRECOVERABLE loss rate (see SRTLossAlarmEnable), so a
+	// much lower number is appropriate than for raw loss.
 	SRTLossAlarmThresholdPct float64 `json:"srtLossAlarmThresholdPct"`
 	// SRTLossDisconnectEnable forces a publish connection closed once its
-	// loss rate has stayed above SRTLossAlarmThresholdPct continuously for
-	// SRTLossDisconnectSec, so a wedged OBS publisher is made to reconnect
-	// (typically renegotiating a bitrate the link can carry) instead of
-	// degrading indefinitely. Independent of SRTLossAlarmEnable and does not
-	// require MMXControl - a node can self-heal with ppcenter unreachable.
+	// unrecoverable loss rate has stayed above SRTLossAlarmThresholdPct
+	// continuously for SRTLossDisconnectSec, so a wedged OBS publisher is
+	// made to reconnect (typically renegotiating a bitrate the link can
+	// carry) instead of degrading indefinitely. Independent of
+	// SRTLossAlarmEnable and does not require MMXControl - a node can
+	// self-heal with ppcenter unreachable.
 	SRTLossDisconnectEnable bool `json:"srtLossDisconnectEnable"`
 	SRTLossDisconnectSec    int  `json:"srtLossDisconnectSec"`
 
@@ -881,7 +889,10 @@ func (conf *Conf) setDefaults() {
 	// WebRTCDegradeEnable) so turning either on "just works" with these
 	// numbers without also having to set the threshold/duration.
 	conf.SRTLossAlarmEnable = false
-	conf.SRTLossAlarmThresholdPct = 10.0
+	// 1% unrecoverable loss: raw-loss defaults (10%) do not carry over, since
+	// ARQ hides most raw loss. Measured healthy baseline on the SGP ingest
+	// path is ~0.13% unrecovered against ~5-10% raw loss.
+	conf.SRTLossAlarmThresholdPct = 1.0
 	conf.SRTLossDisconnectEnable = false
 	conf.SRTLossDisconnectSec = 120
 	// Same starting numbers as WebRTCDegrade*'s own defaults below, absent

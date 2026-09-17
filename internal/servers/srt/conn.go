@@ -63,6 +63,7 @@ type conn struct {
 	lossAlarmReporter     srtLossAlarmReporter
 	lossAlarmEnable       bool
 	lossAlarmThresholdPct float64
+	lossSampleReporter    srtLossSampleReporter
 	lossDisconnectEnable  bool
 	lossDisconnectSec     int
 
@@ -379,6 +380,21 @@ func (c *conn) runReceiveStatsSummary(sconn srt.Conn, pathName string, done <-ch
 			if snap, ok := sampler.Sample(
 				st.Accumulated.ByteRecv, st.Accumulated.PktRecv, st.Accumulated.PktRecvLoss, time.Now(),
 			); ok {
+				// unrecoveredPct is the loss figure the alarm and the
+				// disconnect guard act on, NOT snap.LossPct. snap.LossPct is
+				// raw SRT loss, most of which ARQ retransmits away - alarming
+				// on it pages operators for conditions SRT is designed to
+				// absorb (measured here: ~5-10% raw loss against ~0.13%
+				// actually unrecovered). Only packets lost and never
+				// retransmitted affect a viewer, so that is what is reported.
+				//
+				// haveUnrecovered stays false on the rare tick where the
+				// cumulative counters went backwards (socket recreated): the
+				// deltas would be meaningless, so the tracker is simply not
+				// fed rather than fed a fabricated zero that would resolve an
+				// active alarm.
+				var unrecoveredPct, recoverablePct float64
+				haveUnrecovered := false
 				if st.Accumulated.PktRecvRetrans >= lastRetrans && st.Accumulated.PktRecvDrop >= lastDrop &&
 					st.Accumulated.PktRecvLoss >= lastLoss {
 					dRetrans := st.Accumulated.PktRecvRetrans - lastRetrans
@@ -389,7 +405,18 @@ func (c *conn) runReceiveStatsSummary(sconn srt.Conn, pathName string, done <-ch
 					// window, so a retransmit for a gap detected in this
 					// window overwhelmingly lands within it too - dRetrans
 					// is not a windowed replay of NAKs from a prior interval.
-					unrecovered, unrecoveredPct := unrecoverableLossPct(dLost, dRetrans, snap.PacketsExpected)
+					unrecovered, pct := unrecoverableLossPct(dLost, dRetrans, snap.PacketsExpected)
+					unrecoveredPct = pct
+					// Recoverable is simply what is left of the raw rate once
+					// the never-recovered part is subtracted - i.e. the share
+					// ARQ did retransmit in time. Clamped at zero only to
+					// absorb float noise; by construction it cannot exceed
+					// the raw rate, so recoverable + unrecoverable == raw.
+					recoverablePct = snap.LossPct - unrecoveredPct
+					if recoverablePct < 0 {
+						recoverablePct = 0
+					}
+					haveUnrecovered = true
 
 					snap.Extra = fmt.Sprintf(" retrans=%d drop=%d unrecoverableLoss=%d(%.2f%%)",
 						dRetrans, dDrop, unrecovered, unrecoveredPct)
@@ -424,28 +451,45 @@ func (c *conn) runReceiveStatsSummary(sconn srt.Conn, pathName string, done <-ch
 
 				c.Log(logger.Info, "%s", snap.LogLine("srt", pathName))
 
-				if c.lossAlarmEnable || c.lossDisconnectEnable {
-					decision := lossTracker.Update(snap.LossPct, c.lossAlarmThresholdPct, c.lossDisconnectEnable,
+				if (c.lossAlarmEnable || c.lossDisconnectEnable) && haveUnrecovered {
+					decision := lossTracker.Update(unrecoveredPct, c.lossAlarmThresholdPct, c.lossDisconnectEnable,
 						time.Duration(c.lossDisconnectSec)*time.Second, time.Now())
 
 					if c.lossAlarmEnable && decision.ShouldReport && c.lossAlarmReporter != nil {
 						reporter, path := c.lossAlarmReporter, pathName
-						lossPct, bitrateBps, sustainedSec := snap.LossPct, snap.BitrateBps, int(decision.Sustained.Seconds())
+						pct, bitrateBps, sustainedSec := unrecoveredPct, snap.BitrateBps, int(decision.Sustained.Seconds())
 						go func() {
 							ctx, cancel := context.WithTimeout(c.ctx, 10*time.Second)
 							defer cancel()
-							if err := reporter.ReportSRTLoss(ctx, path, lossPct, bitrateBps, sustainedSec); err != nil {
+							if err := reporter.ReportSRTLoss(ctx, path, pct, bitrateBps, sustainedSec); err != nil {
 								c.Log(logger.Debug, "SRT loss alarm report failed: %v", err)
 							}
 						}()
 					}
 
 					if decision.ShouldDisconnect {
-						c.Log(logger.Warn, "SRT loss=%.2f%% sustained %s >= %ds, forcing disconnect so the publisher reconnects",
-							snap.LossPct, decision.Sustained.Round(time.Second), c.lossDisconnectSec)
+						c.Log(logger.Warn, "SRT unrecovered loss=%.2f%% sustained %s >= %ds, forcing disconnect so the publisher reconnects",
+							unrecoveredPct, decision.Sustained.Round(time.Second), c.lossDisconnectSec)
 						c.Close()
 						return
 					}
+				}
+
+				// Persist the per-minute breakdown for the superadmin trend
+				// view - unlike the alarm above, this is unconditional (every
+				// interval, whatever the loss) so the trend has the healthy
+				// minutes too, not just the bad ones.
+				if c.lossSampleReporter != nil && haveUnrecovered {
+					reporter, path := c.lossSampleReporter, pathName
+					rec, unrec, bitrate := recoverablePct, unrecoveredPct, snap.BitrateBps
+					minute := time.Now().UTC().Format("2006-01-02 15:04")
+					go func() {
+						ctx, cancel := context.WithTimeout(c.ctx, 10*time.Second)
+						defer cancel()
+						if err := reporter.ReportSRTLossSample(ctx, path, rec, unrec, bitrate, minute); err != nil {
+							c.Log(logger.Debug, "SRT loss sample report failed: %v", err)
+						}
+					}()
 				}
 			}
 

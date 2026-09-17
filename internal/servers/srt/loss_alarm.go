@@ -7,6 +7,9 @@ import "context"
 // doesn't import mmxcontrol (matching how recording's SplitRecFileReporter
 // decouples internal/servers packages from internal/mmxcontrol) - internal/
 // core bridges the two.
+//
+// The pct argument is the UNRECOVERABLE loss rate (packets lost and never
+// retransmitted), not raw SRT loss - see runReceiveStatsSummary's call site.
 type srtLossAlarmReporter interface {
-	ReportSRTLoss(ctx context.Context, pathName string, lossPct, bitrateBps float64, sustainedSec int) error
+	ReportSRTLoss(ctx context.Context, pathName string, unrecoveredPct, bitrateBps float64, sustainedSec int) error
 }

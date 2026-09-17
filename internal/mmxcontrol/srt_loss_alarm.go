@@ -11,18 +11,23 @@ import (
 )
 
 // SRTLossAlarmReport is one SRT publish connection's most recent
-// recvstats.Interval loss-rate sample, matching ppcenter's
+// recvstats.Interval UNRECOVERABLE loss-rate sample, matching ppcenter's
 // POST /internal/mmx/v1/alarms/srt-loss. Node identity is deliberately NOT
 // included here - the nodeSecret bearer token this request already
 // authenticates with resolves to the reporting node's identity server-side
 // (nodeSecretAuthMiddleware), the same way TrafficUsageReport's per-node
 // byte rollup is attributed without the node claiming its own identity in
 // the body.
+//
+// UnrecoveredPct, not raw SRT loss: raw loss counts packets ARQ retransmits
+// away, so reporting it here would raise alarms for conditions SRT is
+// designed to absorb (see conn.go's call site). Only packets lost and never
+// retransmitted are reported.
 type SRTLossAlarmReport struct {
-	PathName     string  `json:"pathName"`
-	LossPct      float64 `json:"lossPct"`
-	BitrateBps   float64 `json:"bitrateBps"`
-	SustainedSec int     `json:"sustainedSec"` // continuous seconds over threshold; 0 on the one resolve report
+	PathName       string  `json:"pathName"`
+	UnrecoveredPct float64 `json:"unrecoveredPct"`
+	BitrateBps     float64 `json:"bitrateBps"`
+	SustainedSec   int     `json:"sustainedSec"` // continuous seconds over threshold; 0 on the one resolve report
 }
 
 // SRTLossAlarmClient reports SRT ingest loss-rate samples to ppcenter.
@@ -45,14 +50,14 @@ func NewSRTLossAlarmClient(baseURL, token string, timeout time.Duration) *SRTLos
 	}
 }
 
-// Report sends one loss-rate sample. Unlike TrafficUsageClient.Report, a
-// zero LossPct is not skipped - it is the legitimate "loss dropped back
-// under threshold" resolve report, not a no-op delta.
+// Report sends one unrecoverable-loss sample. Unlike TrafficUsageClient.Report,
+// a zero UnrecoveredPct is not skipped - it is the legitimate "loss dropped
+// back under threshold" resolve report, not a no-op delta.
 func (c *SRTLossAlarmClient) Report(ctx context.Context, report SRTLossAlarmReport) error {
 	if c.baseURL == "" || c.token == "" {
 		return fmt.Errorf("srt loss alarm endpoint and bearer token are required")
 	}
-	if strings.TrimSpace(report.PathName) == "" || report.LossPct < 0 {
+	if strings.TrimSpace(report.PathName) == "" || report.UnrecoveredPct < 0 {
 		return fmt.Errorf("invalid srt loss alarm report")
 	}
 

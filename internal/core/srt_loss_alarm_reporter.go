@@ -11,15 +11,18 @@ import (
 // packages don't import each other (same reasoning as
 // splitRecFileReporterAdapter above), so core - which already depends on
 // both - is where the conversion happens.
+//
+// The pct parameter carries the UNRECOVERABLE loss rate, not raw SRT loss -
+// see mmxcontrol.SRTLossAlarmReport and conn.go's call site.
 type srtLossAlarmReporterAdapter struct {
 	client *mmxcontrol.SRTLossAlarmClient
 }
 
-func (a srtLossAlarmReporterAdapter) ReportSRTLoss(ctx context.Context, pathName string, lossPct, bitrateBps float64, sustainedSec int) error {
+func (a srtLossAlarmReporterAdapter) ReportSRTLoss(ctx context.Context, pathName string, unrecoveredPct, bitrateBps float64, sustainedSec int) error {
 	return a.client.Report(ctx, mmxcontrol.SRTLossAlarmReport{
-		PathName:     pathName,
-		LossPct:      lossPct,
-		BitrateBps:   bitrateBps,
-		SustainedSec: sustainedSec,
+		PathName:       pathName,
+		UnrecoveredPct: unrecoveredPct,
+		BitrateBps:     bitrateBps,
+		SustainedSec:   sustainedSec,
 	})
 }

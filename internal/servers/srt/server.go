@@ -165,6 +165,11 @@ type Server struct {
 	LossAlarmReporter     srtLossAlarmReporter
 	LossAlarmEnable       bool
 	LossAlarmThresholdPct float64
+	// LossSampleReporter persists a per-minute recoverable/unrecoverable loss
+	// breakdown to ppcenter, independent of any threshold - the trend view,
+	// as opposed to LossAlarmReporter's event-driven alarm. Nil disables it,
+	// same as the alarm reporter (see core.go's wiring gating).
+	LossSampleReporter srtLossSampleReporter
 	// LossDisconnectEnable forces a publish connection closed once its loss
 	// rate has stayed above LossAlarmThresholdPct continuously for
 	// LossDisconnectSec, so a wedged OBS publisher is made to reconnect
@@ -401,6 +406,7 @@ outer:
 				lossAlarmReporter:     s.LossAlarmReporter,
 				lossAlarmEnable:       s.LossAlarmEnable,
 				lossAlarmThresholdPct: s.LossAlarmThresholdPct,
+				lossSampleReporter:    s.LossSampleReporter,
 				lossDisconnectEnable:  s.LossDisconnectEnable,
 				lossDisconnectSec:     s.LossDisconnectSec,
 
