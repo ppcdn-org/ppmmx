@@ -443,6 +443,11 @@ type sessionParent interface {
 	recordPublishSessionEnd(pathName string)
 	publishStatsSummary(pathName string) (time.Duration, int)
 
+	// Publish session history (see publish_session_report.go): reports the
+	// start/end of a WHIP publish session to ppcenter, backing the stream
+	// history shown in the console and superadmin dashboard.
+	publishSessionReporterHook() publishSessionReporter
+
 	// OBS abs-timestamp fan-out (see obs_timestamp_broadcast.go): relays
 	// "obs-timestamp" DataChannel messages from a path's WHIP publish
 	// session to all of that path's WHEP reader sessions over their ABR
@@ -497,6 +502,12 @@ type session struct {
 	abrSwitchCooldown int // ms
 	mediaState        *webrtc.MediaState
 	abrReady          bool
+	// abrAutoMode reports whether the reader has left layer selection to
+	// the server. Server-driven switching (see runABRControl) only acts
+	// while this is true; a reader that picked a layer by hand keeps it.
+	// Defaults to true: a reader that never sends SET_ABR_MODE (an older
+	// client) gets adaptive behaviour rather than being pinned forever.
+	abrAutoMode bool
 
 	// OBS abs-timestamp protocol (see docs/obs-abs-timestamp-protocol.md
 	// in the OBS repo): end-to-end publish latency computed from the most
@@ -518,6 +529,32 @@ func (s *session) writeABRMessage(msg abrMessage) error {
 	return ws.WriteJSON(msg)
 }
 
+// waitForABRReady polls s.abrReady until it goes true or timeout elapses,
+// returning the same (selector, mediaState, abrReady) snapshot
+// handleABRWebSocket used to read once - see its call site comment for why
+// a single read isn't enough. Returns immediately, without sleeping at
+// all, on the common case where abrReady is already true.
+func (s *session) waitForABRReady(timeout time.Duration) (*webrtc.TrackSelector, *webrtc.MediaState, bool) {
+	deadline := time.Now().Add(timeout)
+	for {
+		s.mutex.RLock()
+		selector := s.trackSelector
+		mediaState := s.mediaState
+		abrReady := s.abrReady
+		s.mutex.RUnlock()
+
+		if abrReady || time.Now().After(deadline) {
+			return selector, mediaState, abrReady
+		}
+
+		select {
+		case <-time.After(abrReadyPollInterval):
+		case <-s.ctx.Done():
+			return selector, mediaState, false
+		}
+	}
+}
+
 func (s *session) initialize() {
 	s.ctx, s.ctxCancel = context.WithCancel(s.parentCtx)
 	s.created = time.Now()
@@ -525,6 +562,7 @@ func (s *session) initialize() {
 	s.secret = uuid.New()
 	s.chInitialRequest = make(chan initialRequestReq)
 	s.chAddCandidates = make(chan addSessionCandidatesReq)
+	s.abrAutoMode = true
 
 	s.Log(logger.Info, "created by %s", s.remoteAddr)
 
@@ -793,6 +831,20 @@ func (s *session) runPublish(req *initialRequestReq) (int, error) {
 	go s.runPublishStatsSummary()
 	go s.runReceiveStatsSummary(pc)
 
+	// Publish session history (see publish_session_report.go): tells
+	// ppcenter this stream went live, and - via the deferred call - when
+	// and why it stopped. Reported at the lifecycle boundaries rather than
+	// sampled, since these two events *are* the record; a missed one leaves
+	// a session that never started or never ended.
+	//
+	// Placed after AddPublisher succeeded so a session that failed
+	// authorization or negotiation never shows up in a customer's history,
+	// and the deferred end runs before the RemovePublisher defer above
+	// (defers run last-in-first-out) - both describe the same session, so
+	// the ordering between them only matters for log readability.
+	s.reportPublishStart()
+	defer s.reportPublishEnd(pc)
+
 	select {
 	case <-pc.Failed():
 		return 0, fmt.Errorf("peer connection closed")
@@ -968,7 +1020,15 @@ func (s *session) runRead(req *initialRequestReq) (int, error) {
 	s.mutex.Lock()
 	s.reader = r
 	s.abrReady = true
+	selector := s.trackSelector
 	s.mutex.Unlock()
+
+	// Server-driven ABR: only for sessions that actually have a layer
+	// ladder to choose from (the abrEnabled branch above). Multi-track and
+	// plain single-track sessions have no selector and are left alone.
+	if selector != nil {
+		go s.runABRControl(pc, selector)
+	}
 
 	// Subscribe to this path's obs-timestamp fan-out (see
 	// obs_timestamp_broadcast.go) so p2p delay can be computed client-side.
@@ -1073,6 +1133,103 @@ func (s *session) onInboundDataChannel(dc *pwebrtc.DataChannel) {
 		// end-to-end p2p delay, not just the OBS-to-mmx leg above.
 		s.parent.broadcastObsTimestamp(s.pathName, obsTimestampMessage(ts))
 	})
+}
+
+// runABRControl drives server-side layer *decisions* for one WHEP reader.
+//
+// The decision input is the send-side bandwidth estimate GCC derives from
+// the reader's TWCC feedback (see PeerConnection.EstimateBandwidth). Every
+// estimate is reported to the reader so it can display it; whether a
+// resulting recommendation is acted upon depends on the reader's ABR mode,
+// which the reader owns via SET_ABR_MODE.
+//
+// Execution is deliberately NOT done here: this goroutine only ever sends
+// ABR_RECOMMEND and leaves calling TrackSelector.Select to the client's own
+// SELECT_LAYER round-trip (see abr_ws_handler.go's abrReasonAutoBandwidth
+// handling). Two things used to go wrong when the server called
+// selector.Select directly:
+//
+//  1. Manual quality selection could be silently overridden or lost: a user
+//     pick and a server tick raced on the same session.trackSelector, and
+//     whichever lost the race left the <select> UI and the server's actual
+//     active track disagreeing, or a manual choice reverted a moment later.
+//  2. It gave the reader no reliable way to distinguish an automatic switch
+//     from a manual one, since both went through the exact same call.
+//
+// Routing every switch - automatic or manual - through the same
+// SELECT_LAYER message from the client makes TrackSelector.Select have
+// exactly one caller, so there is no longer a race to lose.
+func (s *session) runABRControl(pc *webrtc.PeerConnection, selector *webrtc.TrackSelector) {
+	// Nothing to choose between: a single video layer (or none) makes every
+	// decision a no-op, so don't spend a goroutine and a ticker on it.
+	if selector.VideoTrackCount() < 2 {
+		return
+	}
+
+	ticker := time.NewTicker(abrEvalInterval)
+	defer ticker.Stop()
+
+	controller := newABRController(selector)
+	startedAt := time.Now()
+
+	for {
+		select {
+		case <-ticker.C:
+			estimate, ok := pc.EstimateBandwidth()
+			if !ok {
+				continue
+			}
+
+			// Report regardless of mode: in manual mode this is what lets
+			// a player show the user what the link would support.
+			s.writeABRMessage(bandwidthEstimateMessage(estimate)) //nolint:errcheck
+
+			if time.Since(startedAt) < abrWarmupPeriod {
+				continue
+			}
+
+			s.mutex.RLock()
+			auto := s.abrAutoMode
+			lastSwitch := s.lastSwitchTime
+			cooldown := s.abrSwitchCooldown
+			s.mutex.RUnlock()
+
+			if !auto {
+				controller.reset()
+				continue
+			}
+
+			// Same cooldown a client request is subject to (see
+			// abr_ws_handler.go) and updated by that same handler whenever
+			// any SELECT_LAYER lands, automatic or manual - so a
+			// recommendation the client hasn't yet executed, and a manual
+			// pick the user just made, both throttle the next one.
+			if time.Since(lastSwitch) < time.Duration(cooldown)*time.Millisecond {
+				continue
+			}
+
+			target, switchNow := controller.evaluate(estimate)
+			if !switchNow {
+				continue
+			}
+
+			// Recommend only - see the func doc comment for why this
+			// doesn't call selector.Select itself. If the client doesn't
+			// act on it (dropped message, or it has since left auto mode),
+			// evaluate's own confirmation streak naturally re-recommends
+			// the same target every abrUpgradeConfirmations/
+			// abrDowngradeConfirmations ticks, since the active track
+			// won't have moved - a self-healing retry with no extra state
+			// needed here.
+			s.writeABRMessage(abrRecommendMessage(target)) //nolint:errcheck
+
+			s.Log(logger.Info, "ABR: recommending track %d (estimate=%dkbps)",
+				target, estimate/1000)
+
+		case <-s.ctx.Done():
+			return
+		}
+	}
 }
 
 // degradeStatsLogInterval is how often runDegradeSampling logs the
@@ -1221,6 +1378,79 @@ func (s *session) runReceiveStatsSummary(pc *webrtc.PeerConnection) {
 			return
 		}
 	}
+}
+
+// reportPublishStart tells ppcenter a WHIP publish session went live. The
+// session UUID is the correlation key: reportPublishEnd sends the same one,
+// and ppcenter matches the two into a single history row.
+//
+// Fire-and-forget, like the RTP loss alarm: a publish that is working must
+// not be held up (or failed) because the control plane is briefly
+// unreachable. The cost of that choice is that an unreachable ppcenter
+// loses the record entirely rather than delaying it - acceptable here
+// because history is an operational/reporting feature, not billing input.
+func (s *session) reportPublishStart() {
+	reporter := s.parent.publishSessionReporterHook()
+	if reporter == nil {
+		return
+	}
+
+	sessionID := s.uuid.String()
+	pathName := s.pathName
+	remoteAddr := s.remoteAddr
+	userAgent := s.httpRequest.Header.Get("User-Agent")
+	startedAt := time.Now()
+
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := reporter.ReportPublishStart(ctx, sessionID, pathName, remoteAddr, userAgent, startedAt); err != nil {
+			s.Log(logger.Debug, "publish session start report failed: %v", err)
+		}
+	}()
+}
+
+// reportPublishEnd tells ppcenter the session stopped, carrying the total
+// inbound bytes so the history row can show how much was actually ingested.
+//
+// Deliberately not using s.ctx: by the time this runs (deferred on the way
+// out of runPublish) that context is typically already cancelled, which
+// would abort the very request meant to close out the record. A fresh
+// context with its own timeout is what makes the end event survive the
+// session it describes.
+func (s *session) reportPublishEnd(pc *webrtc.PeerConnection) {
+	reporter := s.parent.publishSessionReporterHook()
+	if reporter == nil {
+		return
+	}
+
+	sessionID := s.uuid.String()
+	endedAt := time.Now()
+
+	// Distinguishes a publisher that went away on its own from one this
+	// node tore down, which is the first thing anyone looks at when a
+	// customer asks why their stream stopped.
+	endReason := "publisher_closed"
+	select {
+	case <-s.ctx.Done():
+		endReason = "session_terminated"
+	default:
+	}
+
+	var inboundBytes uint64
+	if pc != nil {
+		if st := pc.Stats(); st != nil {
+			inboundBytes = st.BytesReceived
+		}
+	}
+
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := reporter.ReportPublishEnd(ctx, sessionID, endedAt, endReason, inboundBytes); err != nil {
+			s.Log(logger.Debug, "publish session end report failed: %v", err)
+		}
+	}()
 }
 
 func (s *session) initialRequest(req initialRequestReq) initialRequestRes {

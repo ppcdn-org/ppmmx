@@ -254,6 +254,14 @@ type Server struct {
 	RTPLossAlarmThresholdPct float64
 	RTPLossAlarmReporter     rtpLossAlarmReporter
 
+	// Publish session history (see publish_session_report.go): reports the
+	// start and end of every WHIP publish session to ppcenter, which is
+	// what backs the stream history shown in the user console and the
+	// superadmin dashboard. Nil unless MMXControl is set up (see core.go's
+	// construction gating); session.go's hook treats a nil reporter as
+	// "nothing to send to" rather than a bug.
+	PublishSessionReporter publishSessionReporter
+
 	// WHIP publish auth (see docs/obs-whip-publish-auth-protocol.md): shared
 	// AES key used by checkWHIPDeviceID to decrypt the ppcenter-issued
 	// bearer token every ppobs publish request must carry. Distinct from

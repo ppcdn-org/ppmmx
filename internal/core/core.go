@@ -136,27 +136,28 @@ type Core struct {
 	recordCleaner    *recordcleaner.Cleaner
 	playbackServer   *playback.Server
 	pathManager      *pathManager
-	rtspServer       *rtsp.Server
-	rtspsServer      *rtsp.Server
-	rtmpServer       *rtmp.Server
-	rtmpsServer      *rtmp.Server
-	hlsServer        *hls.Server
-	webRTCServer     *webrtc.Server
-	degradeManager   *degrade.Manager
-	recMgr           *recording.Manager
-	splitHandler     *recording.SplitRecHandler
-	mmxControl       *mmxcontrol.Client
-	recordingSync    *mmxcontrol.RecordingSyncClient
-	segmentReporter  *mmxcontrol.SegmentReporter
-	trafficUsage     *TrafficUsageSampler
-	srtServer        *srt.Server
-	moqServer        *moq.Server
-	api              *api.API
-	adminSrv         *admin.Server
-	adminStore       *admin.Store
-	publishWhitelist *appPublishWhitelist
-	ingestMgr        *ingest.Manager
-	confWatcher      *confwatcher.ConfWatcher
+	rtspServer           *rtsp.Server
+	rtspsServer          *rtsp.Server
+	rtmpServer           *rtmp.Server
+	rtmpsServer          *rtmp.Server
+	hlsServer            *hls.Server
+	webRTCServer         *webrtc.Server
+	degradeManager       *degrade.Manager
+	recMgr               *recording.Manager
+	splitHandler         *recording.SplitRecHandler
+	recordDeletionRunner *RecordDeletionRunner
+	mmxControl           *mmxcontrol.Client
+	recordingSync        *mmxcontrol.RecordingSyncClient
+	segmentReporter      *mmxcontrol.SegmentReporter
+	trafficUsage         *TrafficUsageSampler
+	srtServer            *srt.Server
+	moqServer            *moq.Server
+	api                  *api.API
+	adminSrv             *admin.Server
+	adminStore           *admin.Store
+	publishWhitelist     *appPublishWhitelist
+	ingestMgr            *ingest.Manager
+	confWatcher          *confwatcher.ConfWatcher
 
 	// in
 	chAPIConfigSet chan *conf.Conf
@@ -854,6 +855,17 @@ func (p *Core) createResources(initial bool) error {
 				10*time.Second,
 			)}
 		}
+		// Publish session history (see webrtc's publish_session_report.go).
+		// Gated on MMXControl alone, unlike the alarm above: there is no
+		// separate enable flag because a deployment that talks to ppcenter
+		// at all wants its streams to appear in the console's history.
+		if p.conf.MMXControl {
+			i.PublishSessionReporter = publishSessionReporterAdapter{client: mmxcontrol.NewPublishSessionClient(
+				mmxcontrol.DeriveFallbackURL(p.conf.MMXControlURL),
+				p.conf.MMXNodeSecret,
+				10*time.Second,
+			)}
+		}
 		err = i.Initialize()
 		if err != nil {
 			return err
@@ -941,6 +953,37 @@ func (p *Core) createResources(initial bool) error {
 	// and (re)wired independently of the reporter above. Same endpoint/
 	// credential reuse as recordingSync/segmentReporter: no separate opt-in
 	// flag, every mmxControl deployment gets it.
+	// Record object deletion runner: claims pending deletions from
+	// ppcenter and executes them against S3/MinIO. Wired whenever
+	// mmxControl and net-storage credentials are both present - no
+	// separate opt-in flag.
+	if p.conf.MMXControl && p.splitHandler != nil && p.recordDeletionRunner == nil {
+		p.recordDeletionRunner = NewRecordDeletionRunner(
+			mmxcontrol.NewRecordDeletionClient(
+				mmxcontrol.DeriveFallbackURL(p.conf.MMXControlURL),
+				p.conf.MMXNodeSecret,
+				30*time.Second,
+			),
+			recording.UploadConfig{
+				Env:            p.conf.NetStorageEnv,
+				S3Bucket:       p.conf.NetStorageS3Bucket,
+				S3Region:       p.conf.NetStorageS3Region,
+				S3AccessKey:    p.conf.NetStorageS3AccessKey,
+				S3SecretKey:    p.conf.NetStorageS3SecretKey,
+				S3Domain:       p.conf.NetStorageS3Domain,
+				S3Endpoint:     p.conf.NetStorageS3Endpoint,
+				S3ACL:          p.conf.NetStorageS3ACL,
+				MinioEndpoint:  p.conf.NetStorageMinioEndpoint,
+				MinioAccessKey: p.conf.NetStorageMinioAccessKey,
+				MinioSecretKey: p.conf.NetStorageMinioSecretKey,
+				MinioUseSSL:    p.conf.NetStorageMinioUseSSL,
+				MinioDomain:    p.conf.NetStorageMinioDomain,
+			},
+			p,
+		)
+		p.recordDeletionRunner.Initialize()
+	}
+
 	if p.conf.WebRTC && p.conf.MMXControl && p.webRTCServer != nil && p.trafficUsage == nil {
 		p.trafficUsage = &TrafficUsageSampler{
 			Server: p.webRTCServer,
@@ -1539,6 +1582,10 @@ func (p *Core) closeResources(newConf *conf.Conf, calledByAPI bool) {
 		_ = p.recMgr.Close()
 		p.recMgr = nil
 		p.splitHandler = nil
+	}
+	if p.recordDeletionRunner != nil {
+		p.recordDeletionRunner.Close()
+		p.recordDeletionRunner = nil
 	}
 
 	if p.mmxControl != nil {

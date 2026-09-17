@@ -50,6 +50,36 @@ type selectLayerData struct {
 	Reason        string `json:"reason"`
 }
 
+// abrReasonAutoBandwidth is the SELECT_LAYER reason a client sends when
+// it's carrying out a server-sent ABR_RECOMMEND rather than a user's own
+// pick (see abrRecommendMessage / runABRControl). The distinction matters
+// because SELECT_LAYER otherwise always means "the viewer chose this" and
+// switches the session to manual mode - if a recommendation's own
+// resulting SELECT_LAYER did that, auto mode would cancel itself on its
+// very first switch.
+const abrReasonAutoBandwidth = "auto_bandwidth"
+
+// selectLayerKeepsAutoMode reports whether a SELECT_LAYER carrying this
+// reason should leave the session in automatic mode, rather than the usual
+// "any explicit SELECT_LAYER means the viewer took over" rule. True only
+// for the client executing the server's own ABR_RECOMMEND; every other
+// reason - including a client that never says one - is a genuine manual
+// pick.
+func selectLayerKeepsAutoMode(reason string) bool {
+	return reason == abrReasonAutoBandwidth
+}
+
+// ABR_RECOMMEND 通知: the server's suggested target layer, computed from
+// the bandwidth estimate (see abr_controller.go). Sent only while the
+// reader is in automatic mode. Purely a suggestion - the server does not
+// switch anything itself; the reader is expected to act on it by sending
+// SELECT_LAYER back with reason=abrReasonAutoBandwidth (see runABRControl's
+// doc comment for why execution lives here instead of on the server).
+type abrRecommendData struct {
+	TargetTrackID int    `json:"target_track_id"`
+	Reason        string `json:"reason"`
+}
+
 // LAYER_SWITCHED 响应
 type layerSwitchedData struct {
 	CurrentTrackID  int `json:"current_track_id"`
@@ -57,12 +87,35 @@ type layerSwitchedData struct {
 }
 
 // LATENCY_REPORT 请求
+//
+// FPS is carried for statistics only. It used to drive the client's own
+// up/downgrade decisions; layer selection is now made server-side from the
+// bandwidth estimate (see abr_controller.go), which is a property of the
+// link rather than of the viewer's decoder.
 type latencyReportData struct {
 	RTTMs          float64 `json:"rtt_ms"`
 	JitterBufferMs float64 `json:"jitter_buffer_ms"`
 	PacketsLost    int     `json:"packets_lost"`
 	FPS            float64 `json:"fps"`
 	EstimatedE2EMs float64 `json:"estimated_e2e_ms"`
+}
+
+// SET_ABR_MODE 请求: hands layer selection to the server, or takes it back.
+type setABRModeData struct {
+	Auto bool `json:"auto"`
+}
+
+// ABR_MODE 响应
+type abrModeData struct {
+	Auto bool `json:"auto"`
+}
+
+// BANDWIDTH_ESTIMATE 通知: the server's estimate of what the link towards
+// this reader will carry, in bits per second, covering the whole connection
+// (all video layers plus audio). Sent every evaluation tick regardless of
+// ABR mode - in manual mode it is purely informational.
+type bandwidthEstimateData struct {
+	BitsPerSecond int `json:"bits_per_second"`
 }
 
 type setMediaStateData struct {
@@ -75,6 +128,16 @@ type abrErrorData struct {
 	Code    int    `json:"code"`
 	Message string `json:"message"`
 }
+
+// abrReadyWaitTimeout bounds how long handleABRWebSocket polls for
+// session.abrReady before giving up - see the call site's comment. Set
+// well above the typical WHIP/WHEP handshake time but still short enough
+// that a genuinely stuck session fails fast rather than hanging the
+// client's connection attempt.
+const abrReadyWaitTimeout = 5 * time.Second
+
+// abrReadyPollInterval is how often waitForABRReady rechecks abrReady.
+const abrReadyPollInterval = 50 * time.Millisecond
 
 // handleABRWebSocket handles the ABR control WebSocket at /ws/control
 func (s *httpServer) handleABRWebSocket(ctx *gin.Context) {
@@ -104,12 +167,17 @@ func (s *httpServer) handleABRWebSocket(ctx *gin.Context) {
 	}
 
 	// Obtain per-reader controls. TrackSelector is optional for media pause.
-	sx.mutex.RLock()
-	selector := sx.trackSelector
-	mediaState := sx.mediaState
-	abrReady := sx.abrReady
-	sx.mutex.RUnlock()
-
+	//
+	// abrReady flips true only after the WHIP/WHEP handshake (ICE, DTLS,
+	// track gathering) completes in session.runRead - but the client opens
+	// this WebSocket right after receiving the WHEP answer, well before
+	// that finishes. Rejecting outright here raced the client's connect
+	// against the server's own handshake and lost most of the time,
+	// forcing the client through its 3s retry backoff on every session
+	// start. Poll briefly instead: the handshake is normally done in low
+	// hundreds of milliseconds, so this almost never actually sleeps the
+	// full budget.
+	selector, mediaState, abrReady := sx.waitForABRReady(abrReadyWaitTimeout)
 	if mediaState == nil || !abrReady {
 		s.writeErrorNoLog(ctx, http.StatusConflict, fmt.Errorf("media session is not ready"))
 		return
@@ -164,6 +232,13 @@ func (s *httpServer) handleABRWebSocket(ctx *gin.Context) {
 	sx.writeABRMessage(tracksInfoMessage(selector))       //nolint:errcheck
 	sx.writeABRMessage(mediaStateMessage("", mediaState)) //nolint:errcheck
 
+	// Tell the client who is driving layer selection right now, so a
+	// reconnecting client resyncs instead of assuming a default.
+	sx.mutex.RLock()
+	auto := sx.abrAutoMode
+	sx.mutex.RUnlock()
+	sx.writeABRMessage(abrModeMessage("", auto)) //nolint:errcheck
+
 	// Message loop
 	for {
 		var msg abrMessage
@@ -206,6 +281,13 @@ func (s *httpServer) handleABRWebSocket(ctx *gin.Context) {
 
 			sx.mutex.Lock()
 			sx.lastSwitchTime = time.Now()
+			// See selectLayerKeepsAutoMode: any reason but the client
+			// executing our own recommendation is a manual choice, which
+			// exits auto mode. A client that wants adaptive behaviour back
+			// says so via SET_ABR_MODE.
+			if !selectLayerKeepsAutoMode(data.Reason) {
+				sx.abrAutoMode = false
+			}
 			sx.mutex.Unlock()
 
 			sx.Log(logger.Info, "ABR SELECT_LAYER: target=%d reason=%s", data.TargetTrackID, data.Reason)
@@ -218,6 +300,20 @@ func (s *httpServer) handleABRWebSocket(ctx *gin.Context) {
 			// Log latency metrics (can be used for server-side ABR decisions)
 			sx.Log(logger.Debug, "ABR LATENCY: rtt=%.1fms jb=%.1fms loss=%d fps=%.1f e2e=%.1fms",
 				data.RTTMs, data.JitterBufferMs, data.PacketsLost, data.FPS, data.EstimatedE2EMs)
+
+		case "SET_ABR_MODE":
+			var data setABRModeData
+			if err := json.Unmarshal(msg.Data, &data); err != nil {
+				sx.writeABRMessage(errorMessage(4002, "invalid data format")) //nolint:errcheck
+				continue
+			}
+
+			sx.mutex.Lock()
+			sx.abrAutoMode = data.Auto
+			sx.mutex.Unlock()
+
+			sx.Log(logger.Info, "ABR SET_ABR_MODE: auto=%v", data.Auto)
+			sx.writeABRMessage(abrModeMessage(msg.MsgID, data.Auto)) //nolint:errcheck
 
 		case "PING":
 			sendPong(conn)
@@ -320,6 +416,31 @@ func layerSwitchedMessage(currentID, previousID int) abrMessage {
 		}),
 	}
 	return msg
+}
+
+func abrModeMessage(msgID string, auto bool) abrMessage {
+	return abrMessage{
+		MsgID: msgID,
+		Type:  "ABR_MODE",
+		Data:  mustMarshalJSON(abrModeData{Auto: auto}),
+	}
+}
+
+func bandwidthEstimateMessage(bitsPerSecond int) abrMessage {
+	return abrMessage{
+		Type: "BANDWIDTH_ESTIMATE",
+		Data: mustMarshalJSON(bandwidthEstimateData{BitsPerSecond: bitsPerSecond}),
+	}
+}
+
+func abrRecommendMessage(targetTrackID int) abrMessage {
+	return abrMessage{
+		Type: "ABR_RECOMMEND",
+		Data: mustMarshalJSON(abrRecommendData{
+			TargetTrackID: targetTrackID,
+			Reason:        abrReasonAutoBandwidth,
+		}),
+	}
 }
 
 func errorMessage(code int, message string) abrMessage {

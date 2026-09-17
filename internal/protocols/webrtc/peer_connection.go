@@ -17,6 +17,8 @@ import (
 	"github.com/bluenviron/gortsplib/v5/pkg/rtpsender"
 	"github.com/pion/ice/v4"
 	"github.com/pion/interceptor"
+	"github.com/pion/interceptor/pkg/cc"
+	"github.com/pion/interceptor/pkg/gcc"
 	"github.com/pion/rtcp"
 	"github.com/pion/sdp/v3"
 	"github.com/pion/transport/v4"
@@ -30,6 +32,15 @@ const (
 	twccExtensionURI = "http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01"
 	// MaxAutoVideoTracks is the number of video m-lines offered in automatic WHEP mode.
 	MaxAutoVideoTracks = 4
+
+	// Bounds for the send-side bandwidth estimator (see EstimateBandwidth).
+	// The initial value matches the top entry of the ABR layer ladder
+	// (layerDefaults in track_selector.go) so a session that starts on the
+	// highest layer isn't immediately demoted before the first TWCC
+	// feedback arrives; min/max only clamp obviously nonsensical estimates.
+	initialBandwidthEstimate = 2_000_000
+	minBandwidthEstimate     = 100_000
+	maxBandwidthEstimate     = 20_000_000
 )
 
 func interfaceIPs(interfaceList []string) ([]string, error) {
@@ -96,10 +107,13 @@ func maxTrackCount(medias []*sdp.MediaDescription) int {
 
 // * skip ConfigureRTCPReports
 // * add statsInterceptor
+// * add send-side bandwidth estimation when sending media (sendSide)
 func registerInterceptors(
 	mediaEngine *webrtc.MediaEngine,
 	interceptorRegistry *interceptor.Registry,
 	onStatsInterceptor func(s *statsInterceptor),
+	sendSide bool,
+	onBandwidthEstimator func(cc.BandwidthEstimator),
 ) error {
 	err := webrtc.ConfigureNack(mediaEngine, interceptorRegistry)
 	if err != nil {
@@ -114,6 +128,60 @@ func registerInterceptors(
 	err = webrtc.ConfigureTWCCSender(mediaEngine, interceptorRegistry)
 	if err != nil {
 		return err
+	}
+
+	// ConfigureTWCCSender above only covers the *receiving* direction: it
+	// makes this peer generate TWCC reports for streams it receives (a WHIP
+	// publisher's). To estimate the bandwidth available towards a WHEP
+	// reader we need the opposite - stamp our own outgoing RTP with
+	// transport-wide sequence numbers so the remote peer sends TWCC reports
+	// back to us, which is what feeds the estimator below. Without this the
+	// estimator never receives a single rtcp.TransportLayerCC and would
+	// report its initial constant forever.
+	if sendSide {
+		var factory *cc.InterceptorFactory
+		factory, err = cc.NewInterceptor(func() (cc.BandwidthEstimator, error) {
+			return gcc.NewSendSideBWE(
+				gcc.SendSideBWEInitialBitrate(initialBandwidthEstimate),
+				gcc.SendSideBWEMinBitrate(minBandwidthEstimate),
+				gcc.SendSideBWEMaxBitrate(maxBandwidthEstimate),
+				// GCC's default leaky-bucket pacer buffers and reshapes
+				// outgoing packets to match the target bitrate. That is the
+				// right thing for an encoder that can be told to slow down,
+				// but here packets are forwarded from an already-encoded
+				// stream and the whole product is tuned for low latency
+				// (see the playout-buffer and catch-up logic in pplayer) -
+				// queueing them would add delay we then try to claw back.
+				// NoOpPacer keeps GCC purely as an estimator: it observes
+				// send times and TWCC feedback, and never delays a packet.
+				gcc.SendSideBWEPacer(gcc.NewNoOpPacer()),
+			)
+		})
+		if err != nil {
+			return err
+		}
+
+		if onBandwidthEstimator != nil {
+			factory.OnNewPeerConnection(func(_ string, estimator cc.BandwidthEstimator) {
+				onBandwidthEstimator(estimator)
+			})
+		}
+
+		// Order matters and is the opposite of what it looks like:
+		// interceptor.Chain wraps each writer around the previous one, so
+		// the *last* registered interceptor is the outermost and runs
+		// first on the way out. The estimator reads the TWCC sequence
+		// number off each outgoing packet, so the interceptor that writes
+		// that extension has to run before it - which means registering it
+		// after. Getting this backwards makes every send fail with
+		// "missing transport layer cc header extension". Same ordering as
+		// pion's own bandwidth-estimation example.
+		interceptorRegistry.Add(factory)
+
+		err = webrtc.ConfigureTWCCHeaderExtensionSender(mediaEngine, interceptorRegistry)
+		if err != nil {
+			return err
+		}
 	}
 
 	interceptorRegistry.Add(&statsInterceptorFactory{
@@ -212,6 +280,11 @@ type PeerConnection struct {
 	inboundTracks       []*InboundTrack
 	inboundTracksClosed bool
 	statsInterceptor    *statsInterceptor
+
+	// Set only when Publish is true (i.e. this PeerConnection sends media,
+	// i.e. a WHEP reader session) - see registerInterceptors.
+	bweMutex sync.RWMutex
+	bwe      cc.BandwidthEstimator
 
 	newLocalCandidate chan *webrtc.ICECandidateInit
 	inboundTrack      chan trackRecvPair
@@ -355,6 +428,12 @@ func (co *PeerConnection) Start() error {
 		interceptorRegistry,
 		func(s *statsInterceptor) {
 			co.statsInterceptor = s
+		},
+		co.Publish,
+		func(estimator cc.BandwidthEstimator) {
+			co.bweMutex.Lock()
+			co.bwe = estimator
+			co.bweMutex.Unlock()
 		},
 	)
 	if err != nil {
@@ -1142,6 +1221,28 @@ func (co *PeerConnection) Stats() *Stats {
 		NACKPacketsReceived:  co.statsInterceptor.nackPacketsReceived.Load(),
 		RTTMilliseconds:      candidatePairRTT(co.wr),
 	}
+}
+
+// EstimateBandwidth returns the estimated bandwidth available towards the
+// remote peer, in bits per second, and whether an estimate exists at all.
+//
+// Only meaningful on a sending (Publish) PeerConnection - see
+// registerInterceptors, which wires the estimator only in that direction.
+// The value covers the whole connection (every track, video and audio), not
+// an individual layer.
+//
+// Note that GCC reports its configured initial value until enough TWCC
+// feedback has arrived, so an estimate being present does not by itself mean
+// it has converged; callers that act on it should allow a warm-up period.
+func (co *PeerConnection) EstimateBandwidth() (int, bool) {
+	co.bweMutex.RLock()
+	bwe := co.bwe
+	co.bweMutex.RUnlock()
+
+	if bwe == nil {
+		return 0, false
+	}
+	return bwe.GetTargetBitrate(), true
 }
 
 // OutboundTrackStats returns per-track send statistics, keyed by a label
