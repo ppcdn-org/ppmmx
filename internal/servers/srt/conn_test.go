@@ -6,6 +6,42 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestUnrecoverableAccumulator(t *testing.T) {
+	var a unrecoverableAccumulator
+
+	// First reading only seeds the baseline (no delta to accumulate yet).
+	require.True(t, a.add(0, 0, 1000))
+	require.Equal(t, uint64(0), a.unrecoverable)
+	require.Equal(t, uint64(0), a.expected)
+
+	// A normal interval: 60 lost, 50 of them retransmitted back in time,
+	// 940 received => 10 unrecoverable out of 1000 expected.
+	require.True(t, a.add(60, 50, 1940))
+	require.Equal(t, uint64(10), a.unrecoverable)
+	require.Equal(t, uint64(1000), a.expected)
+
+	// A late retransmission lands in this interval (dRetrans > dLost): the
+	// unrecoverable total must not go negative, and must not shrink.
+	require.True(t, a.add(70, 70, 2930))
+	require.Equal(t, uint64(10), a.unrecoverable)
+	require.Equal(t, uint64(2000), a.expected)
+
+	// A counter reset (new SRT socket) is not accumulated; totals carry over.
+	require.False(t, a.add(0, 0, 500))
+	require.Equal(t, uint64(10), a.unrecoverable)
+	require.Equal(t, uint64(2000), a.expected)
+
+	// Normal interval again after the reconnect.
+	require.True(t, a.add(30, 10, 1000))
+	require.Equal(t, uint64(30), a.unrecoverable)
+	require.Equal(t, uint64(2530), a.expected)
+
+	// The rate the FSM computes from (unrecoverable, expected-unrecoverable)
+	// is unrecoverable/expected.
+	rate := float64(a.unrecoverable) / float64(a.expected)
+	require.InDelta(t, float64(30)/float64(2530), rate, 1e-9)
+}
+
 func TestUnrecoverableLossPct(t *testing.T) {
 	for _, ca := range []struct {
 		name            string

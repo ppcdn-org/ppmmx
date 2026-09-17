@@ -502,15 +502,68 @@ func (c *conn) runReceiveStatsSummary(sconn srt.Conn, pathName string, done <-ch
 	}
 }
 
+// unrecoverableAccumulator turns cumulative SRT (lost, retrans, received)
+// counters into monotonically increasing cumulative (unrecoverable,
+// expected) totals, so the degrade FSM can be fed an UNRECOVERABLE-loss
+// rate instead of the raw SRT loss rate.
+//
+// Why not just pass PktRecvLoss straight through: raw loss counts every
+// packet ARQ retransmits away, so on a healthy-but-lossy link (measured
+// baseline ~5-10% raw, ~0.1% unrecoverable - see conf.go's
+// SRTLossAlarmThresholdPct comment) triggering degrade on raw loss
+// over-degrades and bottoms the ladder out on a condition SRT is designed
+// to absorb. unrecoverable = lost - retrans, but that difference is NOT
+// monotonic on its own: a gap detected in one 1s tick can be filled by a
+// retransmission in a later one, so lost-retrans can dip while both inputs
+// only rise, and degrade.State.Sample's reset detection requires the
+// cumulative reading it is fed to only ever increase. Accumulating the
+// per-tick deltas here keeps that guarantee.
+type unrecoverableAccumulator struct {
+	seeded      bool
+	lastLoss    uint64
+	lastRetrans uint64
+	lastRecv    uint64
+
+	unrecoverable uint64 // cumulative lost - recovered
+	expected      uint64 // cumulative lost + received
+}
+
+// add folds one cumulative reading in and reports whether the caller should
+// feed the resulting totals to the FSM. It returns false only for the very
+// first reading and for a counter reset (a new SRT socket after a
+// reconnect), in which case it just (re-)seeds the baseline; the
+// accumulated totals deliberately carry across reconnects.
+func (a *unrecoverableAccumulator) add(curLoss, curRetrans, curRecv uint64) bool {
+	if !a.seeded {
+		a.lastLoss, a.lastRetrans, a.lastRecv, a.seeded = curLoss, curRetrans, curRecv, true
+		return true
+	}
+	if curLoss < a.lastLoss || curRetrans < a.lastRetrans || curRecv < a.lastRecv {
+		a.lastLoss, a.lastRetrans, a.lastRecv = curLoss, curRetrans, curRecv
+		return false
+	}
+	dLost := curLoss - a.lastLoss
+	dRetrans := curRetrans - a.lastRetrans
+	dRecv := curRecv - a.lastRecv
+	if dLost > dRetrans {
+		a.unrecoverable += dLost - dRetrans
+	}
+	a.expected += dLost + dRecv
+	a.lastLoss, a.lastRetrans, a.lastRecv = curLoss, curRetrans, curRecv
+	return true
+}
+
 // runDegradeSampling periodically feeds this SRT publish connection's
-// cumulative packet loss/received counters into the path's degrade FSM
-// (see internal/degrade and docs/obs-mmx-degrade-protocol.md), at the same
+// UNRECOVERABLE packet-loss rate into the path's degrade FSM (see
+// internal/degrade and docs/obs-mmx-degrade-protocol.md), at the same
 // 1-second cadence WHIP's own equivalent uses (degrade.SampleInterval) -
 // the FSM's trailing average window is calibrated assuming every caller
-// samples at that exact cadence. videoLayers is this connection's
-// multiplexed video track count (see runPublishReader's
-// mpegts.ValidateVideoTracks call), SRT's analog of WHIP's inbound
-// Simulcast track count.
+// samples at that exact cadence. Unrecoverable (lost minus what ARQ
+// retransmitted), not raw loss: raw loss is mostly recovered on healthy
+// links and would over-degrade (see unrecoverableAccumulator). videoLayers
+// is this connection's multiplexed video track count (see
+// runPublishReader's mpegts.ValidateVideoTracks call), SRT's analog of
+// WHIP's inbound Simulcast track count.
 func (c *conn) runDegradeSampling(sconn srt.Conn, pathName string, videoLayers int, done <-chan struct{}) {
 	c.degradeManager.ObserveSessionLayers(pathName, videoLayers)
 
@@ -518,17 +571,24 @@ func (c *conn) runDegradeSampling(sconn srt.Conn, pathName string, videoLayers i
 	defer ticker.Stop()
 
 	var st srt.Statistics
+	var acc unrecoverableAccumulator
 	for {
 		select {
 		case <-ticker.C:
 			sconn.Stats(&st)
-			c.degradeManager.RecordSample(pathName, st.Accumulated.PktRecvLoss, st.Accumulated.PktRecv, degrade.Thresholds{
-				DegradeInstantLossPct: c.degradeInstantLossPct,
-				DegradeAvgLossPct:     c.degradeAvgLossPct,
-				RecoverInstantLossPct: c.recoverInstantLossPct,
-				RecoverAvgLossPct:     c.recoverAvgLossPct,
-				ObservationSec:        c.degradeObservationSec,
-			})
+			if acc.add(st.Accumulated.PktRecvLoss, st.Accumulated.PktRecvRetrans, st.Accumulated.PktRecv) {
+				// Hand the FSM lost=unrecoverable,
+				// received=expected-unrecoverable, so the rate it
+				// computes is unrecoverable/expected (see
+				// unrecoverableAccumulator).
+				c.degradeManager.RecordSample(pathName, acc.unrecoverable, acc.expected-acc.unrecoverable, degrade.Thresholds{
+					DegradeInstantLossPct: c.degradeInstantLossPct,
+					DegradeAvgLossPct:     c.degradeAvgLossPct,
+					RecoverInstantLossPct: c.recoverInstantLossPct,
+					RecoverAvgLossPct:     c.recoverAvgLossPct,
+					ObservationSec:        c.degradeObservationSec,
+				})
+			}
 
 		case <-done:
 			return

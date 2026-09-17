@@ -667,6 +667,14 @@ type Conf struct {
 	// Requires WebRTC to also be enabled, since that's what serves the
 	// degrade WS channel (see Validate). See the WebRTCDegrade*/
 	// WebRTCRecover* comment above for why Degrade*/Recover* are split.
+	//
+	// SRT feeds the FSM its UNRECOVERABLE loss rate (lost minus what ARQ
+	// retransmitted - see internal/servers/srt conn.go's
+	// unrecoverableAccumulator), NOT raw loss: on a healthy-but-lossy link
+	// raw loss (5-10%) is mostly retransmitted away while unrecoverable
+	// loss stays ~0.1%, so triggering on raw loss bottoms the ladder out on
+	// a condition SRT is designed to absorb. These are 0-100 percentages
+	// applied to that unrecoverable rate.
 	SRTDegradeEnable         bool    `json:"srtDegradeEnable"`
 	SRTDegradeInstantLossPct float64 `json:"srtDegradeInstantLossPct"`
 	SRTDegradeAvgLossPct     float64 `json:"srtDegradeAvgLossPct"`
@@ -897,7 +905,8 @@ func (conf *Conf) setDefaults() {
 	conf.SRTLossDisconnectSec = 120
 	// Same starting numbers as WebRTCDegrade*'s own defaults below, absent
 	// any SRT-specific tuning data yet - independently adjustable per
-	// protocol once real-world loss characteristics diverge.
+	// protocol once real-world loss characteristics diverge. Applied to
+	// SRT's UNRECOVERABLE loss rate (see SRTDegradeEnable above).
 	conf.SRTDegradeEnable = false
 	conf.SRTDegradeInstantLossPct = 5.0
 	conf.SRTDegradeAvgLossPct = 1.0

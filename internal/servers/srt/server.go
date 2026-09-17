@@ -182,8 +182,12 @@ type Server struct {
 	// the webrtc.Server that actually serves the degrade WS channel - nil
 	// when WebRTC is disabled, in which case DegradeEnable is forced false
 	// by the caller (there would be nowhere for the executor to connect).
-	DegradeManager        *degrade.Manager
-	DegradeEnable         bool
+	DegradeManager *degrade.Manager
+	DegradeEnable  bool
+	// DegradeInstantLossPct/DegradeAvgLossPct (and the Recover* pair below)
+	// are applied to the connection's UNRECOVERABLE loss rate, not raw SRT
+	// loss - see runDegradeSampling/unrecoverableAccumulator in conn.go for
+	// why.
 	DegradeInstantLossPct float64
 	DegradeAvgLossPct     float64
 	// RecoverInstantLossPct/RecoverAvgLossPct are the hysteresis "recover"

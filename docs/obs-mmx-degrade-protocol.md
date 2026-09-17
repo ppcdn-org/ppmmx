@@ -27,6 +27,7 @@ maxLayers-1 / 码率100%
 规则：
 - 单向阶梯，一次只走一级，不允许跨级跳变。
 - **降级、恢复阈值分开配置（滞回/gap）**：丢包率超过 `Degrade*` 阈值才计入降级观察，跌回 `Recover*` 阈值（含）以下才计入恢复观察；`Recover* < Degrade*` 时中间留一段"死区"——瞬时/均值丢包率落在死区内既不计入降级也不计入恢复，只是让已经在跑的计时器继续计时，不会被这一个样本重置或提前触发，避免丢包率贴着单一阈值来回抖动导致反复升降级。`Recover* == Degrade*`（默认）等价于旧的单阈值行为，死区宽度为 0。实现见 [internal/degrade](../internal/degrade)（WHIP/SRT 各自独立配置数值，共用同一套状态机/WS 通道）。
+- **SRT 侧喂给状态机的是"不可恢复丢包率"，不是原始丢包率**：原始丢包里绝大部分会被 SRT ARQ 重传补回（实测健康链路上 ~5–10% raw vs ~0.1% unrecoverable），按原始丢包触发会在链路其实正常时就把阶梯一路降到底。SRT 输入取 `PktRecvLoss - PktRecvRetrans` 的每 1s 增量并累积成单调计数（见 [internal/servers/srt/conn.go](../internal/servers/srt/conn.go) 的 `unrecoverableAccumulator`）。WHIP 侧仍按 RTP 丢包计算（见 `二、mmx 任务`）。
 - 终止态（1层/码率80%仍不合规）不再自动继续降码率，只记日志/告警，交人工处理。
 - 每次状态转移后进入观察期（`ObservationSec`，默认60s），期间不做新判断。
 - maxLayers 未知时（该 path 还没有任何真实推流会话上报过层数）状态机不做任何降级动作。
@@ -41,7 +42,7 @@ maxLayers-1 / 码率100%
 
 ## 二、mmx 任务
 
-1. **丢包率计算**：每个 WHIP（publish）session，每 1s 采样 `InboundRTPPackets`/`InboundRTPPacketsLost`（已有字段，见 [internal/servers/webrtc/session.go](../internal/servers/webrtc/session.go)）差分算出瞬时丢包率，维护 5 分钟滑动窗口算出均值丢包率。
+1. **丢包率计算**：每个 WHIP（publish）session，每 1s 采样 `InboundRTPPackets`/`InboundRTPPacketsLost`（已有字段，见 [internal/servers/webrtc/session.go](../internal/servers/webrtc/session.go)）差分算出瞬时丢包率，维护 5 分钟滑动窗口算出均值丢包率。SRT 侧（[internal/servers/srt/conn.go](../internal/servers/srt/conn.go)）同样 1s 采样，但喂的是**不可恢复丢包率**（`PktRecvLoss - PktRecvRetrans` 的增量累积），不是 `PktRecvLoss` 原始值。
 2. **状态机**：按 path 维护 `{当前层级, 当前码率比例, 上次动作时间}`，跑上述状态机；WHIP session 重连后先查该 path 是否已有状态，有则延用，不重置。
 3. **新增 WS 端点**，路径与对应 WHIP 推流地址绑定（如 `ws://.../live/table1-fwv/ws/whip`，从 WHIP 推流地址 `.../live/table1-fwv/whip` 去掉 `/whip`、换成 `/ws/whip`，这也是 OBS 侧实测已经在用的推导方式）：
    - **鉴权**：固定共享密钥，不是签名/带过期时间的 token（那套复杂度是给外部公开 API 防重放用的，这个 WS 端点从头到尾只有 OBS 侧这一个可信客户端，不需要）。密钥就是 mmx 部署环境变量 `WHIP_WS_SECRET` 的值，两种方式任选一种带上：
