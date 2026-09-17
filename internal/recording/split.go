@@ -85,7 +85,7 @@ type AppSecretLookup interface {
 	AppSecret(appID string) (string, bool)
 }
 
-// SplitRecHandler handles POST /api/split-rec requests.
+// SplitRecHandler handles POST /api/record/split requests.
 type SplitRecHandler struct {
 	mgr                  *Manager
 	pathFinder           PathFinder
@@ -253,7 +253,7 @@ func (h *SplitRecHandler) ServeHTTP(c *gin.Context) {
 	if !h.checkRateLimit(ip) {
 		c.JSON(http.StatusTooManyRequests, errResp(429, "rate limit exceeded: max 500 req/s per IP per API", map[string]string{
 			"ip":   ip,
-			"path": "/api/split-rec",
+			"path": "/api/record/split",
 		}))
 		return
 	}

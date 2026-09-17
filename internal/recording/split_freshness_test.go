@@ -34,7 +34,7 @@ func simpleToken(secret string, req splitRecRequest) string {
 // after it.
 func serveSplitRec(h *SplitRecHandler, req splitRecRequest, headers map[string]string) *httptest.ResponseRecorder {
 	body, _ := json.Marshal(req)
-	httpReq := httptest.NewRequest(http.MethodPost, "/api/split-rec", bytes.NewReader(body))
+	httpReq := httptest.NewRequest(http.MethodPost, "/api/record/split", bytes.NewReader(body))
 	for k, v := range headers {
 		httpReq.Header.Set(k, v)
 	}

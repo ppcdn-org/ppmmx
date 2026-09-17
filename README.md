@@ -35,8 +35,8 @@ mmx 是基于 [MediaMTX](https://github.com/bluenviron/mediamtx) v1.19.1 二次�
 
 ### 按需录像控制 API
 
-- `POST /api/split-rec`:供上游业务系统(如 game-server)调用,按桌台/房间触发录像分段或启停,支持 `simple`(MD5)和 `advance`(HMAC-SHA256)两种鉴权模式;签名密钥不再是部署级共享密钥,而是调用方自己的 `appSecret`(mmx 每 30s 从 ppcenter 同步 appId→appSecret,见 `GET /internal/mmx/v1/app-credentials/sync`)。
-- 详见 [doc/api/api-split-rec.md](../doc/api/api-split-rec.md)。
+- `POST /api/record/split`:供上游业务系统(如 game-server)调用,按桌台/房间触发录像分段或启停,支持 `simple`(MD5)和 `advance`(HMAC-SHA256)两种鉴权模式;签名密钥不再是部署级共享密钥,而是调用方自己的 `appSecret`(mmx 每 30s 从 ppcenter 同步 appId→appSecret,见 `GET /internal/mmx/v1/app-credentials/sync`)。
+- 完整接口文档见 ppcdn 仓库 `docs/api/user-record-api.md`。
 
 ### 管理后台 + 双播放器
 

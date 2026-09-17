@@ -4,10 +4,10 @@
 简化后接入到 mmx (`internal/ingest`)。用途:从外部 CDN 拉流,推到 mmx 自己的本地
 RTMP 监听端口再生,让这条流像任何普通推流一样被本地的录像/分发/白名单逻辑处理。
 
-**按需启停,不是进程启动就一直拉。** 只有 `POST /api/split-rec` 的"录像开始"请求
+**按需启停,不是进程启动就一直拉。** 只有 `POST /api/record/split` 的"录像开始"请求
 (`gc` 为空)传进来、且对应 path 当前没有任何人在推流时,才会真的去拉;"录像结束"
 请求(`gc` 非空)传进来时,如果这条 path 是被 ingest 拉起来的,会跟着停掉。这一点
-和 v120 的 `StartGameStream`/`StopGameStream`(同样挂在 `/api/split-rec` 上)是
+和 v120 的 `StartGameStream`/`StopGameStream`(同样挂在 `/api/record/split` 上)是
 同一个触发点,只是 mmx 这边的 split-rec 协议本身比 v120 简单(没有单独的
 table-only 分支,`game` 必填)。
 
@@ -37,7 +37,7 @@ ingestSources:
 `ingestSources`/`ingestThreadEnable` 只在进程启动时读取一次;运行中改这两个字段
 需要重启进程才生效(不支持热重载)。
 
-## 触发方式:POST /api/split-rec
+## 触发方式:POST /api/record/split
 
 `internal/recording/split.go` 的 `SplitRecHandler.execute` 是唯一的触发点:
 
@@ -123,7 +123,7 @@ ffmpeg 真的连上 `play.example.com` 拉到流之后,立刻被转推逻辑重�
 
 ## 和 v120 参考实现的差异(有意简化,没有照抄)
 
-v120 的 `comm/tasks/ingestor.go` 通过 `/api/split-rec` 触发 `StartGameStream`/
+v120 的 `comm/tasks/ingestor.go` 通过 `/api/record/split` 触发 `StartGameStream`/
 `StopGameStream` 这一层(按需拉流/停止拉流)已经照着搬过来了。**没有**移植的是:
 
 - Nacos 热更新 `InputStreamList` 后动态增删 ingest(`ACT_RELOAD_INGEST` 等消息)。
@@ -131,7 +131,7 @@ v120 的 `comm/tasks/ingestor.go` 通过 `/api/split-rec` 触发 `StartGameStrea
   语义)——mmx 的 split-rec 本来就只有两态(`gc` 空/非空,`game` 必填),不需要
   额外照搬 v120 更复杂的状态机。
 - 通过 `GetTableStreamView` 解析 `table`(用于旧的 `recordApi` 的 `tableId`)——
-  当前 mmx 的录像走 `record: yes` + `/api/split-rec`,不需要这个字段,所以只保留
+  当前 mmx 的录像走 `record: yes` + `/api/record/split`,不需要这个字段,所以只保留
   了派生本地流名这一半逻辑。
 
 如果之后真的需要运行中动态增删源,再在这个基础上加,不要反过来假设这次已经支持。

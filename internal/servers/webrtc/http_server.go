@@ -95,7 +95,7 @@ func (s *httpServer) initialize() error {
 
 	// Recording API routes (before generic onRequest to avoid collision)
 	if s.parent.RecMgr != nil {
-		router.POST("/api/split-rec", func(c *gin.Context) {
+		router.POST("/api/record/split", func(c *gin.Context) {
 			s.parent.SplitHandler.ServeHTTP(c)
 		})
 	}

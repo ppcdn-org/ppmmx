@@ -178,7 +178,7 @@ func TestResolveController(t *testing.T) {
 // bypassing ServeHTTP's auth checks, which are covered separately in
 // split_auth_test.go.
 func newSplitRecGinContext() *gin.Context {
-	httpReq := httptest.NewRequest(http.MethodPost, "/api/split-rec", nil)
+	httpReq := httptest.NewRequest(http.MethodPost, "/api/record/split", nil)
 	rec := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(rec)
 	ctx.Request = httpReq

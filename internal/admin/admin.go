@@ -886,7 +886,7 @@ func (s *Server) Initialize() error {
 	if p := os.Getenv("LEGACY_HEALTH_PATH"); p != "" {
 		r.GET(p, s.healthHandler)
 	}
-	api.POST("/split-rec", func(c *gin.Context) { proxy.ServeHTTP(c.Writer, c.Request) })
+	api.POST("/record/split", func(c *gin.Context) { proxy.ServeHTTP(c.Writer, c.Request) })
 	r.GET("/test/token", func(c *gin.Context) {
 		c.String(http.StatusOK, "time=%d&token=not-implemented", time.Now().Unix()+180)
 	})

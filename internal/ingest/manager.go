@@ -22,7 +22,7 @@ type sourceConfig struct {
 // Manager resolves configured CDN sources to local paths and starts/stops an
 // ffmpeg pull-and-republish worker per path on demand - not at boot. A path
 // only starts pulling when something calls StartByPath for it (in practice,
-// SplitRecHandler on a POST /api/split-rec round-start for a path with no
+// SplitRecHandler on a POST /api/record/split round-start for a path with no
 // publisher already live), and stops when StopByPath is called or the
 // process shuts down.
 type Manager struct {

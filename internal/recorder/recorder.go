@@ -138,7 +138,7 @@ func (r *Recorder) Status() Status {
 }
 
 // SplitSegment closes the current recording instance and starts a new one.
-// Used by /api/split-rec: an empty renameTo just cuts a fresh segment
+// Used by /api/record/split: an empty renameTo just cuts a fresh segment
 // (round start); a non-empty renameTo additionally renames the segment
 // that was just closed to "<renameTo><ext>" (round end). It returns the
 // renamed file's path, or "" when renameTo is empty.

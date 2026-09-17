@@ -719,7 +719,7 @@ func (p *Core) createResources(initial bool) error {
 	// initial boot, not re-evaluated on config reload - changing
 	// ingestSources or ingestThreadEnable requires a restart. Sources are
 	// only parsed here, not pulled yet: pulling starts on demand, triggered
-	// by a POST /api/split-rec round-start call for a path with no
+	// by a POST /api/record/split round-start call for a path with no
 	// publisher already live (see SplitRecHandler.execute), not at boot.
 	if initial && p.ingestMgr == nil && p.conf.IngestThreadEnable && len(p.conf.IngestSources) > 0 {
 		if !p.conf.RTMP {
@@ -747,7 +747,7 @@ func (p *Core) createResources(initial bool) error {
 		// NODE_ROLE_RECORDER node ever receives split-rec calls (see
 		// docs/api/recording.md - split-rec talks directly to
 		// mmx-recorder), so origin/edge nodes have no use for
-		// data/recordings.db or /api/split-rec at all; creating it
+		// data/recordings.db or /api/record/split at all; creating it
 		// unconditionally on every role just left an unused sqlite file on
 		// every node's disk.
 		if p.recMgr == nil && p.conf.MMXNodeRole == "NODE_ROLE_RECORDER" {
