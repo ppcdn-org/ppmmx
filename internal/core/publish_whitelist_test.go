@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -164,6 +165,44 @@ func TestAppPublishWhitelistStartStopIsIdempotentAndSafe(t *testing.T) {
 	w := newTestWhitelist(&fakeAppFetcher{appIDs: []string{"app1"}})
 	w.start()
 	w.stop()
+}
+
+// TestAppPublishWhitelistRevokesRemovedApp covers the arrears backstop: an
+// appId that disappears from a successful sync fires the revocation callback
+// exactly once, while a cold start (empty previous cache) and a failed fetch
+// must never revoke anything.
+func TestAppPublishWhitelistRevokesRemovedApp(t *testing.T) {
+	fetcher := &fakeAppFetcher{appIDs: []string{"app1", "app2"}}
+	w := newTestWhitelist(fetcher)
+
+	var mu sync.Mutex
+	var revoked []string
+	w.SetRevocationHandler(func(appID string) {
+		mu.Lock()
+		revoked = append(revoked, appID)
+		mu.Unlock()
+	})
+
+	// Cold start: empty previous cache, so nothing is revoked even though the
+	// sync brings in apps for the first time.
+	w.refresh()
+	mu.Lock()
+	require.Empty(t, revoked)
+	mu.Unlock()
+
+	// app1 stops appearing -> revoked once.
+	fetcher.appIDs = []string{"app2"}
+	w.refresh()
+	mu.Lock()
+	require.Equal(t, []string{"app1"}, revoked)
+	mu.Unlock()
+
+	// A failed refresh keeps the cache and must not revoke.
+	fetcher.err = errFakeFetch
+	w.refresh()
+	mu.Lock()
+	require.Equal(t, []string{"app1"}, revoked)
+	mu.Unlock()
 }
 
 // TestAppPublishWhitelistAppSecret covers the same cache also backing

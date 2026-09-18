@@ -301,6 +301,131 @@ func TestClientResetsBackoffAfterStableSession(t *testing.T) {
 		"backoff should reset to ~1s after a stable session instead of staying at the ~4s it would otherwise have grown to (gap was %v)", gapAfterStable)
 }
 
+// TestClientHandlesPushedCommand verifies the WS push path end to end: ppcenter
+// sends a NodeMsgReq, the configured handler runs, and a matching NodeMsgRsp
+// (paired by msgId) is written back so ppcenter's SendNodeMsgReq returns
+// instead of timing out.
+func TestClientHandlesPushedCommand(t *testing.T) {
+	responses := make(chan nodeMsgRspFields, 1)
+	server := newControlServer(t, func(conn *websocket.Conn) {
+		if _, _, err := conn.ReadMessage(); err != nil {
+			return
+		}
+		_ = conn.WriteMessage(websocket.BinaryMessage, registerAck(true, ""))
+		_ = conn.WriteMessage(websocket.BinaryMessage, nodeMsgReq(
+			"COMMAND_TYPE_DISCONNECT_APP", "app-arrears", "msg-1"))
+		_, data, err := conn.ReadMessage()
+		if err != nil {
+			return
+		}
+		responses <- decodeNodeMsgRsp(t, data)
+	})
+	defer server.Close()
+
+	received := make(chan NodeCommand, 1)
+	client := New(context.Background(), Config{
+		URL: strings.Replace(server.URL, "http://", "ws://", 1), NodeSecret: "node-secret",
+		NodeType: "NODE_ROLE_ORIGIN", Region: "Tokyo", Capacity: 10, HeartbeatInterval: time.Hour,
+		OnCommand: func(cmd NodeCommand) (int32, string) {
+			received <- cmd
+			return 0, "closed=2"
+		},
+	}, func() []string { return nil }, testLogger{})
+	defer client.Close()
+
+	cmd := awaitCommand(t, received)
+	require.Equal(t, "COMMAND_TYPE_DISCONNECT_APP", cmd.MsgType)
+	require.Equal(t, "app-arrears", cmd.StreamPath)
+	require.Equal(t, "msg-1", cmd.MsgID)
+
+	rsp := awaitResponse(t, responses)
+	require.Equal(t, "COMMAND_TYPE_RESPONSE", rsp.msgType)
+	require.Equal(t, int32(0), rsp.code)
+	require.Equal(t, "msg-1", rsp.msgID)
+	require.Equal(t, "closed=2", rsp.reason)
+}
+
+func TestDecodeNodeMsgReqIgnoresNodeOriginatedTypes(t *testing.T) {
+	_, ok := decodeNodeMsgReq(marshalStringField(nil, 1, "COMMAND_TYPE_HEARTBEAT"))
+	require.False(t, ok, "a heartbeat must never decode as a command")
+
+	_, ok = decodeNodeMsgReq(marshalStringField(nil, 1, "COMMAND_TYPE_REGISTER_ACK"))
+	require.False(t, ok, "a register ack must never decode as a command")
+
+	cmd, ok := decodeNodeMsgReq(nodeMsgReq("COMMAND_TYPE_DISCONNECT_APP", "app-1", "m1"))
+	require.True(t, ok)
+	require.Equal(t, NodeCommand{MsgType: "COMMAND_TYPE_DISCONNECT_APP", StreamPath: "app-1", MsgID: "m1"}, cmd)
+}
+
+type nodeMsgRspFields struct {
+	msgType string
+	code    int32
+	reason  string
+	msgID   string
+}
+
+func decodeNodeMsgRsp(t *testing.T, data []byte) nodeMsgRspFields {
+	t.Helper()
+	var out nodeMsgRspFields
+	for len(data) > 0 {
+		number, _, n := protowire.ConsumeTag(data)
+		require.Greater(t, n, 0)
+		data = data[n:]
+		if number == 4 {
+			value, n := protowire.ConsumeVarint(data)
+			require.Greater(t, n, 0)
+			out.code = int32(protowire.DecodeZigZag(value))
+			data = data[n:]
+			continue
+		}
+		value, n := protowire.ConsumeString(data)
+		require.Greater(t, n, 0)
+		data = data[n:]
+		switch number {
+		case 1:
+			out.msgType = value
+		case 5:
+			out.reason = value
+		case 6:
+			out.msgID = value
+		}
+	}
+	return out
+}
+
+func nodeMsgReq(msgType, streamPath, msgID string) []byte {
+	out := marshalStringField(nil, 1, msgType)
+	out = marshalStringField(out, 4, streamPath)
+	return marshalStringField(out, 6, msgID)
+}
+
+func marshalStringField(out []byte, number protowire.Number, value string) []byte {
+	out = protowire.AppendTag(out, number, protowire.BytesType)
+	return protowire.AppendString(out, value)
+}
+
+func awaitCommand(t *testing.T, commands <-chan NodeCommand) NodeCommand {
+	t.Helper()
+	select {
+	case cmd := <-commands:
+		return cmd
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for command")
+		return NodeCommand{}
+	}
+}
+
+func awaitResponse(t *testing.T, responses <-chan nodeMsgRspFields) nodeMsgRspFields {
+	t.Helper()
+	select {
+	case rsp := <-responses:
+		return rsp
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for command response")
+		return nodeMsgRspFields{}
+	}
+}
+
 func newControlServer(t *testing.T, handle func(*websocket.Conn)) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

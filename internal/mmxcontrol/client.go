@@ -54,7 +54,30 @@ type Config struct {
 	WebRTCBaseURL         string
 	PublishURL            string
 	ABRNegotiationAddress string
+
+	// OnCommand handles a control command pushed by ppcenter over the
+	// established control WebSocket (NodeMsgReq) or drained from the HTTP
+	// fallback's /commands/pending queue. It returns a NodeMsgRsp code
+	// (0 = success) and a human-readable reason. nil means the node answers
+	// every command with "not supported". See
+	// docs/design/ppcdn-arrears-session-revocation.zh-CN.md.
+	OnCommand CommandHandler
 }
+
+// NodeCommand is one control command from ppcenter. MsgType mirrors the
+// COMMAND_TYPE_* string; StreamPath carries the command's argument (for
+// COMMAND_TYPE_DISCONNECT_APP it is the appId whose sessions must close);
+// MsgID pairs a WS command with its response.
+type NodeCommand struct {
+	MsgType    string
+	StreamPath string
+	MsgID      string
+}
+
+// CommandHandler processes a NodeCommand. It must be safe to call from the
+// control connection's read loop (WS push) or the fallback loop (HTTP poll),
+// never both at once for a single node.
+type CommandHandler func(cmd NodeCommand) (int32, string)
 
 // Client sends registration and heartbeat indications to ppcenter.
 type Client struct {
@@ -65,6 +88,12 @@ type Client struct {
 	done     chan struct{}
 	once     sync.Once
 	fallback *HTTPFallbackClient
+
+	// writeMu serializes writes to the control WebSocket. Commands pushed by
+	// ppcenter are handled (and answered) from the connection's read
+	// goroutine, while registration and heartbeats are written from the
+	// owning goroutine; gorilla/websocket allows only one concurrent writer.
+	writeMu sync.Mutex
 
 	// outageLogged suppresses the "connection lost" / "falling back to
 	// HTTP" / "fallback heartbeat|poll failed" lines on retries after the
@@ -202,11 +231,15 @@ func (c *Client) runFallback(ctx context.Context) bool {
 			}
 			return false
 		}
-		if _, pollErr := c.fallback.PollCommands(ctx); pollErr != nil {
+		polled, pollErr := c.fallback.PollCommands(ctx)
+		if pollErr != nil {
 			if !c.outageLogged {
 				c.parent.Log(logger.Warn, "MMX HTTP fallback poll failed: %v", pollErr)
 			}
 			return false
+		}
+		for _, cmd := range polled {
+			c.invokeCommand(cmd)
 		}
 		select {
 		case <-ctx.Done():
@@ -263,14 +296,15 @@ func (c *Client) connect(ctx context.Context) error {
 					ack <- errors.New("MMX node registration rejected: " + reason)
 					return
 				}
+				continue
+			}
+			if cmd, ok := decodeNodeMsgReq(data); ok {
+				c.respondToCommand(conn, cmd)
 			}
 		}
 	}()
 
-	if err := func() error {
-		conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-		return conn.WriteMessage(websocket.BinaryMessage, c.registration())
-	}(); err != nil {
+	if err := c.writeMessage(conn, c.registration()); err != nil {
 		return err
 	}
 	select {
@@ -286,8 +320,7 @@ func (c *Client) connect(ctx context.Context) error {
 	registeredAt = time.Now()
 
 	sendHeartbeat := func() error {
-		conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-		return conn.WriteMessage(websocket.BinaryMessage, c.heartbeat())
+		return c.writeMessage(conn, c.heartbeat())
 	}
 
 	ticker := time.NewTicker(c.config.HeartbeatInterval)
@@ -306,6 +339,39 @@ func (c *Client) connect(ctx context.Context) error {
 			}
 		}
 	}
+}
+
+// writeMessage serializes a binary write to the control WebSocket. Command
+// responses come from the read goroutine while heartbeats come from the
+// owning goroutine, and gorilla/websocket permits only one concurrent writer.
+func (c *Client) writeMessage(conn *websocket.Conn, body []byte) error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+	return conn.WriteMessage(websocket.BinaryMessage, body)
+}
+
+// respondToCommand handles a command pushed over the WS and answers with a
+// NodeMsgRsp so ppcenter's SendNodeMsgReq returns promptly instead of waiting
+// for its timeout.
+func (c *Client) respondToCommand(conn *websocket.Conn, cmd NodeCommand) {
+	code, reason := c.invokeCommand(cmd)
+	resp := marshalNodeMsgRsp(cmd.MsgID, code, reason)
+	if err := c.writeMessage(conn, resp); err != nil {
+		c.parent.Log(logger.Warn, "MMX control command response write failed: %v", err)
+	}
+}
+
+// invokeCommand runs the configured handler, or reports "not supported".
+func (c *Client) invokeCommand(cmd NodeCommand) (int32, string) {
+	if c.config.OnCommand == nil {
+		c.parent.Log(logger.Warn, "MMX control received %s but no command handler is configured", cmd.MsgType)
+		return 1, "command handler not configured"
+	}
+	code, reason := c.config.OnCommand(cmd)
+	c.parent.Log(logger.Info, "MMX control command %s arg=%q result code=%d reason=%q",
+		cmd.MsgType, cmd.StreamPath, code, reason)
+	return code, reason
 }
 
 func (c *Client) registration() []byte {
@@ -341,6 +407,60 @@ func (c *Client) heartbeat() []byte {
 		out = appendString(out, 3, pipeline)
 	}
 	return out
+}
+
+// decodeNodeMsgReq parses a NodeMsgReq pushed by ppcenter. It deliberately
+// ignores node->ppcenter message types, so a heartbeat can never be mistaken
+// for a command even if the read loop ever sees one.
+func decodeNodeMsgReq(data []byte) (NodeCommand, bool) {
+	var cmd NodeCommand
+	for len(data) > 0 {
+		number, wireType, n := protowire.ConsumeTag(data)
+		if n < 0 {
+			return NodeCommand{}, false
+		}
+		data = data[n:]
+		switch number {
+		case 1, 4, 6:
+			value, n := protowire.ConsumeString(data)
+			if n < 0 {
+				return NodeCommand{}, false
+			}
+			switch number {
+			case 1:
+				cmd.MsgType = value
+			case 4:
+				cmd.StreamPath = value
+			case 6:
+				cmd.MsgID = value
+			}
+			data = data[n:]
+		default:
+			n := protowire.ConsumeFieldValue(number, wireType, data)
+			if n < 0 {
+				return NodeCommand{}, false
+			}
+			data = data[n:]
+		}
+	}
+	switch cmd.MsgType {
+	case "", "COMMAND_TYPE_REGISTER", "COMMAND_TYPE_HEARTBEAT",
+		"COMMAND_TYPE_INDICATION", "COMMAND_TYPE_REGISTER_ACK", "COMMAND_TYPE_RESPONSE":
+		return NodeCommand{}, false
+	}
+	return cmd, true
+}
+
+// marshalNodeMsgRsp builds a NodeMsgRsp. code is sint32 on the wire (zigzag),
+// so it must be zigzag-encoded; workerType/workerId are omitted because
+// ppcenter pairs responses by msgId alone.
+func marshalNodeMsgRsp(msgID string, code int32, reason string) []byte {
+	var out []byte
+	out = appendString(out, 1, "COMMAND_TYPE_RESPONSE")
+	out = protowire.AppendTag(out, 4, protowire.VarintType)
+	out = protowire.AppendVarint(out, protowire.EncodeZigZag(int64(code)))
+	out = appendString(out, 5, reason)
+	return appendString(out, 6, msgID)
 }
 
 func decodeNodeRegisterAck(data []byte) (accepted bool, reason string, ok bool) {

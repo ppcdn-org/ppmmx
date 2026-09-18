@@ -13,10 +13,10 @@ import (
 )
 
 type HTTPFallbackClient struct {
-	baseURL  string
-	token    string
-	client   *http.Client
-	indicate func() []byte
+	baseURL   string
+	token     string
+	client    *http.Client
+	indicate  func() []byte
 	logParent logger.Writer
 }
 
@@ -25,10 +25,10 @@ func NewHTTPFallbackClient(baseURL, token string, timeout time.Duration, indicat
 		timeout = 10 * time.Second
 	}
 	return &HTTPFallbackClient{
-		baseURL:  strings.TrimRight(strings.TrimSpace(baseURL), "/"),
-		token:    token,
-		client:   &http.Client{Timeout: timeout},
-		indicate: indicate,
+		baseURL:   strings.TrimRight(strings.TrimSpace(baseURL), "/"),
+		token:     token,
+		client:    &http.Client{Timeout: timeout},
+		indicate:  indicate,
 		logParent: logParent,
 	}
 }
@@ -51,11 +51,10 @@ func (h *HTTPFallbackClient) Heartbeat(ctx context.Context) error {
 	return nil
 }
 
-func (h *HTTPFallbackClient) PollCommands(ctx context.Context) ([]struct {
-	ID      string `json:"id"`
-	Type    string `json:"type"`
-	Payload string `json:"payload,omitempty"`
-}, error) {
+// PollCommands drains ppcenter's per-node fallback command queue. ppcenter
+// only enqueues here when the control WebSocket push failed, so the node keeps
+// receiving commands while its WS link is down.
+func (h *HTTPFallbackClient) PollCommands(ctx context.Context) ([]NodeCommand, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, h.baseURL+"/commands/pending", nil)
 	if err != nil {
 		return nil, err
@@ -79,5 +78,13 @@ func (h *HTTPFallbackClient) PollCommands(ctx context.Context) ([]struct {
 	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
 		return nil, err
 	}
-	return body.Commands, nil
+	commands := make([]NodeCommand, 0, len(body.Commands))
+	for _, cmd := range body.Commands {
+		commands = append(commands, NodeCommand{
+			MsgType:    cmd.Type,
+			StreamPath: cmd.Payload,
+			MsgID:      cmd.ID,
+		})
+	}
+	return commands, nil
 }

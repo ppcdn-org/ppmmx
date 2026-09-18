@@ -895,6 +895,7 @@ func (p *Core) createResources(initial bool) error {
 			WebRTCBaseURL:         p.conf.MMXWebRTCBaseURL,
 			PublishURL:            p.conf.MMXPublishURL,
 			ABRNegotiationAddress: p.conf.MMXABRNegotiationAddress,
+			OnCommand:             p.handleControlCommand,
 		}, func() []string { return nil }, p)
 		p.mmxControl.SetHTTPFallback(mmxcontrol.DeriveFallbackURL(p.conf.MMXControlURL),
 			p.conf.MMXNodeSecret, 10*time.Second)
@@ -933,6 +934,12 @@ func (p *Core) createResources(initial bool) error {
 				p.conf.MMXNodeSecret,
 				10*time.Second,
 			), p)
+		// Anti-arrears backstop: when ppcenter's eligible-app list drops an
+		// app, close its live sessions on this node (see
+		// docs/design/ppcdn-arrears-session-revocation.zh-CN.md). This works
+		// independently of the ppcenter command push, so revocation lands
+		// within one sync interval even when pipelines aren't reported.
+		p.publishWhitelist.SetRevocationHandler(p.handleAppRevoked)
 		p.publishWhitelist.start()
 		p.pathManager.SetAdminStore(p.publishWhitelist)
 		if p.splitHandler != nil {
@@ -1776,6 +1783,39 @@ func (p *Core) APIConfigSet(conf *conf.Conf) {
 	case p.chAPIConfigSet <- conf:
 	case <-p.ctx.Done():
 	}
+}
+
+// handleControlCommand executes a command pushed by ppcenter over the control
+// WebSocket (see mmxcontrol.CommandHandler). The only command defined today is
+// COMMAND_TYPE_DISCONNECT_APP, which cuts every live WHIP/WHEP session of one
+// app after its account went into arrears - see
+// docs/design/ppcdn-arrears-session-revocation.zh-CN.md.
+func (p *Core) handleControlCommand(cmd mmxcontrol.NodeCommand) (int32, string) {
+	switch cmd.MsgType {
+	case "COMMAND_TYPE_DISCONNECT_APP":
+		appID := strings.TrimSpace(cmd.StreamPath)
+		if appID == "" {
+			return 1, "empty appId"
+		}
+		if p.webRTCServer == nil {
+			return 1, "webrtc server unavailable"
+		}
+		closed := p.webRTCServer.CloseSessionsForApp(appID)
+		return 0, fmt.Sprintf("closed=%d", closed)
+	default:
+		return 1, "unsupported command: " + cmd.MsgType
+	}
+}
+
+// handleAppRevoked is the publish-whitelist backstop for the same condition
+// handleControlCommand handles by push: an app disappeared from ppcenter's
+// eligible list (arrears/deleted), so its live sessions must be closed.
+func (p *Core) handleAppRevoked(appID string) {
+	if p.webRTCServer == nil {
+		return
+	}
+	closed := p.webRTCServer.CloseSessionsForApp(appID)
+	p.Log(logger.Info, "[publish-whitelist] app %s no longer eligible, closed %d live session(s)", appID, closed)
 }
 
 func portFromAddress(addr string) (string, error) {

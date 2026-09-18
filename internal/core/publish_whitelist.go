@@ -61,6 +61,22 @@ type appPublishWhitelist struct {
 	apps   map[string]string // appId -> appSecret
 	stopCh chan struct{}
 	doneCh chan struct{}
+
+	// onRevoked, if set, is called (outside the lock) for each appId that
+	// disappears from a *successful* refresh, so the node can close that
+	// app's live WHIP/WHEP sessions immediately rather than waiting for the
+	// publisher/viewer to reconnect. AppIds absent from the previous snapshot
+	// are never reported, so a cold start (empty cache -> first sync) cannot
+	// cut anything. See docs/design/ppcdn-arrears-session-revocation.zh-CN.md.
+	onRevoked func(appID string)
+}
+
+// SetRevocationHandler installs the whitelist-diff revocation callback. Call
+// it once before start().
+func (w *appPublishWhitelist) SetRevocationHandler(fn func(appID string)) {
+	w.mu.Lock()
+	w.onRevoked = fn
+	w.mu.Unlock()
 }
 
 // newAppPublishWhitelist creates the whitelist but does not start polling -
@@ -129,8 +145,19 @@ func (w *appPublishWhitelist) refresh() {
 		next[cred.AppID] = cred.AppSecret
 	}
 	w.mu.Lock()
+	previous := w.apps
 	w.apps = next
+	onRevoked := w.onRevoked
 	w.mu.Unlock()
+
+	if onRevoked == nil || len(previous) == 0 {
+		return
+	}
+	for appID := range previous {
+		if _, stillAllowed := next[appID]; !stillAllowed {
+			onRevoked(appID)
+		}
+	}
 }
 
 func (w *appPublishWhitelist) appAllowed(appID string) bool {

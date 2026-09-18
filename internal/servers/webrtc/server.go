@@ -14,6 +14,7 @@ import (
 	"reflect"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -176,6 +177,11 @@ type deleteSessionReq struct {
 	res    chan deleteSessionRes
 }
 
+type closeSessionsForAppReq struct {
+	appID string
+	res   chan int
+}
+
 type serverMetrics interface {
 	SetWebRTCServer(defs.APIWebRTCServer)
 }
@@ -297,6 +303,7 @@ type Server struct {
 	chCloseSession         chan *session
 	chAddSessionCandidates chan addSessionCandidatesReq
 	chDeleteSession        chan deleteSessionReq
+	chCloseSessionsForApp  chan closeSessionsForAppReq
 	chAPISessionsList      chan serverAPISessionsListReq
 	chAPISessionsGet       chan serverAPISessionsGetReq
 	chAPIConnsKick         chan serverAPISessionsKickReq
@@ -319,6 +326,7 @@ func (s *Server) Initialize() error {
 	s.chCloseSession = make(chan *session)
 	s.chAddSessionCandidates = make(chan addSessionCandidatesReq)
 	s.chDeleteSession = make(chan deleteSessionReq)
+	s.chCloseSessionsForApp = make(chan closeSessionsForAppReq)
 	s.chAPISessionsList = make(chan serverAPISessionsListReq)
 	s.chAPISessionsGet = make(chan serverAPISessionsGetReq)
 	s.chAPIConnsKick = make(chan serverAPISessionsKickReq)
@@ -497,6 +505,19 @@ outer:
 			sx.Close()
 
 			req.res <- deleteSessionRes{}
+
+		case req := <-s.chCloseSessionsForApp:
+			closed := 0
+			for sx := range s.sessions {
+				if !pathBelongsToApp(sx.pathName, req.appID) {
+					continue
+				}
+				delete(s.sessions, sx)
+				delete(s.sessionsBySecret, sx.secret)
+				sx.Close()
+				closed++
+			}
+			req.res <- closed
 
 		case req := <-s.chAPISessionsList:
 			data := &defs.APIWebRTCSessionList{
@@ -710,4 +731,40 @@ func (s *Server) APISessionsKick(uuid uuid.UUID) error {
 	case <-s.ctx.Done():
 		return fmt.Errorf("terminated")
 	}
+}
+
+// CloseSessionsForApp closes every WHIP publish and WHEP reader session whose
+// path belongs to appID, returning how many were closed. ppcenter calls this
+// (via a control command) to cut an app's live connections the moment its
+// account can no longer be served - balance reached zero / status arrears -
+// instead of only refusing new requests. See
+// docs/design/ppcdn-arrears-session-revocation.zh-CN.md.
+func (s *Server) CloseSessionsForApp(appID string) int {
+	appID = strings.TrimSpace(appID)
+	if appID == "" {
+		return 0
+	}
+	req := closeSessionsForAppReq{appID: appID, res: make(chan int, 1)}
+	select {
+	case s.chCloseSessionsForApp <- req:
+		return <-req.res
+	case <-s.ctx.Done():
+		return 0
+	}
+}
+
+// pathBelongsToApp reports whether a session path belongs to appID. Stream
+// paths are "{appId}/{streamName}[/{codec}]", so the appId segment has to
+// match exactly - a bare strings.HasPrefix would let appID "app1" also match
+// "app10/...".
+func pathBelongsToApp(pathName, appID string) bool {
+	pathName = strings.TrimSpace(pathName)
+	appID = strings.TrimSpace(appID)
+	if pathName == "" || appID == "" {
+		return false
+	}
+	if pathName == appID {
+		return true
+	}
+	return strings.HasPrefix(pathName, appID+"/")
 }
