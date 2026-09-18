@@ -364,12 +364,15 @@ func (c *conn) runReceiveStatsSummary(sconn srt.Conn, pathName string, done <-ch
 
 	// SRT's ARQ counterpart to the WHIP hops' NACK counters: retrans is
 	// packets ARQ recovered, drop is packets gosrt received but discarded
-	// (too late/duplicate/already-ACKed - not the same thing as loss that
-	// was never recovered at all; see the unrecoverableLoss comment below).
-	// Reporting all of them makes the SRT ingest hop and the WHIP forward
-	// hops directly comparable, instead of only the raw loss rate they
-	// already share.
+	// because they arrived too late to play (the application will never see
+	// them), and dup is duplicate packets discarded (already ACKed or
+	// already buffered). Neither drop nor dup is the same thing as loss
+	// that was never recovered at all; see the unrecoverableLoss comment
+	// below. Reporting all of them makes the SRT ingest hop and the WHIP
+	// forward hops directly comparable, instead of only the raw loss rate
+	// they already share.
 	lastRetrans, lastDrop := st.Accumulated.PktRecvRetrans, st.Accumulated.PktRecvDrop
+	lastDup := st.Accumulated.PktRecvDuplicate
 	lastBelated := st.Accumulated.PktRecvBelated
 	lastLoss := st.Accumulated.PktRecvLoss
 
@@ -396,9 +399,10 @@ func (c *conn) runReceiveStatsSummary(sconn srt.Conn, pathName string, done <-ch
 				var unrecoveredPct, recoverablePct float64
 				haveUnrecovered := false
 				if st.Accumulated.PktRecvRetrans >= lastRetrans && st.Accumulated.PktRecvDrop >= lastDrop &&
-					st.Accumulated.PktRecvLoss >= lastLoss {
+					st.Accumulated.PktRecvDuplicate >= lastDup && st.Accumulated.PktRecvLoss >= lastLoss {
 					dRetrans := st.Accumulated.PktRecvRetrans - lastRetrans
 					dDrop := st.Accumulated.PktRecvDrop - lastDrop
+					dDup := st.Accumulated.PktRecvDuplicate - lastDup
 					dLost := st.Accumulated.PktRecvLoss - lastLoss
 
 					// RTT (tens of ms) is far shorter than the 60s sample
@@ -418,8 +422,8 @@ func (c *conn) runReceiveStatsSummary(sconn srt.Conn, pathName string, done <-ch
 					}
 					haveUnrecovered = true
 
-					snap.Extra = fmt.Sprintf(" retrans=%d drop=%d unrecoverableLoss=%d(%.2f%%)",
-						dRetrans, dDrop, unrecovered, unrecoveredPct)
+					snap.Extra = fmt.Sprintf(" retrans=%d drop=%d dup=%d unrecoverableLoss=%d(%.2f%%)",
+						dRetrans, dDrop, dDup, unrecovered, unrecoveredPct)
 
 					// Feed the adaptive-latency evaluator (see
 					// docs/srt-adaptive-latency-design.md). Zero-traffic
@@ -430,7 +434,7 @@ func (c *conn) runReceiveStatsSummary(sconn srt.Conn, pathName string, done <-ch
 						c.latencyManager.Record(pathName, unrecoveredPct)
 					}
 				}
-				lastRetrans, lastDrop, lastLoss = st.Accumulated.PktRecvRetrans, st.Accumulated.PktRecvDrop, st.Accumulated.PktRecvLoss
+				lastRetrans, lastDrop, lastDup, lastLoss = st.Accumulated.PktRecvRetrans, st.Accumulated.PktRecvDrop, st.Accumulated.PktRecvDuplicate, st.Accumulated.PktRecvLoss
 
 				// Link diagnostics, to tell a bandwidth ceiling apart from
 				// the other things that produce the same loss figure:

@@ -69,12 +69,13 @@ type APISRTConn struct {
 	// The total accumulated time in microseconds, during which the SRT sender has some data to transmit,
 	// including packets that have been sent, but not yet acknowledged
 	UsSndDuration uint64 `json:"usSndDuration"`
-	// ??
+	// The total number of packets that arrive too late
 	PacketsReceivedBelated uint64 `json:"packetsReceivedBelated"`
 	// The total number of dropped by the SRT sender DATA packets that have no chance to be delivered in time
 	PacketsSendDrop uint64 `json:"packetsSendDrop"`
-	// The total number of dropped by the SRT receiver and, as a result,
-	// not delivered to the upstream application DATA packets
+	// The total number of packets dropped by the SRT receiver because they
+	// arrived too late to be scheduled for delivery to the upstream
+	// application (does not include duplicates)
 	PacketsReceivedDrop uint64 `json:"packetsReceivedDrop"`
 	// The total number of packets that failed to be decrypted at the receiver side
 	PacketsReceivedUndecrypt uint64 `json:"packetsReceivedUndecrypt"`

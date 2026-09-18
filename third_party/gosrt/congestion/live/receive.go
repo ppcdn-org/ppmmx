@@ -195,8 +195,8 @@ func (r *receiver) Push(pkt packet.Packet) {
 
 	if pkt.Header().PacketSequenceNumber.Lt(r.lastACKSequenceNumber) {
 		// Already acknowledged, ignoring
-		r.statistics.PktDrop++
-		r.statistics.ByteDrop += pktLen
+		r.statistics.PktDuplicate++
+		r.statistics.ByteDuplicate += pktLen
 
 		return
 	}
@@ -211,8 +211,8 @@ func (r *receiver) Push(pkt packet.Packet) {
 
 			if p.Header().PacketSequenceNumber == pkt.Header().PacketSequenceNumber {
 				// Already received (has been sent more than once), ignoring
-				r.statistics.PktDrop++
-				r.statistics.ByteDrop += pktLen
+				r.statistics.PktDuplicate++
+				r.statistics.ByteDuplicate += pktLen
 
 				break
 			} else if p.Header().PacketSequenceNumber.Gt(pkt.Header().PacketSequenceNumber) {

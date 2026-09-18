@@ -34,7 +34,8 @@ type StatisticsAccumulated struct {
 	UsSndDuration    uint64 // The total accumulated time in microseconds, during which the SRT sender has some data to transmit, including packets that have been sent, but not yet acknowledged
 	PktRecvBelated   uint64
 	PktSendDrop      uint64 // The total number of dropped by the SRT sender DATA packets that have no chance to be delivered in time
-	PktRecvDrop      uint64 // The total number of dropped by the SRT receiver and, as a result, not delivered to the upstream application DATA packets
+	PktRecvDrop      uint64 // The total number of DATA packets dropped by the SRT receiver because they arrived too late to be delivered to the upstream application
+	PktRecvDuplicate uint64 // The total number of duplicate DATA packets received (already acknowledged or already present in the receiver buffer) and discarded
 	PktRecvUndecrypt uint64 // The total number of packets that failed to be decrypted at the receiver side
 
 	ByteSent          uint64 // Same as pktSent, but expressed in bytes, including payload and all the headers (IP, TCP, SRT)
@@ -47,6 +48,7 @@ type StatisticsAccumulated struct {
 	ByteRecvBelated   uint64
 	ByteSendDrop      uint64 // Same as pktSendDrop, but expressed in bytes, including payload and all the headers (IP, TCP, SRT)
 	ByteRecvDrop      uint64 // Same as pktRecvDrop, but expressed in bytes, including payload and all the headers (IP, TCP, SRT)
+	ByteRecvDuplicate uint64 // Same as pktRecvDuplicate, but expressed in bytes, including payload and all the headers (IP, TCP, SRT)
 	ByteRecvUndecrypt uint64 // Same as pktRecvUndecrypt, but expressed in bytes, including payload and all the headers (IP, TCP, SRT)
 }
 
@@ -74,7 +76,8 @@ type StatisticsInterval struct {
 	PktReorderDistance uint64
 	PktRecvBelated     uint64 // Number of packets that arrive too late
 	PktSndDrop         uint64 // Number of dropped by the SRT sender DATA packets that have no chance to be delivered in time
-	PktRecvDrop        uint64 // Number of dropped by the SRT receiver and, as a result, not delivered to the upstream application DATA packets
+	PktRecvDrop        uint64 // Number of DATA packets dropped by the SRT receiver because they arrived too late to be delivered to the upstream application
+	PktRecvDuplicate   uint64 // Number of duplicate DATA packets received (already acknowledged or already present in the receiver buffer) and discarded
 	PktRecvUndecrypt   uint64 // Number of packets that failed to be decrypted at the receiver side
 
 	ByteSent          uint64 // Same as pktSent, but expressed in bytes, including payload and all the headers (IP, TCP, SRT)
@@ -87,6 +90,7 @@ type StatisticsInterval struct {
 	ByteRecvBelated   uint64 // Same as pktRecvBelated, but expressed in bytes, including payload and all the headers (IP, TCP, SRT)
 	ByteSendDrop      uint64 // Same as pktSendDrop, but expressed in bytes, including payload and all the headers (IP, TCP, SRT)
 	ByteRecvDrop      uint64 // Same as pktRecvDrop, but expressed in bytes, including payload and all the headers (IP, TCP, SRT)
+	ByteRecvDuplicate uint64 // Same as pktRecvDuplicate, but expressed in bytes, including payload and all the headers (IP, TCP, SRT)
 	ByteRecvUndecrypt uint64 // Same as pktRecvUndecrypt, but expressed in bytes, including payload and all the headers (IP, TCP, SRT)
 }
 

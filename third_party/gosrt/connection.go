@@ -1450,6 +1450,8 @@ func (c *srtConn) Stats(s *Statistics) {
 		UsSndDuration:     send.UsSndDuration,
 		PktSendDrop:       send.PktDrop,
 		PktRecvDrop:       recv.PktDrop,
+		PktRecvBelated:    recv.PktBelated,
+		PktRecvDuplicate:  recv.PktDuplicate,
 		PktRecvUndecrypt:  c.statistics.pktRecvUndecrypt,
 		ByteSent:          send.Byte + (send.Pkt * c.statistics.headerSize),
 		ByteRecv:          recv.Byte + (recv.Pkt * c.statistics.headerSize),
@@ -1460,6 +1462,8 @@ func (c *srtConn) Stats(s *Statistics) {
 		ByteRecvRetrans:   recv.ByteRetrans + (recv.PktRetrans * c.statistics.headerSize),
 		ByteSendDrop:      send.ByteDrop + (send.PktDrop * c.statistics.headerSize),
 		ByteRecvDrop:      recv.ByteDrop + (recv.PktDrop * c.statistics.headerSize),
+		ByteRecvBelated:   recv.ByteBelated + (recv.PktBelated * c.statistics.headerSize),
+		ByteRecvDuplicate: recv.ByteDuplicate + (recv.PktDuplicate * c.statistics.headerSize),
 		ByteRecvUndecrypt: c.statistics.byteRecvUndecrypt + (c.statistics.pktRecvUndecrypt * c.statistics.headerSize),
 	}
 
@@ -1485,6 +1489,7 @@ func (c *srtConn) Stats(s *Statistics) {
 		PktRecvBelated:     s.Accumulated.PktRecvBelated - previous.PktRecvBelated,
 		PktSndDrop:         s.Accumulated.PktSendDrop - previous.PktSendDrop,
 		PktRecvDrop:        s.Accumulated.PktRecvDrop - previous.PktRecvDrop,
+		PktRecvDuplicate:   s.Accumulated.PktRecvDuplicate - previous.PktRecvDuplicate,
 		PktRecvUndecrypt:   s.Accumulated.PktRecvUndecrypt - previous.PktRecvUndecrypt,
 		ByteSent:           s.Accumulated.ByteSent - previous.ByteSent,
 		ByteRecv:           s.Accumulated.ByteRecv - previous.ByteRecv,
@@ -1496,6 +1501,7 @@ func (c *srtConn) Stats(s *Statistics) {
 		ByteRecvBelated:    s.Accumulated.ByteRecvBelated - previous.ByteRecvBelated,
 		ByteSendDrop:       s.Accumulated.ByteSendDrop - previous.ByteSendDrop,
 		ByteRecvDrop:       s.Accumulated.ByteRecvDrop - previous.ByteRecvDrop,
+		ByteRecvDuplicate:  s.Accumulated.ByteRecvDuplicate - previous.ByteRecvDuplicate,
 		ByteRecvUndecrypt:  s.Accumulated.ByteRecvUndecrypt - previous.ByteRecvUndecrypt,
 	}
 

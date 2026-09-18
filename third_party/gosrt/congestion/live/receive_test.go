@@ -359,7 +359,7 @@ func TestRecvDropTooLate(t *testing.T) {
 	require.Equal(t, uint64(1), stats.PktDrop)
 }
 
-func TestRecvDropAlreadyACK(t *testing.T) {
+func TestRecvDuplicateAlreadyACK(t *testing.T) {
 	recv := mockLiveRecv(
 		nil,
 		nil,
@@ -401,10 +401,11 @@ func TestRecvDropAlreadyACK(t *testing.T) {
 
 	stats = recv.Stats()
 
-	require.Equal(t, uint64(1), stats.PktDrop)
+	require.Equal(t, uint64(0), stats.PktDrop)
+	require.Equal(t, uint64(1), stats.PktDuplicate)
 }
 
-func TestRecvDropAlreadyRecvNoACK(t *testing.T) {
+func TestRecvDuplicateAlreadyRecvNoACK(t *testing.T) {
 	recv := mockLiveRecv(
 		nil,
 		nil,
@@ -454,7 +455,8 @@ func TestRecvDropAlreadyRecvNoACK(t *testing.T) {
 
 	stats = recv.Stats()
 
-	require.Equal(t, uint64(1), stats.PktDrop)
+	require.Equal(t, uint64(0), stats.PktDrop)
+	require.Equal(t, uint64(1), stats.PktDuplicate)
 }
 
 func TestRecvFlush(t *testing.T) {
