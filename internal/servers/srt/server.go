@@ -177,6 +177,10 @@ type Server struct {
 	// silently degrading indefinitely.
 	LossDisconnectEnable bool
 	LossDisconnectSec    int
+	// PublishSessionReporter reports a publish connection's start/end to
+	// ppcenter (see publish_session_report.go). Nil when MMXControl isn't
+	// set up - same construction gating as the reporters above.
+	PublishSessionReporter publishSessionReporter
 	// DegradeManager is the shared per-path degrade FSM registry (see
 	// internal/degrade), constructed and owned by internal/core alongside
 	// the webrtc.Server that actually serves the degrade WS channel - nil

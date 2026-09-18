@@ -312,6 +312,13 @@ func (c *conn) runPublishReader(sconn srt.Conn, streamID *streamID, pathConf *co
 	c.sconn = sconn
 	c.mutex.Unlock()
 
+	// Publish session history (see publish_session_report.go): tells ppcenter
+	// this SRT stream went live, and - via the deferred call - when and why
+	// it stopped. Reported at the lifecycle boundaries rather than sampled,
+	// since these two events *are* the record.
+	c.reportPublishStart(streamID.path)
+	defer c.reportPublishEnd(sconn, streamID.path)
+
 	// log ingest receive bitrate + packet-loss every recvstats.Interval for
 	// the life of this publish (stops when the read loop below returns).
 	statsDone := make(chan struct{})

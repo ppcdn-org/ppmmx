@@ -1098,6 +1098,17 @@ func (p *Core) createResources(initial bool) error {
 				10*time.Second,
 			)}
 		}
+		// Publish session history (see srt's publish_session_report.go),
+		// gated on MMXControl alone like the WHIP path: a deployment that
+		// talks to ppcenter at all wants its SRT streams in the console's
+		// history.
+		if p.conf.MMXControl {
+			i.PublishSessionReporter = publishSessionReporterAdapter{client: mmxcontrol.NewPublishSessionClient(
+				mmxcontrol.DeriveFallbackURL(p.conf.MMXControlURL),
+				p.conf.MMXNodeSecret,
+				10*time.Second,
+			)}
+		}
 		err = i.Initialize()
 		if err != nil {
 			return err

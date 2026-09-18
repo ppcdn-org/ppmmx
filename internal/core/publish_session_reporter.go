@@ -7,11 +7,11 @@ import (
 	"github.com/bluenviron/mediamtx/internal/mmxcontrol"
 )
 
-// publishSessionReporterAdapter satisfies webrtc's publishSessionReporter by
-// forwarding to a *mmxcontrol.PublishSessionClient. The webrtc and
-// mmxcontrol packages don't import each other (same reasoning as
-// rtpLossAlarmReporterAdapter), so core - which already depends on both - is
-// where the conversion happens.
+// publishSessionReporterAdapter satisfies both webrtc's and srt's
+// publishSessionReporter interfaces (they are structurally identical) by
+// forwarding to a *mmxcontrol.PublishSessionClient. Neither server package
+// imports mmxcontrol (same reasoning as rtpLossAlarmReporterAdapter), so core
+// - which already depends on all three - is where the conversion happens.
 type publishSessionReporterAdapter struct {
 	client *mmxcontrol.PublishSessionClient
 }
