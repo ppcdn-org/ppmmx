@@ -28,6 +28,7 @@ import (
 	"github.com/bluenviron/mediamtx/internal/degrade"
 	"github.com/bluenviron/mediamtx/internal/externalcmd"
 	"github.com/bluenviron/mediamtx/internal/forward"
+	"github.com/bluenviron/mediamtx/internal/healthlog"
 	"github.com/bluenviron/mediamtx/internal/ingest"
 	"github.com/bluenviron/mediamtx/internal/logger"
 	"github.com/bluenviron/mediamtx/internal/metrics"
@@ -123,19 +124,19 @@ var cli struct {
 
 // Core is an instance of MediaMTX.
 type Core struct {
-	ctx              context.Context
-	ctxCancel        func()
-	confPath         string
-	conf             *conf.Conf
-	logger           *logger.Logger
-	externalCmdPool  *externalcmd.Pool
-	authManager      *auth.Manager
-	metrics          *metrics.Metrics
-	selfStats        *selfstats.Reporter
-	pprof            *pprof.PPROF
-	recordCleaner    *recordcleaner.Cleaner
-	playbackServer   *playback.Server
-	pathManager      *pathManager
+	ctx                  context.Context
+	ctxCancel            func()
+	confPath             string
+	conf                 *conf.Conf
+	logger               *logger.Logger
+	externalCmdPool      *externalcmd.Pool
+	authManager          *auth.Manager
+	metrics              *metrics.Metrics
+	selfStats            *selfstats.Reporter
+	pprof                *pprof.PPROF
+	recordCleaner        *recordcleaner.Cleaner
+	playbackServer       *playback.Server
+	pathManager          *pathManager
 	rtspServer           *rtsp.Server
 	rtspsServer          *rtsp.Server
 	rtmpServer           *rtmp.Server
@@ -150,6 +151,7 @@ type Core struct {
 	recordingSync        *mmxcontrol.RecordingSyncClient
 	segmentReporter      *mmxcontrol.SegmentReporter
 	trafficUsage         *TrafficUsageSampler
+	healthLog            *healthlog.Collector
 	srtServer            *srt.Server
 	moqServer            *moq.Server
 	api                  *api.API
@@ -897,6 +899,25 @@ func (p *Core) createResources(initial bool) error {
 		p.mmxControl.SetHTTPFallback(mmxcontrol.DeriveFallbackURL(p.conf.MMXControlURL),
 			p.conf.MMXNodeSecret, 10*time.Second)
 	}
+	// healthLog collects structured health events off the log stream and
+	// reports them in batches to ppcenter, feeding the AI health report's
+	// "log evidence" dimension (docs/design/ppcdn-ai-live-health-report.zh-CN.md
+	// §5.2). Gated on MMXControl alone, like publish-session reporting - a
+	// node that talks to ppcenter at all wants its evidence collected, with
+	// no extra credential to provision.
+	if p.conf.MMXControl && p.healthLog == nil {
+		p.healthLog = healthlog.NewCollector(
+			mmxcontrol.NewHealthLogClient(
+				mmxcontrol.DeriveFallbackURL(p.conf.MMXControlURL),
+				p.conf.MMXNodeSecret,
+				10*time.Second,
+			),
+			512, 200, 5*time.Second,
+		)
+		if p.logger != nil {
+			p.logger.SetHook(p.healthLog.HandleLog)
+		}
+	}
 	// Publish whitelist (see docs/design/ppcdn-mmx-publish-whitelist.zh-CN.md):
 	// every publish path on this node - not just split-rec/recording paths -
 	// must be "<appId>/<tableId>-<viewName>" with appId one ppcenter
@@ -1000,14 +1021,14 @@ func (p *Core) createResources(initial bool) error {
 	if p.conf.SRT &&
 		p.srtServer == nil {
 		i := &srt.Server{
-			Address:             p.conf.SRTAddress,
-			RTSPAddress:         p.conf.RTSPAddress,
-			ReadTimeout:         p.conf.ReadTimeout,
-			WriteTimeout:        p.conf.WriteTimeout,
-			UDPMaxPayloadSize:   p.conf.UDPMaxPayloadSize,
-			Latency:             p.conf.SRTLatency,
-			ReceiverBufferSize:  p.conf.SRTReceiverBufferSize,
-			FlowControlWindow:   p.conf.SRTFlowControlWindow,
+			Address:            p.conf.SRTAddress,
+			RTSPAddress:        p.conf.RTSPAddress,
+			ReadTimeout:        p.conf.ReadTimeout,
+			WriteTimeout:       p.conf.WriteTimeout,
+			UDPMaxPayloadSize:  p.conf.UDPMaxPayloadSize,
+			Latency:            p.conf.SRTLatency,
+			ReceiverBufferSize: p.conf.SRTReceiverBufferSize,
+			FlowControlWindow:  p.conf.SRTFlowControlWindow,
 			// SRT adaptive receive latency (see conf.SRTLatencyAutoTune's
 			// doc comment and docs/srt-adaptive-latency-design.md).
 			LatencyAutoTune:     p.conf.SRTLatencyAutoTune,
@@ -1613,6 +1634,16 @@ func (p *Core) closeResources(newConf *conf.Conf, calledByAPI bool) {
 	if p.mmxControl != nil {
 		p.mmxControl.Close()
 		p.mmxControl = nil
+	}
+	if p.healthLog != nil {
+		// Detach from the logger before closing so a late log line cannot
+		// enqueue into a stopped collector. p.logger is guaranteed non-nil
+		// here - it is only nil'd at the very end of this function.
+		if p.logger != nil {
+			p.logger.SetHook(nil)
+		}
+		p.healthLog.Close()
+		p.healthLog = nil
 	}
 	if p.publishWhitelist != nil {
 		p.publishWhitelist.stop()

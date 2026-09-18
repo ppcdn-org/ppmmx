@@ -22,7 +22,19 @@ type Logger struct {
 	timeNow      func() time.Time
 	stdout       io.Writer
 	destinations []destination
+	hook         func(time.Time, Level, string, ...any)
 	mutex        sync.Mutex
+}
+
+// SetHook installs a callback that receives every entry passing the level
+// filter, before it is written to the destinations. It exists so the health
+// log collector (internal/healthlog) can observe the log stream without
+// changing every call site; the callback runs while the logger's mutex is
+// held, so it must never block or call back into Log.
+func (l *Logger) SetHook(h func(time.Time, Level, string, ...any)) {
+	l.mutex.Lock()
+	l.hook = h
+	l.mutex.Unlock()
 }
 
 // Initialize initializes Logger.
@@ -154,6 +166,10 @@ func (l *Logger) Log(level Level, format string, args ...any) {
 	defer l.mutex.Unlock()
 
 	t := l.timeNow()
+
+	if l.hook != nil {
+		l.hook(t, level, format, args...)
+	}
 
 	for _, dest := range l.destinations {
 		dest.log(t, level, format, args...)

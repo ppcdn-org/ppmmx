@@ -39,6 +39,34 @@ func TestLoggerToStdout(t *testing.T) {
 	}
 }
 
+func TestLoggerHookReceivesEntries(t *testing.T) {
+	var buf bytes.Buffer
+	l := &Logger{
+		Level:        Info,
+		Destinations: []Destination{DestinationStdout},
+		timeNow:      func() time.Time { return time.Date(2003, 11, 4, 23, 15, 8, 0, time.UTC) },
+		stdout:       &buf,
+	}
+	require.NoError(t, l.Initialize())
+	defer l.Close()
+
+	var gotLevel Level
+	var gotMessage string
+	l.SetHook(func(_ time.Time, level Level, format string, args ...any) {
+		gotLevel = level
+		gotMessage = format
+	})
+	l.Log(Info, "hooked %d", 7)
+	require.Equal(t, Info, gotLevel)
+	require.Equal(t, "hooked %d", gotMessage)
+
+	// Entries below the level filter must not reach the hook.
+	l.SetHook(func(_ time.Time, _ Level, _ string, _ ...any) {
+		t.Fatal("hook called for a filtered entry")
+	})
+	l.Log(Debug, "ignored")
+}
+
 func TestLoggerToFile(t *testing.T) {
 	for _, ca := range []string{
 		"plain",
