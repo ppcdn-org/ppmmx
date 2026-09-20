@@ -431,22 +431,24 @@ func tableLockKey(appID, table string) string {
 // execute implements the two-phase per-round protocol:
 //   - gameRound empty: round start. For every path matching (req.AppID,
 //     req.TableID) (a table with multiple configured views records all of
-//     them - see tableToPaths), cuts a fresh segment on the path's already
-//     running recording (record: yes) and locks the whole table to the
-//     caller's owner identity (see ownerKey: appEnv+gameId if appEnv was
-//     provided, otherwise just gameId). If a given path has nothing
-//     publishing to it yet and an ingest source is configured for it,
-//     this is also what brings the ingest pull online (see
-//     resolveController) - ingest only ever runs because a round started,
-//     not from process boot. A path with no resolvable controller at all
-//     is skipped with a warning rather than failing the whole round,
-//     unless every path fails, in which case the round-start itself
-//     fails.
-//   - gameRound non-empty: round end. Cuts the segment that has been
-//     accumulating on every path started for this round since the paired
-//     start call, renames each to "$tableId-$view-$gameRound-$gameId",
-//     releases the table lock, and - if ingest was what brought a path
-//     online - stops the pull again for it.
+//     them - see tableToPaths), starts on-demand recording (paths are
+//     configured with record: no - see bin/conf/record.local.yml - so
+//     nothing is written to disk until a round actually starts) and locks
+//     the whole table to the caller's owner identity (see ownerKey:
+//     appEnv+gameId if appEnv was provided, otherwise just gameId). If a
+//     given path has nothing publishing to it yet and an ingest source is
+//     configured for it, this is also what brings the ingest pull online
+//     (see resolveController) - ingest only ever runs because a round
+//     started, not from process boot. A path with no resolvable
+//     controller, or not currently online, is skipped with a warning
+//     rather than failing the whole round, unless every path fails, in
+//     which case the round-start itself fails.
+//   - gameRound non-empty: round end. Closes and renames the segment that
+//     has been accumulating on every path started for this round since
+//     the paired start call to "$tableId-$view-$gameRound-$gameId", stops
+//     on-demand recording on each (so nothing keeps recording past
+//     round-end), releases the table lock, and - if ingest was what
+//     brought a path online - stops the pull again for it.
 //
 // A (appId, tableId) pair can only have one owner holding it open at a
 // time: a second start is rejected, and only the same owner
@@ -508,6 +510,49 @@ func (h *SplitRecHandler) resolveController(
 	}
 }
 
+// resolveRecordingController resolves the controller split-rec should
+// record for a view's base path (e.g. "appId/table-view"), preferring an
+// already-live "<basePath>/h264" over basePath itself, and returns the path
+// that actually resolved alongside the controller so the caller's
+// bookkeeping (recordID, audit Store row, and the path stopRound will later
+// look the same controller back up by) reflects reality.
+//
+// Dual-codec publishes - both WHIP's multi-track capability and SRT's
+// dual-connection H264/HEVC mode (see docs/design/
+// whip-hevc-h264-multitrack-simulcast-design.zh-CN.md and ppcenter-mmx-
+// communication-protocol.zh-CN.md §7) - register two entirely separate
+// paths, "<basePath>/h264" and "<basePath>/hevc", never basePath itself: a
+// path's codec suffix gates which codec ppmmx accepts publishing on it, so
+// bare basePath is simply never live for a stream published this way. A
+// single-codec publish (no dual-track capability requested) never gets a
+// codec suffix at all and is only ever found at basePath. Recording is
+// fixed to H264 rather than negotiating - matching pickRecordedVideo's
+// H264-over-HEVC preference for the single-path, multi-track case that
+// preference logic actually reaches - so a stream published only in HEVC
+// (no "/h264" path at all) is not recorded by split-rec.
+//
+// The H264 check is a direct, ingest-side-effect-free lookup only - never
+// falling through to allowStartIngest's StartByPath/poll - because an
+// ingest-pull source, if one is configured at all for this table/view, is
+// configured at basePath (ingest pulls from an external source into mmx;
+// it doesn't go through the WHIP/SRT publish-auth gate that codec-suffixed
+// paths exist for, so there's no reason one would ever be registered under
+// a "/h264" name). Probing "<basePath>/h264" with allowStartIngest would
+// otherwise cost a full ingest-start-and-poll timeout on every round-start
+// for a table whose stream is already live at plain basePath - see
+// TestExecuteStopAlwaysCallsStopByPathEvenWithoutIngest, which pins this.
+func (h *SplitRecHandler) resolveRecordingController(
+	ctx context.Context, basePath string, allowStartIngest bool, timeout, pollInterval time.Duration,
+) (ctrl PathController, resolvedPath string, ok bool) {
+	if ctrl, ok := h.lookupController(basePath + "/h264"); ok {
+		return ctrl, basePath + "/h264", true
+	}
+	if ctrl, ok := h.resolveController(ctx, basePath, allowStartIngest, timeout, pollInterval); ok {
+		return ctrl, basePath, true
+	}
+	return nil, "", false
+}
+
 // lookupController tries the handler's own recording-job map first, then
 // falls back to the general path manager.
 func (h *SplitRecHandler) lookupController(path string) (PathController, bool) {
@@ -548,12 +593,17 @@ func (h *SplitRecHandler) startRound(ctx context.Context, req splitRecRequest) e
 	recordIDs := make(map[string]string, len(paths))
 	var startedPaths []TableViewPath
 	for _, tvp := range paths {
-		ctrl, ok := h.resolveController(ctx, tvp.Path, true, waitForIngestPath, 200*time.Millisecond)
+		ctrl, resolvedPath, ok := h.resolveRecordingController(ctx, tvp.Path, true, waitForIngestPath, 200*time.Millisecond)
 		if !ok {
 			h.parent.Log(logger.Warn, "[split-rec] table %q: path %q not found, skipping", req.TableID, tvp.Path)
 			continue
 		}
-		if _, err := ctrl.SplitRecording(""); err != nil {
+		tvp.Path = resolvedPath
+		if !ctrl.IsOnline() {
+			h.parent.Log(logger.Warn, "[split-rec] table %q: path %q not online, skipping", req.TableID, tvp.Path)
+			continue
+		}
+		if _, err := ctrl.StartOnDemandRecording(Options{}); err != nil {
 			h.parent.Log(logger.Warn, "[split-rec] table %q: start round on path %q failed: %v", req.TableID, tvp.Path, err)
 			continue
 		}
@@ -662,6 +712,13 @@ func (h *SplitRecHandler) stopRound(req splitRecRequest) error {
 
 		finalName := req.TableID + "-" + tvp.View + "-" + req.GameRound + "-" + req.GameID
 		finalPath, err := ctrl.SplitRecording(finalName)
+		// Always stop the on-demand recorder here, regardless of whether the
+		// split/rename above succeeded - otherwise a rename failure would
+		// leave recording running past round-end with nothing left to ever
+		// stop it (the table lock for this round is released either way).
+		if _, _, stopErr := ctrl.StopOnDemandRecording(); stopErr != nil {
+			h.parent.Log(logger.Warn, "[split-rec] table %q: stop recording on path %q failed: %v", req.TableID, path, stopErr)
+		}
 		if err != nil {
 			stopErrs = append(stopErrs, fmt.Sprintf("path %q: %v", path, err))
 			h.parent.Log(logger.Warn, "[split-rec] table %q: stop round on path %q failed: %v", req.TableID, path, err)

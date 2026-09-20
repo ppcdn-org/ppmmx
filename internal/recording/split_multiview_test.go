@@ -22,11 +22,26 @@ func (f *fakeViewResolver) ViewsForTable(table string) ([]string, error) {
 	return f.views[table], nil
 }
 
+// fakePathFinder is a minimal PathFinder test double: split-rec looks paths
+// up here (via SplitRecHandler.pathFinder) the same way it looks them up in
+// the real path manager in production. Registering a controller here rather
+// than via mgr.Start keeps each test's fake controller decoupled from
+// Manager's own on-demand-recording bookkeeping, so a round-start's
+// StartOnDemandRecording call isn't preceded by an unrelated one already
+// made during test setup.
+type fakePathFinder map[string]PathController
+
+func (f fakePathFinder) FindPath(name string) (PathController, bool) {
+	ctrl, ok := f[name]
+	return ctrl, ok
+}
+
 // multiviewTestController is a PathController whose SplitRecording result
 // is distinguishable per instance, so a test can tell which path's
 // controller was actually split.
 type multiviewTestController struct {
 	mu          sync.Mutex
+	startCount  int
 	splitCount  int
 	splitErr    error
 	renamedTo   []string
@@ -34,6 +49,9 @@ type multiviewTestController struct {
 }
 
 func (c *multiviewTestController) StartOnDemandRecording(Options) (string, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.startCount++
 	return "recording.mp4", nil
 }
 func (c *multiviewTestController) StopOnDemandRecording() (int64, int64, error) { return 0, 0, nil }
@@ -63,20 +81,16 @@ func TestStartRoundRecordsEveryConfiguredView(t *testing.T) {
 	mgr := newTestManager(t)
 	ctrlFwh := &multiviewTestController{}
 	ctrlFwv := &multiviewTestController{}
-	_, err := mgr.Start(pathFwh, Options{Format: "fmp4"}, ctrlFwh)
-	require.NoError(t, err)
-	_, err = mgr.Start(pathFwv, Options{Format: "fmp4"}, ctrlFwv)
-	require.NoError(t, err)
 
-	h := NewSplitRecHandler(mgr, nil, test.NilLogger)
+	h := NewSplitRecHandler(mgr, fakePathFinder{pathFwh: ctrlFwh, pathFwv: ctrlFwv}, test.NilLogger)
 	h.SetViewResolver(&fakeViewResolver{views: map[string][]string{table: {"fwh", "fwv"}}})
 
 	startReq := splitRecRequest{Time: "9999999999", AppID: appID, TableID: table, GameID: "game1"}
 	c := newSplitRecGinContext()
 	require.NoError(t, h.execute(c, startReq))
 
-	require.Equal(t, 1, ctrlFwh.splitCount, "fwh view must be started")
-	require.Equal(t, 1, ctrlFwv.splitCount, "fwv view must also be started, not just the first match")
+	require.Equal(t, 1, ctrlFwh.startCount, "fwh view must be started")
+	require.Equal(t, 1, ctrlFwv.startCount, "fwv view must also be started, not just the first match")
 
 	// A concurrent start for the same (appId, table) must be rejected, even
 	// though the request only names the table (no view), confirming the
@@ -94,20 +108,18 @@ func TestStartRoundSkipsMissingViewButRecordsTheRest(t *testing.T) {
 	const appID = "app1"
 	const table = "table1"
 	pathFwh := "app1/table1-fwh"
-	// pathFwv is intentionally never started with mgr.Start: it has no
-	// publisher/controller, simulating a configured view that isn't live.
+	// pathFwv is intentionally never registered in the path finder: it has
+	// no publisher/controller, simulating a configured view that isn't live.
 
 	mgr := newTestManager(t)
 	ctrlFwh := &multiviewTestController{}
-	_, err := mgr.Start(pathFwh, Options{Format: "fmp4"}, ctrlFwh)
-	require.NoError(t, err)
 
-	h := NewSplitRecHandler(mgr, nil, test.NilLogger)
+	h := NewSplitRecHandler(mgr, fakePathFinder{pathFwh: ctrlFwh}, test.NilLogger)
 	h.SetViewResolver(&fakeViewResolver{views: map[string][]string{table: {"fwh", "fwv"}}})
 
 	startReq := splitRecRequest{Time: "9999999999", AppID: appID, TableID: table, GameID: "game1"}
 	require.NoError(t, h.execute(newSplitRecGinContext(), startReq))
-	require.Equal(t, 1, ctrlFwh.splitCount, "the view that is live must still be recorded")
+	require.Equal(t, 1, ctrlFwh.startCount, "the view that is live must still be recorded")
 
 	stopReq := splitRecRequest{Time: "9999999999", AppID: appID, TableID: table, GameID: "game1", GameRound: "round1"}
 	require.NoError(t, h.execute(newSplitRecGinContext(), stopReq))
@@ -144,12 +156,8 @@ func TestStopRoundContinuesOnPerPathFailure(t *testing.T) {
 	mgr := newTestManager(t)
 	ctrlFwh := &multiviewTestController{}
 	ctrlFwv := &multiviewTestController{splitErr: fmt.Errorf("split failed")}
-	_, err := mgr.Start(pathFwh, Options{Format: "fmp4"}, ctrlFwh)
-	require.NoError(t, err)
-	_, err = mgr.Start(pathFwv, Options{Format: "fmp4"}, ctrlFwv)
-	require.NoError(t, err)
 
-	h := NewSplitRecHandler(mgr, nil, test.NilLogger)
+	h := NewSplitRecHandler(mgr, fakePathFinder{pathFwh: ctrlFwh, pathFwv: ctrlFwv}, test.NilLogger)
 	h.SetViewResolver(&fakeViewResolver{views: map[string][]string{table: {"fwh", "fwv"}}})
 
 	startReq := splitRecRequest{Time: "9999999999", AppID: appID, TableID: table, GameID: "game1"}
@@ -170,10 +178,8 @@ func TestAppEnvDistinguishesOwnersWithSameGame(t *testing.T) {
 
 	mgr := newTestManager(t)
 	ctrl := &multiviewTestController{}
-	_, err := mgr.Start(path, Options{Format: "fmp4"}, ctrl)
-	require.NoError(t, err)
 
-	h := NewSplitRecHandler(mgr, nil, test.NilLogger)
+	h := NewSplitRecHandler(mgr, fakePathFinder{path: ctrl}, test.NilLogger)
 
 	// Same game, different app_env: must be treated as different owners,
 	// so the second start is rejected as "already being recorded by
@@ -183,7 +189,7 @@ func TestAppEnvDistinguishesOwnersWithSameGame(t *testing.T) {
 	require.NoError(t, h.execute(newSplitRecGinContext(), startReq))
 
 	otherEnvReq := splitRecRequest{Time: "9999999999", AppID: appID, TableID: table, GameID: "p2w001", AppEnv: "prod"}
-	err = h.execute(newSplitRecGinContext(), otherEnvReq)
+	err := h.execute(newSplitRecGinContext(), otherEnvReq)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "already being recorded by another game")
 
@@ -202,14 +208,10 @@ func TestAppEnvDistinguishesOwnersWithSameGame(t *testing.T) {
 // request's app_env field is written into the recordings.db audit row -
 // not just used transiently for owner identity/upload routing - so a
 // deployment serving multiple game environments from one process can tell
-// which environment produced a given recording after the fact.
-//
-// Looks up records by the recordID startRound generated (via h.activeGames,
-// a white-box read - this file is part of package recording) rather than
-// FindRunning(path): mgr.Start in test setup below also inserts its own
-// "running" row for the same path (to register the fake controller so
-// findController can see it), so more than one running row can exist per
-// path and FindRunning's unordered SELECT could pick either one.
+// which environment produced a given recording after the fact. Looks up
+// records by the recordID startRound generated (via h.activeGames, a
+// white-box read - this file is part of package recording) since that ID
+// isn't otherwise returned to the caller.
 func TestStartRoundPersistsAppEnvToAuditRecord(t *testing.T) {
 	const appID = "app1"
 	pathWithEnv := "app1/table1-fwh"
@@ -217,13 +219,9 @@ func TestStartRoundPersistsAppEnvToAuditRecord(t *testing.T) {
 
 	mgr := newTestManager(t)
 	ctrlWithEnv := &multiviewTestController{}
-	_, err := mgr.Start(pathWithEnv, Options{Format: "fmp4"}, ctrlWithEnv)
-	require.NoError(t, err)
 	ctrlWithoutEnv := &multiviewTestController{}
-	_, err = mgr.Start(pathWithoutEnv, Options{Format: "fmp4"}, ctrlWithoutEnv)
-	require.NoError(t, err)
 
-	h := NewSplitRecHandler(mgr, nil, test.NilLogger)
+	h := NewSplitRecHandler(mgr, fakePathFinder{pathWithEnv: ctrlWithEnv, pathWithoutEnv: ctrlWithoutEnv}, test.NilLogger)
 
 	startWithEnv := splitRecRequest{Time: "9999999999", AppID: appID, TableID: "table1", GameID: "p2w001", AppEnv: "uat"}
 	require.NoError(t, h.execute(newSplitRecGinContext(), startWithEnv))
@@ -255,10 +253,8 @@ func TestNoAppEnvFallsBackToGameOnlyOwnership(t *testing.T) {
 
 	mgr := newTestManager(t)
 	ctrl := &multiviewTestController{}
-	_, err := mgr.Start(path, Options{Format: "fmp4"}, ctrl)
-	require.NoError(t, err)
 
-	h := NewSplitRecHandler(mgr, nil, test.NilLogger)
+	h := NewSplitRecHandler(mgr, fakePathFinder{path: ctrl}, test.NilLogger)
 
 	// No app_env in either call: behaves exactly like before (game alone
 	// identifies the owner).
@@ -279,9 +275,12 @@ func TestNoAppEnvFallsBackToGameOnlyOwnership(t *testing.T) {
 func TestStopRoundWithoutPriorStartIsDroppedNotAnError(t *testing.T) {
 	const appID = "app1"
 	const table = "table1"
+	path := "app1/table1-fwh"
 
 	mgr := newTestManager(t)
-	h := NewSplitRecHandler(mgr, nil, test.NilLogger)
+	ctrl := &multiviewTestController{}
+
+	h := NewSplitRecHandler(mgr, fakePathFinder{path: ctrl}, test.NilLogger)
 	h.SetViewResolver(&fakeViewResolver{views: map[string][]string{table: {"fwh", "fwv"}}})
 
 	// No start round was ever issued for this table.
@@ -292,10 +291,6 @@ func TestStopRoundWithoutPriorStartIsDroppedNotAnError(t *testing.T) {
 	// The table must remain free to start afterward - the dropped stop
 	// must not have left any stray lock/state behind.
 	startReq := splitRecRequest{Time: "9999999999", AppID: appID, TableID: table, GameID: "game1"}
-	path := "app1/table1-fwh"
-	ctrl := &multiviewTestController{}
-	_, err := mgr.Start(path, Options{Format: "fmp4"}, ctrl)
-	require.NoError(t, err)
 	require.NoError(t, h.execute(newSplitRecGinContext(), startReq))
 }
 
@@ -310,12 +305,8 @@ func TestDifferentAppsWithSameTableIDDoNotContendForTheLock(t *testing.T) {
 	mgr := newTestManager(t)
 	ctrlA := &multiviewTestController{}
 	ctrlB := &multiviewTestController{}
-	_, err := mgr.Start("appA/table-fwh", Options{Format: "fmp4"}, ctrlA)
-	require.NoError(t, err)
-	_, err = mgr.Start("appB/table-fwh", Options{Format: "fmp4"}, ctrlB)
-	require.NoError(t, err)
 
-	h := NewSplitRecHandler(mgr, nil, test.NilLogger)
+	h := NewSplitRecHandler(mgr, fakePathFinder{"appA/table-fwh": ctrlA, "appB/table-fwh": ctrlB}, test.NilLogger)
 
 	startA := splitRecRequest{Time: "9999999999", AppID: "appA", TableID: table, GameID: "game1"}
 	require.NoError(t, h.execute(newSplitRecGinContext(), startA))
@@ -324,8 +315,8 @@ func TestDifferentAppsWithSameTableIDDoNotContendForTheLock(t *testing.T) {
 	require.NoError(t, h.execute(newSplitRecGinContext(), startB),
 		"a different app with the same tableId string must not be blocked by appA's lock")
 
-	require.Equal(t, 1, ctrlA.splitCount)
-	require.Equal(t, 1, ctrlB.splitCount)
+	require.Equal(t, 1, ctrlA.startCount)
+	require.Equal(t, 1, ctrlB.startCount)
 }
 
 func TestSingleViewTableStillWorksWithoutResolver(t *testing.T) {
@@ -335,15 +326,13 @@ func TestSingleViewTableStillWorksWithoutResolver(t *testing.T) {
 
 	mgr := newTestManager(t)
 	ctrl := &multiviewTestController{}
-	_, err := mgr.Start(path, Options{Format: "fmp4"}, ctrl)
-	require.NoError(t, err)
 
-	h := NewSplitRecHandler(mgr, nil, test.NilLogger)
+	h := NewSplitRecHandler(mgr, fakePathFinder{path: ctrl}, test.NilLogger)
 	// No SetViewResolver call: falls back to the single-view "fwh" default.
 
 	startReq := splitRecRequest{Time: "9999999999", AppID: appID, TableID: table, GameID: "game1"}
 	require.NoError(t, h.execute(newSplitRecGinContext(), startReq))
-	require.Equal(t, 1, ctrl.splitCount)
+	require.Equal(t, 1, ctrl.startCount)
 
 	stopReq := splitRecRequest{Time: "9999999999", AppID: appID, TableID: table, GameID: "game1", GameRound: "round1"}
 	require.NoError(t, h.execute(newSplitRecGinContext(), stopReq))

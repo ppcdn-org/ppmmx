@@ -100,7 +100,7 @@ paths:
     forwardTencent: false
     maxReaders: 30              # WHEP 拉流最大并发数，0=不限制
     # forwardTencentStreamKey: my-stream-name    # 留空则默认用 path 名
-    record: yes                 # 收到 origin 推流即自动录像(fmp4),供 /api/record/split 切分
+    record: no                  # 平时不落盘；由 /api/record/split 的 round-start/round-end 按需开关(fmp4)
     recordPath: data/recordings/%Y%m%d/%path.%Y%m%d%H%M%S-%f
     # Format of recorded segments.
     # Available formats are "fmp4" (fragmented MP4) and "mpegts" (MPEG-TS).
