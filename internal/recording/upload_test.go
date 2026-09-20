@@ -172,6 +172,33 @@ func TestPlaybackURLSuffix(t *testing.T) {
 	// how appEnv affects the S3 key instead).
 	appEnvOverridesMinioBucket := newUploader(UploadConfig{Env: "test", MinioDomain: "minio.example.com"}, test.NilLogger)
 	require.Equal(t, ", url=https://minio.example.com/uat/key.mp4", appEnvOverridesMinioBucket.playbackURLSuffix("key.mp4", "uat"))
+
+	// Virtual-hosted-style domains (bucket already embedded as the leading
+	// host label, e.g. OVH's own net-storage default domain) must not get
+	// "/<bucket>/" appended on top - that doubles the bucket segment and
+	// 403s against the real endpoint (confirmed in production against
+	// ppcdn-net-storage.s3.sgp.io.cloud.ovh.net: the doubled-bucket URL
+	// 403s, "domain/key" with no bucket segment 200s).
+	s3VirtualHostedStyle := newUploader(UploadConfig{
+		S3Bucket: "ppcdn-net-storage", S3AccessKey: "a", S3SecretKey: "s",
+		S3Domain: "ppcdn-net-storage.s3.sgp.io.cloud.ovh.net",
+	}, test.NilLogger)
+	require.Equal(t, ", url=https://ppcdn-net-storage.s3.sgp.io.cloud.ovh.net/test/key.mp4",
+		s3VirtualHostedStyle.playbackURLSuffix("test/key.mp4", "test"),
+		"bucket is already the domain's leading host label - must not be repeated in the path")
+
+	// A path-style domain that merely starts with the bucket name as a
+	// substring (not a full host-label match) must still get the bucket
+	// segment - e.g. bucket "cdn" against host "cdn2.example.com" is not
+	// the same host label and would silently 404 if the bucket segment
+	// were dropped.
+	s3PathStyleWithSimilarPrefix := newUploader(UploadConfig{
+		S3Bucket: "cdn", S3AccessKey: "a", S3SecretKey: "s",
+		S3Domain: "cdn2.example.com",
+	}, test.NilLogger)
+	require.Equal(t, ", url=https://cdn2.example.com/cdn/key.mp4",
+		s3PathStyleWithSimilarPrefix.playbackURLSuffix("key.mp4", "prod"),
+		"host label must match the bucket exactly (or bucket+'.'), not just share a string prefix")
 }
 
 func TestFaststartRemuxFailsOnUnreadableInput(t *testing.T) {

@@ -375,6 +375,20 @@ func (u *uploader) playbackURL(remoteKey, appEnv string) string {
 	if !strings.Contains(domain, "://") {
 		domain = "https://" + domain
 	}
+
+	// Some S3-compatible endpoints are virtual-hosted-style, with the
+	// bucket already embedded as the leading host label
+	// ("<bucket>.s3.<region>...") - OVH's own net-storage domain is one
+	// of these. Appending "/<bucket>/<key>" on top of that doubles the
+	// bucket segment and 403s; confirmed against the real OVH endpoint in
+	// production, where the doubled-bucket URL 403s and the corrected one
+	// 200s. Detect that shape and skip the redundant path segment; a
+	// genuinely path-style domain (bucket not already in the host) still
+	// gets "/<bucket>/<key>" as before.
+	host := strings.TrimPrefix(strings.TrimPrefix(domain, "https://"), "http://")
+	if host == bucket || strings.HasPrefix(host, bucket+".") {
+		return fmt.Sprintf("%s/%s", domain, remoteKey)
+	}
 	return fmt.Sprintf("%s/%s/%s", domain, bucket, remoteKey)
 }
 
