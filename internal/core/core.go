@@ -150,16 +150,21 @@ type Core struct {
 	mmxControl           *mmxcontrol.Client
 	recordingSync        *mmxcontrol.RecordingSyncClient
 	segmentReporter      *mmxcontrol.SegmentReporter
-	trafficUsage         *TrafficUsageSampler
-	healthLog            *healthlog.Collector
-	srtServer            *srt.Server
-	moqServer            *moq.Server
-	api                  *api.API
-	adminSrv             *admin.Server
-	adminStore           *admin.Store
-	publishWhitelist     *appPublishWhitelist
-	ingestMgr            *ingest.Manager
-	confWatcher          *confwatcher.ConfWatcher
+	// publishSessionClients are the publish-session reporters handed to the
+	// webrtc/srt servers. Kept so a graceful shutdown can drain their
+	// in-flight end reports (a restart must not leave ppcenter with a session
+	// it will show as live until the 24h sweeper).
+	publishSessionClients []*mmxcontrol.PublishSessionClient
+	trafficUsage          *TrafficUsageSampler
+	healthLog             *healthlog.Collector
+	srtServer             *srt.Server
+	moqServer             *moq.Server
+	api                   *api.API
+	adminSrv              *admin.Server
+	adminStore            *admin.Store
+	publishWhitelist      *appPublishWhitelist
+	ingestMgr             *ingest.Manager
+	confWatcher           *confwatcher.ConfWatcher
 
 	// in
 	chAPIConfigSet chan *conf.Conf
@@ -290,6 +295,28 @@ func (p *Core) Log(level logger.Level, format string, args ...any) {
 	p.logger.Log(level, format, args...)
 }
 
+// activePipelines reports the streams currently hosted by this node, used as
+// the mmxControl heartbeat's pipelines snapshot. ppcenter aggregates these
+// across nodes into the admin "Active Streams" view; the snapshot used to be
+// hardwired to nil, so the heartbeat always reported zero streams and that
+// view stayed empty however many paths were live.
+func (p *Core) activePipelines() []string {
+	if p.pathManager == nil {
+		return nil
+	}
+	list, err := p.pathManager.APIPathsList()
+	if err != nil || list == nil {
+		return nil
+	}
+	names := make([]string, 0, len(list.Items))
+	for _, item := range list.Items {
+		if item.Name != "" {
+			names = append(names, item.Name)
+		}
+	}
+	return names
+}
+
 func (p *Core) run() {
 	defer close(p.done)
 
@@ -345,6 +372,20 @@ outer:
 	p.ctxCancel()
 
 	p.closeResources(nil, false)
+
+	// closeResources tears down the servers, which fires each live session's
+	// end report asynchronously. Wait for those to reach ppcenter before the
+	// process exits, with a short overall budget, so a restart doesn't leave
+	// ppcenter holding sessions that read as still live.
+	if len(p.publishSessionClients) > 0 {
+		deadline := time.Now().Add(3 * time.Second)
+		for _, c := range p.publishSessionClients {
+			remaining := time.Until(deadline)
+			if remaining <= 0 || !c.Wait(remaining) {
+				break
+			}
+		}
+	}
 }
 
 func (p *Core) createResources(initial bool) error {
@@ -862,11 +903,13 @@ func (p *Core) createResources(initial bool) error {
 		// separate enable flag because a deployment that talks to ppcenter
 		// at all wants its streams to appear in the console's history.
 		if p.conf.MMXControl {
-			i.PublishSessionReporter = publishSessionReporterAdapter{client: mmxcontrol.NewPublishSessionClient(
+			client := mmxcontrol.NewPublishSessionClient(
 				mmxcontrol.DeriveFallbackURL(p.conf.MMXControlURL),
 				p.conf.MMXNodeSecret,
 				10*time.Second,
-			)}
+			)
+			p.publishSessionClients = append(p.publishSessionClients, client)
+			i.PublishSessionReporter = publishSessionReporterAdapter{client: client}
 		}
 		err = i.Initialize()
 		if err != nil {
@@ -896,7 +939,7 @@ func (p *Core) createResources(initial bool) error {
 			PublishURL:            p.conf.MMXPublishURL,
 			ABRNegotiationAddress: p.conf.MMXABRNegotiationAddress,
 			OnCommand:             p.handleControlCommand,
-		}, func() []string { return nil }, p)
+		}, p.activePipelines, p)
 		p.mmxControl.SetHTTPFallback(mmxcontrol.DeriveFallbackURL(p.conf.MMXControlURL),
 			p.conf.MMXNodeSecret, 10*time.Second)
 	}
@@ -1103,11 +1146,13 @@ func (p *Core) createResources(initial bool) error {
 		// talks to ppcenter at all wants its SRT streams in the console's
 		// history.
 		if p.conf.MMXControl {
-			i.PublishSessionReporter = publishSessionReporterAdapter{client: mmxcontrol.NewPublishSessionClient(
+			client := mmxcontrol.NewPublishSessionClient(
 				mmxcontrol.DeriveFallbackURL(p.conf.MMXControlURL),
 				p.conf.MMXNodeSecret,
 				10*time.Second,
-			)}
+			)
+			p.publishSessionClients = append(p.publishSessionClients, client)
+			i.PublishSessionReporter = publishSessionReporterAdapter{client: client}
 		}
 		err = i.Initialize()
 		if err != nil {

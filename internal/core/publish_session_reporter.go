@@ -33,3 +33,16 @@ func (a publishSessionReporterAdapter) ReportPublishEnd(
 ) error {
 	return a.client.ReportPublishEnd(ctx, sessionID, endedAt, endReason, inboundBytes)
 }
+
+// ReportPublishEndAsync is what the servers call on teardown: non-blocking,
+// but tracked by the client's in-flight set so a graceful shutdown can drain
+// it. See PublishSessionClient.ReportPublishEndAsync.
+func (a publishSessionReporterAdapter) ReportPublishEndAsync(
+	sessionID string,
+	endedAt time.Time,
+	endReason string,
+	inboundBytes uint64,
+	onError func(error),
+) {
+	a.client.ReportPublishEndAsync(sessionID, endedAt, endReason, inboundBytes, onError)
+}

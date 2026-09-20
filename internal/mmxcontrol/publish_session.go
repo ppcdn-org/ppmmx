@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -52,6 +53,12 @@ type PublishSessionClient struct {
 	baseURL string
 	token   string
 	client  *http.Client
+
+	// inFlight counts end reports fired by ReportPublishEndAsync that have not
+	// finished yet, so a graceful shutdown can drain them (see Wait) instead
+	// of exiting while ppcenter is still waiting for the end of a session the
+	// node just tore down.
+	inFlight sync.WaitGroup
 }
 
 func NewPublishSessionClient(baseURL, token string, timeout time.Duration) *PublishSessionClient {
@@ -105,6 +112,46 @@ func (c *PublishSessionClient) ReportPublishEnd(
 		EndReason:    endReason,
 		InboundBytes: inboundBytes,
 	})
+}
+
+// ReportPublishEndAsync fires the end report in the background so a teardown
+// is never blocked by a slow control plane, while counting it toward the
+// client's in-flight set. The Add happens synchronously here - before any
+// goroutine is scheduled - which is what lets Wait() reliably drain a
+// shutdown's in-flight reports rather than racing their start.
+func (c *PublishSessionClient) ReportPublishEndAsync(
+	sessionID string,
+	endedAt time.Time,
+	endReason string,
+	inboundBytes uint64,
+	onError func(error),
+) {
+	c.inFlight.Add(1)
+	go func() {
+		defer c.inFlight.Done()
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := c.ReportPublishEnd(ctx, sessionID, endedAt, endReason, inboundBytes); err != nil && onError != nil {
+			onError(err)
+		}
+	}()
+}
+
+// Wait blocks until every ReportPublishEndAsync call has finished, or timeout
+// elapses, returning true when it drained cleanly. Called on graceful
+// shutdown so end reports aren't cut off by process exit.
+func (c *PublishSessionClient) Wait(timeout time.Duration) bool {
+	done := make(chan struct{})
+	go func() {
+		c.inFlight.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return true
+	case <-time.After(timeout):
+		return false
+	}
 }
 
 func (c *PublishSessionClient) post(ctx context.Context, path string, payload any) error {

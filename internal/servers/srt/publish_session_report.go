@@ -21,6 +21,9 @@ import (
 type publishSessionReporter interface {
 	ReportPublishStart(ctx context.Context, sessionID, pathName, remoteAddr, userAgent string, startedAt time.Time) error
 	ReportPublishEnd(ctx context.Context, sessionID string, endedAt time.Time, endReason string, inboundBytes uint64) error
+	// ReportPublishEndAsync is the teardown path: non-blocking, but counted by
+	// the reporter so a graceful shutdown can drain it (see core's shutdown).
+	ReportPublishEndAsync(sessionID string, endedAt time.Time, endReason string, inboundBytes uint64, onError func(error))
 }
 
 // publishSessionReporterHook returns the configured reporter (nil when
@@ -93,11 +96,10 @@ func (c *conn) reportPublishEnd(sconn srt.Conn, pathName string) {
 		inboundBytes = st.Accumulated.ByteRecv
 	}
 
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		if err := reporter.ReportPublishEnd(ctx, sessionID, endedAt, endReason, inboundBytes); err != nil {
-			c.Log(logger.Debug, "publish session end report failed: %v", err)
-		}
-	}()
+	// The report itself is fired asynchronously inside the reporter (so a slow
+	// control plane can't hold up teardown) but registered synchronously, so
+	// this node's graceful shutdown can wait for it - see core's exit path.
+	reporter.ReportPublishEndAsync(sessionID, endedAt, endReason, inboundBytes, func(err error) {
+		c.Log(logger.Debug, "publish session end report failed: %v", err)
+	})
 }

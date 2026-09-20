@@ -1444,13 +1444,11 @@ func (s *session) reportPublishEnd(pc *webrtc.PeerConnection) {
 		}
 	}
 
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		if err := reporter.ReportPublishEnd(ctx, sessionID, endedAt, endReason, inboundBytes); err != nil {
-			s.Log(logger.Debug, "publish session end report failed: %v", err)
-		}
-	}()
+	// Fired asynchronously inside the reporter, but registered synchronously so
+	// the node's graceful shutdown can wait for it - see core's exit path.
+	reporter.ReportPublishEndAsync(sessionID, endedAt, endReason, inboundBytes, func(err error) {
+		s.Log(logger.Debug, "publish session end report failed: %v", err)
+	})
 }
 
 func (s *session) initialRequest(req initialRequestReq) initialRequestRes {

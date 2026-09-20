@@ -18,6 +18,9 @@ import (
 type publishSessionReporter interface {
 	ReportPublishStart(ctx context.Context, sessionID, pathName, remoteAddr, userAgent string, startedAt time.Time) error
 	ReportPublishEnd(ctx context.Context, sessionID string, endedAt time.Time, endReason string, inboundBytes uint64) error
+	// ReportPublishEndAsync is the teardown path: non-blocking, but counted by
+	// the reporter so a graceful shutdown can drain it (see core's shutdown).
+	ReportPublishEndAsync(sessionID string, endedAt time.Time, endReason string, inboundBytes uint64, onError func(error))
 }
 
 // publishSessionReporterHook implements the sessionParent hook, returning
