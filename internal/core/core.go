@@ -911,6 +911,17 @@ func (p *Core) createResources(initial bool) error {
 			p.publishSessionClients = append(p.publishSessionClients, client)
 			i.PublishSessionReporter = publishSessionReporterAdapter{client: client}
 		}
+		// Per-minute WHIP RTP loss samples for ppcenter's unified
+		// loss_samples table (see webrtc's rtp_loss_sample.go). Gated on
+		// MMXControl alone, like publish-session history: ppcenter drops the
+		// below-threshold samples itself, so there is no separate enable flag.
+		if p.conf.MMXControl {
+			i.RTPLossSampleReporter = rtpLossSampleReporterAdapter{client: mmxcontrol.NewRTPLossSampleClient(
+				mmxcontrol.DeriveFallbackURL(p.conf.MMXControlURL),
+				p.conf.MMXNodeSecret,
+				10*time.Second,
+			)}
+		}
 		err = i.Initialize()
 		if err != nil {
 			return err

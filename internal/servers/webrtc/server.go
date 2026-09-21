@@ -260,6 +260,13 @@ type Server struct {
 	RTPLossAlarmThresholdPct float64
 	RTPLossAlarmReporter     rtpLossAlarmReporter
 
+	// Per-minute WHIP RTP loss samples (see rtp_loss_sample.go): the full
+	// series behind ppcenter's unified loss_samples table, reported every
+	// recvstats.Interval regardless of any threshold (ppcenter drops the
+	// below-threshold ones). Nil unless MMXControl is set up (same gating
+	// as PublishSessionReporter below).
+	RTPLossSampleReporter rtpLossSampleReporter
+
 	// Publish session history (see publish_session_report.go): reports the
 	// start and end of every WHIP publish session to ppcenter, which is
 	// what backs the stream history shown in the user console and the

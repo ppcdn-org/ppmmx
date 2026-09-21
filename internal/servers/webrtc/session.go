@@ -436,6 +436,10 @@ type sessionParent interface {
 	rtpLossAlarmThresholdPct() float64
 	rtpLossAlarmReporterHook() rtpLossAlarmReporter
 
+	// Per-minute RTP loss samples (see rtp_loss_sample.go): the full series
+	// behind ppcenter's unified loss_samples table, independent of the alarm.
+	rtpLossSampleReporterHook() rtpLossSampleReporter
+
 	// WHIP publish reconnect tracking (see publishstats.go) - independent
 	// of the degrade protocol, gives operators plain visibility into how
 	// often a publisher has reconnected during a streaming period.
@@ -1351,6 +1355,22 @@ func (s *session) runReceiveStatsSummary(pc *webrtc.PeerConnection) {
 			if snap, ok := sampler.Sample(st.BytesReceived, st.RTPPacketsReceived, st.RTPPacketsLost, time.Now()); ok {
 				snap.Extra = nackSampler.extra(st, pc.InboundTrackStats())
 				s.Log(logger.Info, "%s", snap.LogLine("whip", s.pathName))
+
+				// Per-minute sample to ppcenter's unified loss_samples table
+				// (it persists only samples above its threshold). Independent
+				// of the threshold-gated alarm below.
+				if reporter := s.parent.rtpLossSampleReporterHook(); reporter != nil {
+					path := s.pathName
+					lossPct, bitrateBps := snap.LossPct, snap.BitrateBps
+					minute := time.Now().UTC().Format("2006-01-02 15:04")
+					go func() {
+						ctx, cancel := context.WithTimeout(s.ctx, 10*time.Second)
+						defer cancel()
+						if err := reporter.ReportRTPLossSample(ctx, path, lossPct, bitrateBps, minute); err != nil {
+							s.Log(logger.Debug, "RTP loss sample report failed: %v", err)
+						}
+					}()
+				}
 
 				if s.parent.rtpLossAlarmEnabled() {
 					// No disconnect feature for RTP (disconnectEnable=false,
