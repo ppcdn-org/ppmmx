@@ -717,6 +717,23 @@ func (pm *pathManager) FindPath(name string) (recording.PathController, bool) {
 	return pa, true
 }
 
+// ListPaths returns every path name currently known to the node. It backs
+// recording.PathLister, which split-rec uses to discover a table's live views
+// from the path names themselves instead of an operator-maintained table->view
+// configuration. Reads through APIPathsList so it observes the
+// main-goroutine-owned path map safely.
+func (pm *pathManager) ListPaths() ([]string, error) {
+	list, err := pm.APIPathsList()
+	if err != nil {
+		return nil, err
+	}
+	names := make([]string, 0, len(list.Items))
+	for _, item := range list.Items {
+		names = append(names, item.Name)
+	}
+	return names, nil
+}
+
 // SetAdminStore is called by core once the admin store has been opened, so
 // that publish requests can be checked against site_stream_configs. The
 // admin store is created after pathManager (it needs the WebRTC/API ports,

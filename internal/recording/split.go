@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -36,26 +37,33 @@ type IngestStarter interface {
 	StopByPath(path string)
 }
 
-// TableViewResolver looks up every view configured for a table (e.g.
-// "table1" -> ["fwh", "fwv"]), so a round-start/round-end request - which
-// only ever carries the table name, not a specific view - can be applied
-// to every configured view at once instead of guessing a single default.
-// The caller (tableToPaths) combines each view with the request's appId to
-// derive the actual stream path (appId+"/"+table+"-"+view - see
-// docs/design/ppcdn-mmx-publish-whitelist.zh-CN.md): the path always lives
-// under the requesting app's own namespace, so this resolver only needs to
-// know which views a table has, not where any app's streams live.
-// Satisfied by *internal/admin.Store.
-type TableViewResolver interface {
-	ViewsForTable(table string) ([]string, error)
+// PathLister lists every path name currently known to the node. split-rec
+// uses it to discover which views a table is actually streaming with, instead
+// of depending on an operator-maintained table->view configuration: a
+// round-start/round-end request only ever carries the table name, so the views
+// are recovered from the live path names themselves.
+//
+// Path names follow "<appId>/<tableId>-<view>", optionally with a trailing
+// "/h264" or "/hevc" codec segment (see docs/design/
+// ppcdn-mmx-publish-whitelist.zh-CN.md and the multitrack design doc), so
+// tableToPaths only has to strip any codec suffix, match the requesting
+// (appId, tableId) prefix and take the remainder as the view.
+// Satisfied by *internal/core.pathManager.
+type PathLister interface {
+	ListPaths() ([]string, error)
 }
 
-// TableViewPath is one view's resolved stream path for a table, as
-// returned by TableViewResolver.
+// TableViewPath is one view's resolved stream path for a table, as returned
+// by tableToPaths.
 type TableViewPath struct {
 	Path string
 	View string
 }
+
+// streamCodecSuffixes are the trailing segments a multi-codec publish appends
+// after "<tableId>-<view>" (WHIP multitrack / SRT dual-codec). They are
+// stripped when discovering a table's views from live path names.
+var streamCodecSuffixes = []string{"/h264", "/hevc"}
 
 // waitForIngestPath bounds how long a round-start request blocks for an
 // ingest-triggered path to actually come online (ffmpeg dialing the source,
@@ -98,7 +106,6 @@ type SplitRecHandler struct {
 	uploader             *uploader
 	splitRecFileReporter SplitRecFileReporter
 	ingestMgr            IngestStarter
-	viewResolver         TableViewResolver
 	// activeGames tracks, per table, which owner (see ownerKey) currently
 	// holds the open recording round (started by a gameRound-less call,
 	// closed by the paired call carrying gameRound). Only one owner may
@@ -153,16 +160,6 @@ func (h *SplitRecHandler) SetIngestManager(m IngestStarter) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.ingestMgr = m
-}
-
-// SetViewResolver wires in the source of truth for table->views, letting
-// round-start/round-end requests fan out to every view configured for a
-// table. Not calling this (viewResolver stays nil) falls back to the
-// legacy tablePathMapping/single-default behavior.
-func (h *SplitRecHandler) SetViewResolver(r TableViewResolver) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	h.viewResolver = r
 }
 
 // ConfigureUpload changes the net-storage upload settings without
@@ -445,7 +442,7 @@ func tableLockKey(appID, table string) string {
 //     which case the round-start itself fails.
 //   - gameRound non-empty: round end. Closes and renames the segment that
 //     has been accumulating on every path started for this round since
-//     the paired start call to "$tableId-$view-$gameRound-$gameId", stops
+//     the paired start call to "$tableId-$view-$gameRound", stops
 //     on-demand recording on each (so nothing keeps recording past
 //     round-end), releases the table lock, and - if ingest was what
 //     brought a path online - stops the pull again for it.
@@ -710,7 +707,7 @@ func (h *SplitRecHandler) stopRound(req splitRecRequest) error {
 			continue
 		}
 
-		finalName := req.TableID + "-" + tvp.View + "-" + req.GameRound + "-" + req.GameID
+		finalName := req.TableID + "-" + tvp.View + "-" + req.GameRound
 		finalPath, err := ctrl.SplitRecording(finalName)
 		// Always stop the on-demand recorder here, regardless of whether the
 		// split/rename above succeeded - otherwise a rename failure would
@@ -771,28 +768,60 @@ func newRecordID(path string) string {
 }
 
 // tableToPaths resolves every path+view a round-start/round-end request for
-// (appID, table) must be applied to. If a TableViewResolver is wired in
-// and reports at least one view for table, one TableViewPath is returned
-// per configured view - a table with multiple views records all of them,
-// since the request only carries the table name, not a specific view.
-// Otherwise falls back to a single view, "fwh" (matching the convention
-// every fallback in this file already assumed before views were
-// configurable). Every path is derived the same way regardless of source:
-// appID+"/"+table+"-"+view, so it always resolves under the requesting
-// app's own WHIP-publish namespace (see docs/design/
-// ppcdn-mmx-publish-whitelist.zh-CN.md) rather than a separately
-// registered path.
+// (appID, table) must be applied to. Views are discovered from the node's
+// currently-known path names rather than an operator-maintained
+// table->view configuration: any path named
+// "<appId>/<table>-<view>" (optionally codec-suffixed with "/h264" or
+// "/hevc") contributes one view, so any online stream for a table is
+// recordable with no separate registration step. A table with multiple live
+// views records all of them, since the request only carries the table name,
+// not a specific view.
+//
+// If nothing matches, it falls back to the single legacy default view "fwh"
+// (appId+"/"+table+"-fwh"), preserving the pre-existing behavior for an
+// ingest-configured path that can be brought online on demand. Every path is
+// derived under the requesting app's own WHIP-publish namespace (see
+// docs/design/ppcdn-mmx-publish-whitelist.zh-CN.md), never a separately
+// registered one.
 func (h *SplitRecHandler) tableToPaths(appID, table string) []TableViewPath {
 	h.mu.Lock()
-	resolver := h.viewResolver
+	finder := h.pathFinder
 	h.mu.Unlock()
 
-	views := []string{"fwh"}
-	if resolver != nil {
-		if resolved, err := resolver.ViewsForTable(table); err == nil && len(resolved) > 0 {
-			views = resolved
+	var lister PathLister
+	if l, ok := finder.(PathLister); ok {
+		lister = l
+	}
+
+	prefix := appID + "/" + table + "-"
+	seen := make(map[string]struct{})
+	views := make([]string, 0, 2)
+	if lister != nil {
+		if names, err := lister.ListPaths(); err == nil {
+			for _, name := range names {
+				base := name
+				for _, suffix := range streamCodecSuffixes {
+					base = strings.TrimSuffix(base, suffix)
+				}
+				if !strings.HasPrefix(base, prefix) {
+					continue
+				}
+				view := strings.TrimPrefix(base, prefix)
+				if view == "" || strings.Contains(view, "/") || !identifierPattern.MatchString(view) {
+					continue
+				}
+				if _, ok := seen[view]; ok {
+					continue
+				}
+				seen[view] = struct{}{}
+				views = append(views, view)
+			}
 		}
 	}
+	if len(views) == 0 {
+		views = []string{"fwh"}
+	}
+	sort.Strings(views)
 
 	paths := make([]TableViewPath, len(views))
 	for i, view := range views {

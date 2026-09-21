@@ -216,34 +216,6 @@ func (s *Store) SiteStreamConfigs() ([]SiteStreamConfig, error) {
 	return configs, rows.Err()
 }
 
-// ViewsForTable returns every view_name configured for streamName across
-// all sites (e.g. "table" -> ["fwh", "fwv"]), for split-rec: a table with
-// multiple views must record all of them, since a round-start/round-end
-// request only ever carries the table name, not a specific view. The
-// caller (recording.SplitRecHandler.tableToPaths) combines each view with
-// the request's own appId to derive the actual stream path - this store
-// only needs to know which views exist, not where any app's streams live
-// (see recording.TableViewResolver's doc comment).
-func (s *Store) ViewsForTable(streamName string) ([]string, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	rows, err := s.db.Query(`SELECT DISTINCT view_name FROM site_stream_configs
-		WHERE stream_name = ? ORDER BY view_name`, streamName)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var views []string
-	for rows.Next() {
-		var view string
-		if err := rows.Scan(&view); err != nil {
-			return nil, err
-		}
-		views = append(views, view)
-	}
-	return views, rows.Err()
-}
-
 func (s *Store) SetSiteStreamConfigs(configs []SiteStreamConfig) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

@@ -345,7 +345,7 @@ func (u *uploader) uploadMinio(filePath, objectKey, appEnv string) error {
 }
 
 // objectKeyFor returns the storage object key for a finished round file:
-// just its base name, e.g. "table1-fwv-rec20250904109-p2w001.mp4".
+// just its base name, e.g. "table1-fwv-round001.mp4".
 func objectKeyFor(filePath string) string {
 	return filepath.Base(filePath)
 }

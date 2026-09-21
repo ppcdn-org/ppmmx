@@ -808,17 +808,14 @@ func (p *Core) createResources(initial bool) error {
 				if p.ingestMgr != nil {
 					p.splitHandler.SetIngestManager(p.ingestMgr)
 				}
-				// adminStore (the source of truth for table->view fan-out,
-				// see SetViewResolver) is opened later, in the admin
-				// backend block below; if this isn't the first time
-				// through (e.g. a config reload recreated recMgr while
-				// adminStore survived), wire it in immediately.
-				if p.adminStore != nil {
-					p.splitHandler.SetViewResolver(p.adminStore)
-				}
-				// Same reasoning for publishWhitelist (the appId->appSecret
-				// source split-rec now verifies signatures against, see
-				// AppSecretLookup) - it's created further down, after
+				// split-rec discovers a table's views from the live path
+				// names themselves (see tableToPaths / PathLister), which
+				// the pathManager passed above already provides - no
+				// table->view configuration to wire in.
+				//
+				// The publishWhitelist (the appId->appSecret
+				// source split-rec verifies signatures against, see
+				// AppSecretLookup) is created further down, after
 				// mmxControl; wire it in immediately if it already exists
 				// from an earlier pass.
 				if p.publishWhitelist != nil {
@@ -1280,13 +1277,6 @@ func (p *Core) createResources(initial bool) error {
 				p.Log(logger.Warn, "admin store failed: %v", err2)
 			} else {
 				p.adminStore = st
-				// Publish whitelist (pathManager.SetAdminStore) is wired
-				// separately from p.publishWhitelist above, not from
-				// admin.Store - only site_stream_configs' table->view
-				// fan-out for split-rec comes from here.
-				if p.splitHandler != nil {
-					p.splitHandler.SetViewResolver(st)
-				}
 			}
 		}
 		p.adminSrv = &admin.Server{

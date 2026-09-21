@@ -40,7 +40,7 @@ func TestStartRoundPrefersH264SuffixedPath(t *testing.T) {
 
 	stopReq := splitRecRequest{Time: "9999999999", AppID: appID, TableID: table, GameID: "game1", GameRound: "round1"}
 	require.NoError(t, h.execute(newSplitRecGinContext(), stopReq))
-	require.Equal(t, []string{"table1-fwh-round1-game1"}, h264Ctrl.renamedTo, "round-end must finalize the same h264 path round-start recorded")
+	require.Equal(t, []string{"table1-fwh-round1"}, h264Ctrl.renamedTo, "round-end must finalize the same h264 path round-start recorded")
 }
 
 // TestStartRoundFallsBackToBarePathWithoutH264Variant covers a

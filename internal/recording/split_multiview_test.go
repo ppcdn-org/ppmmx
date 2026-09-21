@@ -10,30 +10,27 @@ import (
 	"github.com/bluenviron/mediamtx/internal/test"
 )
 
-// fakeViewResolver is a controllable TableViewResolver for testing
-// table-with-multiple-views fan-out. Only returns view names - the actual
-// path (appId+"/"+table+"-"+view) is derived by tableToPaths, not by the
-// resolver (see TableViewResolver's doc comment).
-type fakeViewResolver struct {
-	views map[string][]string
-}
-
-func (f *fakeViewResolver) ViewsForTable(table string) ([]string, error) {
-	return f.views[table], nil
-}
-
-// fakePathFinder is a minimal PathFinder test double: split-rec looks paths
-// up here (via SplitRecHandler.pathFinder) the same way it looks them up in
-// the real path manager in production. Registering a controller here rather
-// than via mgr.Start keeps each test's fake controller decoupled from
-// Manager's own on-demand-recording bookkeeping, so a round-start's
-// StartOnDemandRecording call isn't preceded by an unrelated one already
-// made during test setup.
+// fakePathFinder is a minimal PathFinder + PathLister test double: split-rec
+// looks paths up here (via SplitRecHandler.pathFinder) the same way it does
+// against the real path manager, and discovers a table's views from the map
+// keys exactly as pathManager.ListPaths does from the live path names.
+// Registering a controller here rather than via mgr.Start keeps each test's
+// fake controller decoupled from Manager's own on-demand-recording
+// bookkeeping, so a round-start's StartOnDemandRecording call isn't preceded
+// by an unrelated one already made during test setup.
 type fakePathFinder map[string]PathController
 
 func (f fakePathFinder) FindPath(name string) (PathController, bool) {
 	ctrl, ok := f[name]
 	return ctrl, ok
+}
+
+func (f fakePathFinder) ListPaths() ([]string, error) {
+	names := make([]string, 0, len(f))
+	for name := range f {
+		names = append(names, name)
+	}
+	return names, nil
 }
 
 // multiviewTestController is a PathController whose SplitRecording result
@@ -72,7 +69,7 @@ func (c *multiviewTestController) SplitRecording(renameTo string) (string, error
 	return "recording.mp4", nil
 }
 
-func TestStartRoundRecordsEveryConfiguredView(t *testing.T) {
+func TestStartRoundRecordsEveryLiveView(t *testing.T) {
 	const appID = "app1"
 	const table = "table1"
 	pathFwh := "app1/table1-fwh"
@@ -83,7 +80,6 @@ func TestStartRoundRecordsEveryConfiguredView(t *testing.T) {
 	ctrlFwv := &multiviewTestController{}
 
 	h := NewSplitRecHandler(mgr, fakePathFinder{pathFwh: ctrlFwh, pathFwv: ctrlFwv}, test.NilLogger)
-	h.SetViewResolver(&fakeViewResolver{views: map[string][]string{table: {"fwh", "fwv"}}})
 
 	startReq := splitRecRequest{Time: "9999999999", AppID: appID, TableID: table, GameID: "game1"}
 	c := newSplitRecGinContext()
@@ -100,22 +96,22 @@ func TestStartRoundRecordsEveryConfiguredView(t *testing.T) {
 	stopReq := splitRecRequest{Time: "9999999999", AppID: appID, TableID: table, GameID: "game1", GameRound: "round1"}
 	require.NoError(t, h.execute(newSplitRecGinContext(), stopReq))
 
-	require.Equal(t, []string{"table1-fwh-round1-game1"}, ctrlFwh.renamedTo)
-	require.Equal(t, []string{"table1-fwv-round1-game1"}, ctrlFwv.renamedTo)
+	require.Equal(t, []string{"table1-fwh-round1"}, ctrlFwh.renamedTo)
+	require.Equal(t, []string{"table1-fwv-round1"}, ctrlFwv.renamedTo)
 }
 
 func TestStartRoundSkipsMissingViewButRecordsTheRest(t *testing.T) {
 	const appID = "app1"
 	const table = "table1"
 	pathFwh := "app1/table1-fwh"
-	// pathFwv is intentionally never registered in the path finder: it has
-	// no publisher/controller, simulating a configured view that isn't live.
+	// pathFwv is intentionally never registered in the path finder, so it is
+	// never discovered as a view: only live/known paths are recorded, with no
+	// separate table->view configuration that could name a non-live one.
 
 	mgr := newTestManager(t)
 	ctrlFwh := &multiviewTestController{}
 
 	h := NewSplitRecHandler(mgr, fakePathFinder{pathFwh: ctrlFwh}, test.NilLogger)
-	h.SetViewResolver(&fakeViewResolver{views: map[string][]string{table: {"fwh", "fwv"}}})
 
 	startReq := splitRecRequest{Time: "9999999999", AppID: appID, TableID: table, GameID: "game1"}
 	require.NoError(t, h.execute(newSplitRecGinContext(), startReq))
@@ -123,16 +119,15 @@ func TestStartRoundSkipsMissingViewButRecordsTheRest(t *testing.T) {
 
 	stopReq := splitRecRequest{Time: "9999999999", AppID: appID, TableID: table, GameID: "game1", GameRound: "round1"}
 	require.NoError(t, h.execute(newSplitRecGinContext(), stopReq))
-	require.Equal(t, []string{"table1-fwh-round1-game1"}, ctrlFwh.renamedTo)
+	require.Equal(t, []string{"table1-fwh-round1"}, ctrlFwh.renamedTo)
 }
 
-func TestStartRoundFailsWhenNoConfiguredViewIsLive(t *testing.T) {
+func TestStartRoundFailsWhenNoViewIsLive(t *testing.T) {
 	const appID = "app1"
 	const table = "table1"
 
 	mgr := newTestManager(t)
 	h := NewSplitRecHandler(mgr, nil, test.NilLogger)
-	h.SetViewResolver(&fakeViewResolver{views: map[string][]string{table: {"fwh", "fwv"}}})
 
 	startReq := splitRecRequest{Time: "9999999999", AppID: appID, TableID: table, GameID: "game1"}
 	err := h.execute(newSplitRecGinContext(), startReq)
@@ -158,7 +153,6 @@ func TestStopRoundContinuesOnPerPathFailure(t *testing.T) {
 	ctrlFwv := &multiviewTestController{splitErr: fmt.Errorf("split failed")}
 
 	h := NewSplitRecHandler(mgr, fakePathFinder{pathFwh: ctrlFwh, pathFwv: ctrlFwv}, test.NilLogger)
-	h.SetViewResolver(&fakeViewResolver{views: map[string][]string{table: {"fwh", "fwv"}}})
 
 	startReq := splitRecRequest{Time: "9999999999", AppID: appID, TableID: table, GameID: "game1"}
 	require.NoError(t, h.execute(newSplitRecGinContext(), startReq))
@@ -168,7 +162,7 @@ func TestStopRoundContinuesOnPerPathFailure(t *testing.T) {
 	stopReq := splitRecRequest{Time: "9999999999", AppID: appID, TableID: table, GameID: "game1", GameRound: "round1"}
 	require.NoError(t, h.execute(newSplitRecGinContext(), stopReq),
 		"one broken view must not prevent finalizing the others")
-	require.Equal(t, []string{"table1-fwh-round1-game1"}, ctrlFwh.renamedTo)
+	require.Equal(t, []string{"table1-fwh-round1"}, ctrlFwh.renamedTo)
 }
 
 func TestAppEnvDistinguishesOwnersWithSameGame(t *testing.T) {
@@ -281,7 +275,6 @@ func TestStopRoundWithoutPriorStartIsDroppedNotAnError(t *testing.T) {
 	ctrl := &multiviewTestController{}
 
 	h := NewSplitRecHandler(mgr, fakePathFinder{path: ctrl}, test.NilLogger)
-	h.SetViewResolver(&fakeViewResolver{views: map[string][]string{table: {"fwh", "fwv"}}})
 
 	// No start round was ever issued for this table.
 	stopReq := splitRecRequest{Time: "9999999999", AppID: appID, TableID: table, GameID: "game1", GameRound: "round1"}
@@ -319,7 +312,7 @@ func TestDifferentAppsWithSameTableIDDoNotContendForTheLock(t *testing.T) {
 	require.Equal(t, 1, ctrlB.startCount)
 }
 
-func TestSingleViewTableStillWorksWithoutResolver(t *testing.T) {
+func TestSingleViewTableStillWorksWithoutConfiguration(t *testing.T) {
 	const appID = "app1"
 	const table = "legacy-table"
 	path := "app1/legacy-table-fwh"
@@ -328,7 +321,8 @@ func TestSingleViewTableStillWorksWithoutResolver(t *testing.T) {
 	ctrl := &multiviewTestController{}
 
 	h := NewSplitRecHandler(mgr, fakePathFinder{path: ctrl}, test.NilLogger)
-	// No SetViewResolver call: falls back to the single-view "fwh" default.
+	// View "fwh" is discovered straight from the registered path name, with
+	// no table->view configuration anywhere.
 
 	startReq := splitRecRequest{Time: "9999999999", AppID: appID, TableID: table, GameID: "game1"}
 	require.NoError(t, h.execute(newSplitRecGinContext(), startReq))
@@ -336,5 +330,5 @@ func TestSingleViewTableStillWorksWithoutResolver(t *testing.T) {
 
 	stopReq := splitRecRequest{Time: "9999999999", AppID: appID, TableID: table, GameID: "game1", GameRound: "round1"}
 	require.NoError(t, h.execute(newSplitRecGinContext(), stopReq))
-	require.Equal(t, []string{"legacy-table-fwh-round1-game1"}, ctrl.renamedTo)
+	require.Equal(t, []string{"legacy-table-fwh-round1"}, ctrl.renamedTo)
 }

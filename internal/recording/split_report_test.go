@@ -45,9 +45,9 @@ func TestReportSplitRecFileFillsObjectKeyAppEnvAndPlaybackURL(t *testing.T) {
 	}, test.NilLogger)
 	u.reporter = reporter
 
-	u.reportSplitRecFile("table1-fwh-gc001-p2w001.mp4", "test", SplitRecFileInfo{
+	u.reportSplitRecFile("table1-fwh-gc001.mp4", "test", SplitRecFileInfo{
 		TableID: "table1", GameID: "p2w001", GameRound: "gc001",
-		StreamPath: "live/table1-fwh", FileName: "table1-fwh-gc001-p2w001.mp4",
+		StreamPath: "live/table1-fwh", FileName: "table1-fwh-gc001.mp4",
 		DurationSeconds: 45, SizeBytes: 1024000,
 	})
 
@@ -58,12 +58,12 @@ func TestReportSplitRecFileFillsObjectKeyAppEnvAndPlaybackURL(t *testing.T) {
 	require.Equal(t, "p2w001", got.GameID)
 	require.Equal(t, "gc001", got.GameRound)
 	require.Equal(t, "live/table1-fwh", got.StreamPath)
-	require.Equal(t, "table1-fwh-gc001-p2w001.mp4", got.FileName)
+	require.Equal(t, "table1-fwh-gc001.mp4", got.FileName)
 	require.Equal(t, int64(45), got.DurationSeconds)
 	require.Equal(t, int64(1024000), got.SizeBytes)
 	require.Equal(t, "test", got.AppEnv, "appEnv must be the resolved env, filled in by reportSplitRecFile")
-	require.Equal(t, "table1-fwh-gc001-p2w001.mp4", got.ObjectKey)
-	require.Equal(t, "https://cdn.example.com/test/table1-fwh-gc001-p2w001.mp4", got.PlaybackURL)
+	require.Equal(t, "table1-fwh-gc001.mp4", got.ObjectKey)
+	require.Equal(t, "https://cdn.example.com/test/table1-fwh-gc001.mp4", got.PlaybackURL)
 }
 
 // TestReportSplitRecFileNoopWithoutReporter verifies a nil reporter (the
