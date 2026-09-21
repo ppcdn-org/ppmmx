@@ -598,11 +598,12 @@ type Conf struct {
 	SRTFlowControlWindow int `json:"srtFlowControlWindow"`
 
 	// SRT adaptive receive latency (see docs/srt-adaptive-latency-design.md):
-	// per publish path, every SRTLatencyEvalInterval mmx looks at the p95
-	// unrecovered drop rate observed on that path over the preceding
-	// interval and adjusts that path's own tuned latency up or down by
-	// SRTLatencyStep, clamped to [SRTLatencyMin, SRTLatencyMax]. A path
-	// seeds its tuned value from SRTLatency the first time it is seen.
+	// per publish path, every per-minute unrecovered drop-rate event adjusts
+	// that path's own tuned latency by SRTLatencyStep, clamped to
+	// [SRTLatencyMin, SRTLatencyMax]. An event above SRTLatencyRaisePct
+	// raises the latency, one below SRTLatencyLowerPct lowers it, and a
+	// value inside the dead band leaves it unchanged. A path seeds its
+	// tuned value from SRTLatency the first time it is seen.
 	//
 	// The new value is not applied to the connection that is currently
 	// publishing - SRT negotiates TSBPD delay once at handshake time and
@@ -614,9 +615,7 @@ type Conf struct {
 	//
 	// SRTLatencyRaisePct/SRTLatencyLowerPct form a hysteresis band
 	// (SRTLatencyLowerPct < SRTLatencyRaisePct, enforced by Validate) so a
-	// path hovering near one threshold doesn't oscillate every interval.
-	// SRTLatencyMinSamples guards against tuning off a path that has only
-	// been up for a few minutes in the interval.
+	// path hovering near one threshold doesn't oscillate.
 	//
 	// SRTReceiverBufferSize/SRTFlowControlWindow are not tuned per path:
 	// they are sized once at startup for SRTLatencyMax (the worst case a
@@ -624,14 +623,12 @@ type Conf struct {
 	// (possibly lower) tuned value would mean a later raise could outgrow
 	// a buffer already allocated - the same problem this whole mechanism
 	// exists to avoid for latency itself.
-	SRTLatencyAutoTune     bool     `json:"srtLatencyAutoTune"`
-	SRTLatencyMin          Duration `json:"srtLatencyMin"`
-	SRTLatencyMax          Duration `json:"srtLatencyMax"`
-	SRTLatencyEvalInterval Duration `json:"srtLatencyEvalInterval"`
-	SRTLatencyStep         Duration `json:"srtLatencyStep"`
-	SRTLatencyRaisePct     float64  `json:"srtLatencyRaisePct"`
-	SRTLatencyLowerPct     float64  `json:"srtLatencyLowerPct"`
-	SRTLatencyMinSamples   int      `json:"srtLatencyMinSamples"`
+	SRTLatencyAutoTune bool     `json:"srtLatencyAutoTune"`
+	SRTLatencyMin      Duration `json:"srtLatencyMin"`
+	SRTLatencyMax      Duration `json:"srtLatencyMax"`
+	SRTLatencyStep     Duration `json:"srtLatencyStep"`
+	SRTLatencyRaisePct float64  `json:"srtLatencyRaisePct"`
+	SRTLatencyLowerPct float64  `json:"srtLatencyLowerPct"`
 
 	// SRTLossAlarmEnable reports a publish connection's SRT UNRECOVERABLE
 	// loss rate to ppcenter (POST /internal/mmx/v1/alarms/srt-loss) whenever
@@ -866,14 +863,14 @@ func (conf *Conf) setDefaults() {
 	// SRT server
 	conf.SRT = true
 	conf.SRTAddress = ":8890"
-	// 300ms default (~9x a typical ~32ms RTT), configurable per-node via
+	// 500ms default (~15x a typical ~32ms RTT), configurable per-node via
 	// the srtLatency YAML key. The previous 2000ms was ~60x RTT and
-	// pushed end-to-end P2P delay past 2 seconds for HEVC viewers; 300ms
+	// pushed end-to-end P2P delay past 2 seconds for HEVC viewers; 500ms
 	// still leaves enough margin for NAK-triggered retransmits on a
 	// clean public-internet link while keeping ingest latency reasonable.
 	// Only the seed value for a path not yet tuned by SRTLatencyAutoTune
 	// below - it is never rewritten.
-	conf.SRTLatency = 300 * Duration(time.Millisecond)
+	conf.SRTLatency = 500 * Duration(time.Millisecond)
 	conf.SRTReceiverBufferSize = 2 * 1024 * 1024
 	// 65536 packets (vs. gosrt's 25600 default): the flow-control window
 	// has to scale with SRTLatency above, otherwise the sender is capped
@@ -883,16 +880,15 @@ func (conf *Conf) setDefaults() {
 	// sizes up from for SRTLatencyMax below.
 	conf.SRTFlowControlWindow = 65536
 	// SRT adaptive receive latency (see docs/srt-adaptive-latency-design.md).
-	// SRTLatencyMin matches SRTLatency above so the seed value starts
-	// inside its own tunable range (enforced by Validate).
+	// SRTLatencyMin is below SRTLatency so a quiet path can be tuned down
+	// past its seed value; the seed must still start inside the range
+	// (enforced by Validate).
 	conf.SRTLatencyAutoTune = true
 	conf.SRTLatencyMin = 300 * Duration(time.Millisecond)
 	conf.SRTLatencyMax = 3000 * Duration(time.Millisecond)
-	conf.SRTLatencyEvalInterval = 8 * Duration(time.Hour)
-	conf.SRTLatencyStep = 200 * Duration(time.Millisecond)
-	conf.SRTLatencyRaisePct = 0.8
-	conf.SRTLatencyLowerPct = 0.4
-	conf.SRTLatencyMinSamples = 60
+	conf.SRTLatencyStep = 100 * Duration(time.Millisecond)
+	conf.SRTLatencyRaisePct = 1.0
+	conf.SRTLatencyLowerPct = 0.1
 	// Both alarm/disconnect flags default off (opt-in, matching
 	// WebRTCDegradeEnable) so turning either on "just works" with these
 	// numbers without also having to set the threshold/duration.
@@ -1520,14 +1516,8 @@ func (conf *Conf) Validate(l logger.Writer) error {
 			return fmt.Errorf("'srtLatency' must be >= 'srtLatencyMin', otherwise a newly seen " +
 				"path's initial value is immediately out of its own tunable range")
 		}
-		if conf.SRTLatencyEvalInterval <= 0 {
-			return fmt.Errorf("'srtLatencyEvalInterval' must be greater than zero")
-		}
 		if conf.SRTLatencyStep <= 0 {
 			return fmt.Errorf("'srtLatencyStep' must be greater than zero")
-		}
-		if conf.SRTLatencyMinSamples <= 0 {
-			return fmt.Errorf("'srtLatencyMinSamples' must be greater than zero")
 		}
 		if conf.SRTLatencyLowerPct >= conf.SRTLatencyRaisePct {
 			return fmt.Errorf("'srtLatencyLowerPct' must be < 'srtLatencyRaisePct', " +

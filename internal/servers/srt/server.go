@@ -139,14 +139,12 @@ type Server struct {
 	// comment and docs/srt-adaptive-latency-design.md). When disabled,
 	// every connection uses Latency/ReceiverBufferSize/FlowControlWindow
 	// above unchanged - byte for byte the pre-existing behavior.
-	LatencyAutoTune     bool
-	LatencyMin          conf.Duration
-	LatencyMax          conf.Duration
-	LatencyEvalInterval conf.Duration
-	LatencyStep         conf.Duration
-	LatencyRaisePct     float64
-	LatencyLowerPct     float64
-	LatencyMinSamples   int
+	LatencyAutoTune bool
+	LatencyMin      conf.Duration
+	LatencyMax      conf.Duration
+	LatencyStep     conf.Duration
+	LatencyRaisePct float64
+	LatencyLowerPct float64
 	// PublishAuthKey is the shared secret ppcenter seals publish tokens
 	// with - the same key the WHIP server uses (see the HEVC/H264
 	// multitrack design §3.2: both ingest protocols share one token
@@ -292,23 +290,18 @@ func (s *Server) Initialize() error {
 
 	if s.LatencyAutoTune {
 		s.latencyManager = newLatencyManager(srtLatencyConfig{
-			Initial:      time.Duration(s.Latency),
-			Min:          time.Duration(s.LatencyMin),
-			Max:          time.Duration(s.LatencyMax),
-			Step:         time.Duration(s.LatencyStep),
-			EvalInterval: time.Duration(s.LatencyEvalInterval),
-			RaisePct:     s.LatencyRaisePct,
-			LowerPct:     s.LatencyLowerPct,
-			MinSamples:   s.LatencyMinSamples,
+			Initial:  time.Duration(s.Latency),
+			Min:      time.Duration(s.LatencyMin),
+			Max:      time.Duration(s.LatencyMax),
+			Step:     time.Duration(s.LatencyStep),
+			RaisePct: s.LatencyRaisePct,
+			LowerPct: s.LatencyLowerPct,
 		}, s.Log)
 
 		s.Log(logger.Info, "SRT adaptive latency: enabled, range [%v, %v], step %v, "+
-			"eval interval %v, raise/lower thresholds %.2f%%/%.2f%%",
+			"raise/lower thresholds %.2f%%/%.2f%%",
 			time.Duration(s.LatencyMin), time.Duration(s.LatencyMax), time.Duration(s.LatencyStep),
-			time.Duration(s.LatencyEvalInterval), s.LatencyRaisePct, s.LatencyLowerPct)
-
-		s.wg.Add(1)
-		go s.latencyManager.Run(s.ctx, &s.wg)
+			s.LatencyRaisePct, s.LatencyLowerPct)
 	}
 
 	// Forwards gosrt's NAK trace into our own logger. Exits via s.ctx rather

@@ -76,7 +76,7 @@ type conn struct {
 	degradeObservationSec int
 
 	// latencyManager feeds this connection's unrecovered drop rate into
-	// the per-path adaptive latency evaluator (see latency.go and
+	// the per-path adaptive latency tuner (see latency.go and
 	// docs/srt-adaptive-latency-design.md). Nil when SRTLatencyAutoTune
 	// is disabled.
 	latencyManager *latencyManager
@@ -432,10 +432,10 @@ func (c *conn) runReceiveStatsSummary(sconn srt.Conn, pathName string, done <-ch
 					snap.Extra = fmt.Sprintf(" retrans=%d drop=%d dup=%d unrecoverableLoss=%d(%.2f%%)",
 						dRetrans, dDrop, dDup, unrecovered, unrecoveredPct)
 
-					// Feed the adaptive-latency evaluator (see
+					// Feed the adaptive-latency tuner (see
 					// docs/srt-adaptive-latency-design.md). Zero-traffic
 					// intervals are never recorded: an idle path would
-					// otherwise pull its p95 toward zero and trigger a
+					// otherwise look like a low-drop event and trigger a
 					// spurious latency reduction.
 					if c.latencyManager != nil && snap.PacketsExpected > 0 {
 						c.latencyManager.Record(pathName, unrecoveredPct)

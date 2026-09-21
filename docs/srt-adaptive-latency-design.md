@@ -8,12 +8,12 @@ at startup (`internal/servers/srt/server.go`'s `Initialize()`) and could not
 be changed without restarting the process.
 
 This design adds a per-path, self-tuning receiver latency, ported from
-philCDN/mmx's `docs/srt-adaptive-latency-design.md`. Every
-`srtLatencyEvalInterval` (default 8 hours) ppmmx evaluates the unrecovered
-drop rate observed on each path over the preceding interval and derives a
-new latency for that path. The new value is stored but is **not** applied
-to the connection currently running. It is applied when the next connection
-for that path performs its handshake.
+philCDN/mmx's `docs/srt-adaptive-latency-design.md`. Every per-minute
+unrecovered-drop-rate event adjusts that path's latency: an event above the
+raise threshold adds one `srtLatencyStep`, one below the lower threshold
+subtracts one, and anything in between leaves it unchanged. The new value is
+stored but is **not** applied to the connection currently running. It is
+applied when the next connection for that path performs its handshake.
 
 The scheme is deliberately opportunistic: it never forces a disconnect, so
 its runtime cost to viewers is zero. The trade-off is that a new value may
@@ -138,13 +138,13 @@ type latencyManager struct {
 
 type srtLatencyPathState struct {
 	current time.Duration // value handed to the next connection
-	samples []float64     // rolling window of per-minute drop rates
 }
 ```
 
 Two entry points:
 
-- `Record(path string, dropRatePct float64)` - appends one sample.
+- `Record(path string, dropRatePct float64)` - applies one event
+  immediately (see [Evaluation](#3-evaluation)).
 - `LatencyFor(path string) time.Duration` - returns the value for a new
   connection. An unknown path is seeded with `conf.SRTLatency` on first
   sight.
@@ -159,43 +159,43 @@ State is keyed by path, not by connection, so it survives reconnects.
 
 ### 3. Evaluation
 
-Every `srtLatencyEvalInterval` (default 8h), for each path:
+Per event, i.e. on every 60s sample `Record` receives, for that path:
 
 ```
-p95 = percentile(samples, 95)
-
-if   p95 > srtLatencyRaisePct  -> current += srtLatencyStep
-elif p95 < srtLatencyLowerPct  -> current -= srtLatencyStep
-else                           -> unchanged
+if   dropRatePct > srtLatencyRaisePct  -> current += srtLatencyStep
+elif dropRatePct < srtLatencyLowerPct  -> current -= srtLatencyStep
+else                                   -> unchanged
 
 clamp(current, srtLatencyMin, srtLatencyMax)
-reset window
 ```
 
-**Why p95 and not the mean.** The mean over a busy/quiet mixed period
-dilutes exactly the interval the mechanism exists to detect - a bad night
-can sit inside the no-change dead band on the mean while its p95 sits well
-above the raise threshold.
+The decision is applied to the stored value immediately, but - as noted
+above - it only reaches the wire at that path's next handshake.
 
-**Step and bounds.** Default `srtLatencyStep` is 200ms per evaluation,
-clamped to `[srtLatencyMin, srtLatencyMax]` = `[300ms, 3000ms]` by default.
-These bounds are independent of `srtLatency`: a path is only *seeded* from
-`srtLatency` the first time it is seen, and can move below that seed value
-down to `srtLatencyMin` if its drop rate is consistently low. At most one
-step per evaluation - this is intentional damping; a single bad night
-should not slam the window wide open.
+**Per event, not per window.** A windowed aggregate (an earlier revision
+used the p95 over a multi-hour interval) delays the response by up to a
+whole window and lets one bad minute hide inside a mostly-good one. Reacting
+to each event makes the tuned value track the link directly: a run of bad
+minutes raises latency by one step per minute until the drop disappears,
+while a run of clean minutes walks it back down.
+
+**Step and bounds.** Default `srtLatencyStep` is 100ms per event, clamped to
+`[srtLatencyMin, srtLatencyMax]` = `[300ms, 3000ms]` by default. These
+bounds are independent of `srtLatency`: a path is only *seeded* from
+`srtLatency` (default 500ms) the first time it is seen, and can move below
+that seed value down to `srtLatencyMin` if its drop rate is consistently
+low. At most one step per event - a path that is already at a bound simply
+stays there.
 
 **Hysteresis.** The `srtLatencyLowerPct`-`srtLatencyRaisePct` dead band
-(default 0.4%-0.8%) separates the raise and lower thresholds, so a path
-hovering near one threshold does not oscillate.
+(default 0.1%-1.0%) separates the raise and lower thresholds, so a path
+hovering near one threshold does not oscillate. An event in the band leaves
+the tuned value untouched.
 
-**Insufficient data.** If a path has fewer than `srtLatencyMinSamples`
-(default 60, i.e. one hour of traffic) valid samples in the window, the
-evaluation is skipped and the window is reset. Zero-traffic intervals are
-never recorded at all - they carry no information and would otherwise pull
-the p95 toward zero and trigger spurious reductions. This mirrors the
-existing zero-traffic guard already present for ppmmx's degrade FSM
-(`srtDecideDegrade` in `conn.go`).
+**Zero traffic.** Zero-traffic intervals are never recorded at all - they
+carry no information and would otherwise look like a low-drop event and
+trigger spurious reductions. This mirrors the existing zero-traffic guard
+already present for ppmmx's degrade FSM (`srtDecideDegrade` in `conn.go`).
 
 ### 4. Buffer sizing
 
@@ -246,60 +246,57 @@ existing code path regardless).
 ### Latency of Effect
 
 A newly computed value takes effect only at the next handshake for that
-path. A long-lived publish connection may run through several evaluations
-without ever seeing the new value applied. This is the direct consequence
-of refusing to force a reconnect, and it is the intended trade-off. The
-mechanism converges over days, not minutes. Operators who need a value
-applied immediately can restart the publisher.
+path. A long-lived publish connection may receive many events without ever
+seeing the new value applied. This is the direct consequence of refusing to
+force a reconnect, and it is the intended trade-off. Operators who need a
+value applied immediately can restart the publisher.
 
 ## Configuration
 
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `srtLatencyAutoTune` | `true` | Master switch. |
-| `srtLatency` | `300ms` | Unchanged, existing key. Seeds a path's tuned value the first time it is seen. Never rewritten. |
+| `srtLatency` | `500ms` | Unchanged, existing key. Seeds a path's tuned value the first time it is seen. Never rewritten. |
 | `srtLatencyMin` | `300ms` | Lower bound a path can be tuned down to. |
 | `srtLatencyMax` | `3000ms` | Upper bound a path can be tuned up to. |
-| `srtLatencyEvalInterval` | `8h` | Evaluation period and sample window. |
-| `srtLatencyStep` | `200ms` | Adjustment per evaluation. |
-| `srtLatencyRaisePct` | `0.8` | p95 above this raises latency. |
-| `srtLatencyLowerPct` | `0.4` | p95 below this lowers latency. |
-| `srtLatencyMinSamples` | `60` | Minimum samples for a valid evaluation. |
+| `srtLatencyStep` | `100ms` | Adjustment per event. |
+| `srtLatencyRaisePct` | `1.0` | An event above this raises latency. |
+| `srtLatencyLowerPct` | `0.1` | An event below this lowers latency. |
 
 Validation, alongside the existing rules in `internal/conf/conf.go`'s
 `Validate()`:
 
 - `srtLatencyMax >= srtLatencyMin`
 - `srtLatencyMin <= srtLatency` (the seed value must fall inside the
-  tunable range, otherwise the first evaluation after startup immediately
+  tunable range, otherwise the first event after startup immediately
   clamps it)
 - `srtLatencyRaisePct > srtLatencyLowerPct` (non-negotiable; equal values
   remove the hysteresis and cause oscillation)
-- `srtLatencyStep > 0`, `srtLatencyEvalInterval > 0`,
-  `srtLatencyMinSamples > 0`
+- `srtLatencyStep > 0`
 
 Since `srtLatencyAutoTune` defaults to `true`, an upgrade changes behavior
-out of the box: any path whose measured p95 drop rate is already above
-0.8% will start raising its latency within the first 8-hour window,
-without any config change. Deployments that must keep today's fixed-latency
-behavior need to set `srtLatencyAutoTune: false` explicitly.
+out of the box: any path whose measured drop rate is already above 1% will
+start raising its latency on its next event, without any config change.
+Deployments that must keep today's fixed-latency behavior need to set
+`srtLatencyAutoTune: false` explicitly.
 
 ## Observability
 
-Per evaluation, one line per path:
+One line, logged whenever an event moves the tuned value:
 
 ```
-SRT latency tune - path: live/x, samples: 480, p95: 1.04%, latency: 300ms -> 500ms
+SRT latency tune - path: live/x, unrecovered drop: 1.04%, latency: 500ms -> 600ms
 ```
 
-`ReceiverBufferSize`/`FlowControlWindow` do not change per evaluation (they
-are fixed for `srtLatencyMax` at startup, see
+Events inside the dead band leave the value unchanged and are not logged;
+the per-minute `unrecoveredLoss=` field of the SRT stats line already
+reports every sample, so a quiet path is still distinguishable from a broken
+tuner.
+
+`ReceiverBufferSize`/`FlowControlWindow` do not change per event (they are
+fixed for `srtLatencyMax` at startup, see
 [Buffer sizing](#4-buffer-sizing)), so they are not part of this line. The
 listener startup log reports the buffer/FC values once.
-
-Skipped evaluations state the reason (`insufficient samples: 12 < 60`).
-Unchanged evaluations are logged too, so a quiet path is distinguishable
-from a broken evaluator.
 
 ## Interaction with existing ppmmx SRT features
 
@@ -314,26 +311,24 @@ ppmmx (unlike upstream philCDN/mmx) already ships:
   unrecovered drop rate (`srtDecideDegrade`), sharing the same
   60s-interval samples this design reads from. The two mechanisms consume
   the same signal independently - a persistently high drop rate will both
-  raise the tuned latency (over the next 8h window) and degrade the
+  raise the tuned latency (one step per bad event) and degrade the
   simulcast ladder (immediately, on the next sample), which is
-  intentional: latency tuning is a slow, session-spanning fix, while
-  degrade is a fast, single-connection mitigation.
+  intentional: latency tuning is a session-spanning fix, while degrade is a
+  fast, single-connection mitigation.
 
 ## Test Plan
 
 Unit tests (`internal/servers/srt/latency_test.go`), no live link required:
 
-- p95 on a known distribution, confirming a raise decision.
+- An event above the raise threshold adds exactly one step; one below the
+  lower threshold subtracts exactly one; a dead-band event changes nothing.
 - Clamping at both bounds; repeated raises stop at `srtLatencyMax`,
   repeated lowers stop at `srtLatencyMin`, independent of the seed value
   `srtLatency`.
-- Dead-band inputs produce no change.
-- Fewer than `srtLatencyMinSamples` produces no change and resets the
-  window.
 - Two paths tune independently and do not share state.
+- An unknown path is seeded with `srtLatency`.
 - `fc >= bufBytes / 1316` holds for the fixed, startup-computed buffer
   values.
-- `latencyManager.Run` exits promptly on context cancellation.
 
 Integration (manual/production):
 
@@ -348,7 +343,8 @@ Integration (manual/production):
 | --- | --- |
 | Forking `gosrt` adds maintenance cost | Change is ~8 lines, additive, on a stable interface; `replace` precedent already exists for `webtransport-go` |
 | Tuned value never applied on long-lived connections | Accepted and documented; zero-disruption was the requirement |
-| p95 skewed by a short, very bad connection | `srtLatencyMinSamples` floor; `srtLatencyStep` cap per evaluation |
+| A single very bad event moves the tuned value | `srtLatencyStep` bounds each event to one step; the value only reaches the wire at the path's next handshake |
+| Oscillation around a threshold | `srtLatencyLowerPct`-`srtLatencyRaisePct` dead band (default 0.1%-1.0%) |
 | Larger buffers increase memory per connection | Fixed once for `srtLatencyMax`, not per-connection tuned value |
 | `srtLatencyAutoTune` defaults on, changing behavior at upgrade time | Documented above; operators wanting the old fixed behavior must set it to `false` |
 | Tuning masks a genuine network fault | Existing loss-alarm/degrade signals are unchanged and still fire off the same raw counters |

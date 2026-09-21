@@ -1,9 +1,6 @@
 package srt
 
 import (
-	"context"
-	"math"
-	"sort"
 	"sync"
 	"time"
 
@@ -14,27 +11,23 @@ import (
 // verbatim from the conf.SRTLatency* fields - see conf.go's doc comment and
 // docs/srt-adaptive-latency-design.md for the policy these implement.
 type srtLatencyConfig struct {
-	Initial      time.Duration // seeds a path's tuned value the first time it is seen
-	Min          time.Duration
-	Max          time.Duration
-	Step         time.Duration
-	EvalInterval time.Duration
-	RaisePct     float64
-	LowerPct     float64
-	MinSamples   int
+	Initial  time.Duration // seeds a path's tuned value the first time it is seen
+	Min      time.Duration
+	Max      time.Duration
+	Step     time.Duration
+	RaisePct float64 // an event above this drop rate raises latency by Step
+	LowerPct float64 // an event below this drop rate lowers latency by Step
 }
 
-// srtLatencyPathState is one path's tuned latency and its accumulated
-// unrecovered-drop-rate samples for the current evaluation window.
+// srtLatencyPathState is one path's tuned latency.
 type srtLatencyPathState struct {
 	current time.Duration
-	samples []float64
 }
 
 // latencyManager owns the per-path tuned SRT receive latency. It is safe
 // for concurrent use: Record is called from each connection's per-minute
-// statistics goroutine (internal/servers/srt/conn.go), LatencyFor is called
-// from the server's accept loop, and evaluateAll runs on its own ticker.
+// statistics goroutine (internal/servers/srt/conn.go), while LatencyFor is
+// called from the server's accept loop.
 type latencyManager struct {
 	cfg srtLatencyConfig
 	log func(logger.Level, string, ...any)
@@ -67,100 +60,46 @@ func (m *latencyManager) getOrCreateLocked(path string) *srtLatencyPathState {
 	return st
 }
 
-// Record appends one interval's unrecovered drop rate (percent) to path's
-// current evaluation window. Callers must not record zero-traffic
-// intervals (totalPkts == 0) - an idle interval would otherwise pull the
-// p95 toward zero and trigger a spurious latency reduction.
+// Record applies one interval's unrecovered drop rate (percent) to path's
+// tuned latency immediately: every event above cfg.RaisePct raises it by
+// cfg.Step, every event below cfg.LowerPct lowers it by cfg.Step, and a
+// value inside the dead band leaves it unchanged - all clamped to
+// [cfg.Min, cfg.Max]. Callers must not record zero-traffic intervals
+// (totalPkts == 0) - an idle interval would otherwise look like a low-drop
+// event and trigger a spurious latency reduction.
 func (m *latencyManager) Record(path string, dropRatePct float64) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
 	st := m.getOrCreateLocked(path)
-	st.samples = append(st.samples, dropRatePct)
+	next := srtLatencyNextValue(st.current, dropRatePct, m.cfg)
+	if next == st.current {
+		return
+	}
+
+	m.logf(logger.Info, "path: %s, unrecovered drop: %.2f%%, latency: %v -> %v",
+		path, dropRatePct, st.current, next)
+	st.current = next
 }
 
 // LatencyFor returns the latency a new connection on path should request.
-// An unknown path is seeded with cfg.Initial (conf.SRTLatency) and recorded
-// so it can be tuned from then on.
+// An unknown path is seeded with cfg.Initial (conf.SRTLatency) so it can be
+// tuned from then on.
 func (m *latencyManager) LatencyFor(path string) time.Duration {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.getOrCreateLocked(path).current
 }
 
-// Run evaluates every known path once per cfg.EvalInterval until ctx is
-// done. Intended to be started once from Server.Initialize.
-func (m *latencyManager) Run(ctx context.Context, wg *sync.WaitGroup) {
-	defer wg.Done()
-
-	ticker := time.NewTicker(m.cfg.EvalInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ticker.C:
-			m.evaluateAll()
-		case <-ctx.Done():
-			return
-		}
-	}
-}
-
-func (m *latencyManager) evaluateAll() {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	for path, st := range m.paths {
-		samples := st.samples
-		st.samples = nil
-
-		if len(samples) < m.cfg.MinSamples {
-			m.logf(logger.Info, "path: %s, skipped: insufficient samples: %d < %d",
-				path, len(samples), m.cfg.MinSamples)
-			continue
-		}
-
-		p95 := srtLatencyPercentile(samples, 95)
-		next := srtLatencyNextValue(st.current, p95, m.cfg)
-
-		if next == st.current {
-			m.logf(logger.Info, "path: %s, samples: %d, p95: %.2f%%, latency: %v (unchanged)",
-				path, len(samples), p95, st.current)
-			continue
-		}
-
-		m.logf(logger.Info, "path: %s, samples: %d, p95: %.2f%%, latency: %v -> %v",
-			path, len(samples), p95, st.current, next)
-		st.current = next
-	}
-}
-
-// srtLatencyPercentile returns the p-th percentile (0-100) of samples using
-// the nearest-rank method. samples is not mutated.
-func srtLatencyPercentile(samples []float64, p float64) float64 {
-	if len(samples) == 0 {
-		return 0
-	}
-	sorted := append([]float64(nil), samples...)
-	sort.Float64s(sorted)
-	idx := int(math.Ceil(p/100*float64(len(sorted)))) - 1
-	if idx < 0 {
-		idx = 0
-	}
-	if idx >= len(sorted) {
-		idx = len(sorted) - 1
-	}
-	return sorted[idx]
-}
-
-// srtLatencyNextValue applies one evaluation's raise/lower/hold decision to
+// srtLatencyNextValue applies one event's raise/lower/hold decision to
 // current and clamps the result to [cfg.Min, cfg.Max]. Extracted from
-// evaluateAll so the policy can be tested without a live SRT connection.
-func srtLatencyNextValue(current time.Duration, p95 float64, cfg srtLatencyConfig) time.Duration {
+// Record so the policy can be tested without a live SRT connection.
+func srtLatencyNextValue(current time.Duration, dropRatePct float64, cfg srtLatencyConfig) time.Duration {
 	next := current
 	switch {
-	case p95 > cfg.RaisePct:
+	case dropRatePct > cfg.RaisePct:
 		next = current + cfg.Step
-	case p95 < cfg.LowerPct:
+	case dropRatePct < cfg.LowerPct:
 		next = current - cfg.Step
 	}
 
