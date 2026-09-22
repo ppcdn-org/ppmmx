@@ -1093,6 +1093,7 @@ func (p *Core) createResources(initial bool) error {
 			LatencyMin:          p.conf.SRTLatencyMin,
 			LatencyMax:          p.conf.SRTLatencyMax,
 			LatencyStep:         p.conf.SRTLatencyStep,
+			LatencyRaiseStep:    p.conf.SRTLatencyRaiseStep,
 			LatencyRaisePct:     p.conf.SRTLatencyRaisePct,
 			LatencyLowerPct:     p.conf.SRTLatencyLowerPct,
 			RunOnConnect:        p.conf.RunOnConnect,

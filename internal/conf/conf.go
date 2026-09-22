@@ -599,11 +599,12 @@ type Conf struct {
 
 	// SRT adaptive receive latency (see docs/srt-adaptive-latency-design.md):
 	// per publish path, every per-minute unrecovered drop-rate event adjusts
-	// that path's own tuned latency by SRTLatencyStep, clamped to
+	// that path's own tuned latency, clamped to
 	// [SRTLatencyMin, SRTLatencyMax]. An event above SRTLatencyRaisePct
-	// raises the latency, one below SRTLatencyLowerPct lowers it, and a
-	// value inside the dead band leaves it unchanged. A path seeds its
-	// tuned value from SRTLatency the first time it is seen.
+	// raises the latency by SRTLatencyRaiseStep, one below
+	// SRTLatencyLowerPct lowers it by SRTLatencyStep, and a value inside
+	// the dead band leaves it unchanged. A path seeds its tuned value from
+	// SRTLatency the first time it is seen.
 	//
 	// The new value is not applied to the connection that is currently
 	// publishing - SRT negotiates TSBPD delay once at handshake time and
@@ -626,9 +627,14 @@ type Conf struct {
 	SRTLatencyAutoTune bool     `json:"srtLatencyAutoTune"`
 	SRTLatencyMin      Duration `json:"srtLatencyMin"`
 	SRTLatencyMax      Duration `json:"srtLatencyMax"`
-	SRTLatencyStep     Duration `json:"srtLatencyStep"`
-	SRTLatencyRaisePct float64  `json:"srtLatencyRaisePct"`
-	SRTLatencyLowerPct float64  `json:"srtLatencyLowerPct"`
+	// SRTLatencyRaiseStep is how much one above-threshold event adds;
+	// SRTLatencyStep is how much one below-threshold event subtracts. They
+	// are deliberately separate so ramping up against loss can be faster
+	// than walking back down once the link is clean.
+	SRTLatencyRaiseStep Duration `json:"srtLatencyRaiseStep"`
+	SRTLatencyStep      Duration `json:"srtLatencyStep"`
+	SRTLatencyRaisePct  float64  `json:"srtLatencyRaisePct"`
+	SRTLatencyLowerPct  float64  `json:"srtLatencyLowerPct"`
 
 	// SRTLossAlarmEnable reports a publish connection's SRT UNRECOVERABLE
 	// loss rate to ppcenter (POST /internal/mmx/v1/alarms/srt-loss) whenever
@@ -887,6 +893,7 @@ func (conf *Conf) setDefaults() {
 	conf.SRTLatencyMin = 300 * Duration(time.Millisecond)
 	conf.SRTLatencyMax = 3000 * Duration(time.Millisecond)
 	conf.SRTLatencyStep = 100 * Duration(time.Millisecond)
+	conf.SRTLatencyRaiseStep = 200 * Duration(time.Millisecond)
 	conf.SRTLatencyRaisePct = 1.0
 	conf.SRTLatencyLowerPct = 0.1
 	// Both alarm/disconnect flags default off (opt-in, matching
@@ -1518,6 +1525,9 @@ func (conf *Conf) Validate(l logger.Writer) error {
 		}
 		if conf.SRTLatencyStep <= 0 {
 			return fmt.Errorf("'srtLatencyStep' must be greater than zero")
+		}
+		if conf.SRTLatencyRaiseStep <= 0 {
+			return fmt.Errorf("'srtLatencyRaiseStep' must be greater than zero")
 		}
 		if conf.SRTLatencyLowerPct >= conf.SRTLatencyRaisePct {
 			return fmt.Errorf("'srtLatencyLowerPct' must be < 'srtLatencyRaisePct', " +

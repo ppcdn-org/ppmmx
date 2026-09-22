@@ -11,12 +11,13 @@ import (
 // verbatim from the conf.SRTLatency* fields - see conf.go's doc comment and
 // docs/srt-adaptive-latency-design.md for the policy these implement.
 type srtLatencyConfig struct {
-	Initial  time.Duration // seeds a path's tuned value the first time it is seen
-	Min      time.Duration
-	Max      time.Duration
-	Step     time.Duration
-	RaisePct float64 // an event above this drop rate raises latency by Step
-	LowerPct float64 // an event below this drop rate lowers latency by Step
+	Initial   time.Duration // seeds a path's tuned value the first time it is seen
+	Min       time.Duration
+	Max       time.Duration
+	Step      time.Duration // the decrease step: a below-threshold event lowers latency by this
+	RaiseStep time.Duration // the increase step: an above-threshold event raises latency by this
+	RaisePct  float64       // an event above this drop rate raises latency
+	LowerPct  float64       // an event below this drop rate lowers latency
 }
 
 // srtLatencyPathState is one path's tuned latency.
@@ -62,8 +63,8 @@ func (m *latencyManager) getOrCreateLocked(path string) *srtLatencyPathState {
 
 // Record applies one interval's unrecovered drop rate (percent) to path's
 // tuned latency immediately: every event above cfg.RaisePct raises it by
-// cfg.Step, every event below cfg.LowerPct lowers it by cfg.Step, and a
-// value inside the dead band leaves it unchanged - all clamped to
+// cfg.RaiseStep, every event below cfg.LowerPct lowers it by cfg.Step, and
+// a value inside the dead band leaves it unchanged - all clamped to
 // [cfg.Min, cfg.Max]. Callers must not record zero-traffic intervals
 // (totalPkts == 0) - an idle interval would otherwise look like a low-drop
 // event and trigger a spurious latency reduction.
@@ -98,7 +99,7 @@ func srtLatencyNextValue(current time.Duration, dropRatePct float64, cfg srtLate
 	next := current
 	switch {
 	case dropRatePct > cfg.RaisePct:
-		next = current + cfg.Step
+		next = current + cfg.RaiseStep
 	case dropRatePct < cfg.LowerPct:
 		next = current - cfg.Step
 	}

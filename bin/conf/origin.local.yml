@@ -51,16 +51,19 @@ srt: true
 srtAddress: :7890
 
 # SRT 自适应接收延迟(详见 docs/srt-adaptive-latency-design.md)。按事件调整：
-# 每分钟的不可恢复丢包率 > srtLatencyRaisePct 则 +srtLatencyStep，< 该下限
-# srtLatencyLowerPct 则 -srtLatencyStep，落在死区内不变，最终钳制到
-# [srtLatencyMin, srtLatencyMax]。新值只在下一路重新握手时生效，不影响当前
-# 正在推流的连接；srtLatency 只是路径首次出现时的起始值，之后不会被改写。
+# 每分钟的不可恢复丢包率 > srtLatencyRaisePct 则 +srtLatencyRaiseStep，
+# < srtLatencyLowerPct 则 -srtLatencyStep，落在死区内不变，最终钳制到
+# [srtLatencyMin, srtLatencyMax]。上调步长与下调步长分开配置：抗丢包时
+# 升延迟更快(200ms)，链路恢复干净后回退更慢(100ms)。新值只在下一路重新
+# 握手时生效，不影响当前正在推流的连接；srtLatency 只是路径首次出现时的
+# 起始值，之后不会被改写。
 srtLatencyAutoTune: true
 srtLatency: 500ms           # 起始值
 srtLatencyMin: 300ms        # 下限
 srtLatencyMax: 3000ms       # 上限
-srtLatencyStep: 100ms       # 每次事件调整步长
-srtLatencyRaisePct: 1.0     # >1% 不可恢复丢包：延迟 +100ms
+srtLatencyRaiseStep: 200ms  # >1% 事件每次 +200ms
+srtLatencyStep: 100ms       # <0.1% 事件每次 -100ms(下调步长)
+srtLatencyRaisePct: 1.0     # >1% 不可恢复丢包：延迟 +200ms
 srtLatencyLowerPct: 0.1     # <0.1% 不可恢复丢包：延迟 -100ms
 
 # 丢包率超过 srtLossAlarmThresholdPct(默认 10%)时上报告警到 ppcenter(需要

@@ -10,8 +10,10 @@ be changed without restarting the process.
 This design adds a per-path, self-tuning receiver latency, ported from
 philCDN/mmx's `docs/srt-adaptive-latency-design.md`. Every per-minute
 unrecovered-drop-rate event adjusts that path's latency: an event above the
-raise threshold adds one `srtLatencyStep`, one below the lower threshold
-subtracts one, and anything in between leaves it unchanged. The new value is
+raise threshold adds one `srtLatencyRaiseStep`, one below the lower threshold
+subtracts one `srtLatencyStep`, and anything in between leaves it unchanged.
+The raise and lower steps are configured separately so latency can ramp up
+against loss faster than it walks back down. The new value is
 stored but is **not** applied to the connection currently running. It is
 applied when the next connection for that path performs its handshake.
 
@@ -162,7 +164,7 @@ State is keyed by path, not by connection, so it survives reconnects.
 Per event, i.e. on every 60s sample `Record` receives, for that path:
 
 ```
-if   dropRatePct > srtLatencyRaisePct  -> current += srtLatencyStep
+if   dropRatePct > srtLatencyRaisePct  -> current += srtLatencyRaiseStep
 elif dropRatePct < srtLatencyLowerPct  -> current -= srtLatencyStep
 else                                   -> unchanged
 
@@ -179,8 +181,11 @@ to each event makes the tuned value track the link directly: a run of bad
 minutes raises latency by one step per minute until the drop disappears,
 while a run of clean minutes walks it back down.
 
-**Step and bounds.** Default `srtLatencyStep` is 100ms per event, clamped to
-`[srtLatencyMin, srtLatencyMax]` = `[300ms, 3000ms]` by default. These
+**Step and bounds.** Default `srtLatencyRaiseStep` is 200ms and default
+`srtLatencyStep` (the lower/decrease step) is 100ms, per event, clamped to
+`[srtLatencyMin, srtLatencyMax]` = `[300ms, 3000ms]` by default. The raise
+step is larger so a link that has started dropping latency climbs out of the
+loss faster than it falls once the link is clean. These
 bounds are independent of `srtLatency`: a path is only *seeded* from
 `srtLatency` (default 500ms) the first time it is seen, and can move below
 that seed value down to `srtLatencyMin` if its drop rate is consistently
@@ -259,7 +264,8 @@ value applied immediately can restart the publisher.
 | `srtLatency` | `500ms` | Unchanged, existing key. Seeds a path's tuned value the first time it is seen. Never rewritten. |
 | `srtLatencyMin` | `300ms` | Lower bound a path can be tuned down to. |
 | `srtLatencyMax` | `3000ms` | Upper bound a path can be tuned up to. |
-| `srtLatencyStep` | `100ms` | Adjustment per event. |
+| `srtLatencyRaiseStep` | `200ms` | Amount one above-threshold event adds. |
+| `srtLatencyStep` | `100ms` | Amount one below-threshold event subtracts (the decrease step). |
 | `srtLatencyRaisePct` | `1.0` | An event above this raises latency. |
 | `srtLatencyLowerPct` | `0.1` | An event below this lowers latency. |
 
@@ -273,6 +279,7 @@ Validation, alongside the existing rules in `internal/conf/conf.go`'s
 - `srtLatencyRaisePct > srtLatencyLowerPct` (non-negotiable; equal values
   remove the hysteresis and cause oscillation)
 - `srtLatencyStep > 0`
+- `srtLatencyRaiseStep > 0`
 
 Since `srtLatencyAutoTune` defaults to `true`, an upgrade changes behavior
 out of the box: any path whose measured drop rate is already above 1% will
@@ -343,7 +350,7 @@ Integration (manual/production):
 | --- | --- |
 | Forking `gosrt` adds maintenance cost | Change is ~8 lines, additive, on a stable interface; `replace` precedent already exists for `webtransport-go` |
 | Tuned value never applied on long-lived connections | Accepted and documented; zero-disruption was the requirement |
-| A single very bad event moves the tuned value | `srtLatencyStep` bounds each event to one step; the value only reaches the wire at the path's next handshake |
+| A single very bad event moves the tuned value | `srtLatencyRaiseStep`/`srtLatencyStep` bound each event to one step; the value only reaches the wire at the path's next handshake |
 | Oscillation around a threshold | `srtLatencyLowerPct`-`srtLatencyRaisePct` dead band (default 0.1%-1.0%) |
 | Larger buffers increase memory per connection | Fixed once for `srtLatencyMax`, not per-connection tuned value |
 | `srtLatencyAutoTune` defaults on, changing behavior at upgrade time | Documented above; operators wanting the old fixed behavior must set it to `false` |

@@ -9,12 +9,13 @@ import (
 
 func TestSRTLatencyNextValue(t *testing.T) {
 	cfg := srtLatencyConfig{
-		Initial:  500 * time.Millisecond,
-		Min:      300 * time.Millisecond,
-		Max:      3000 * time.Millisecond,
-		Step:     100 * time.Millisecond,
-		RaisePct: 1.0,
-		LowerPct: 0.1,
+		Initial:   500 * time.Millisecond,
+		Min:       300 * time.Millisecond,
+		Max:       3000 * time.Millisecond,
+		Step:      100 * time.Millisecond,
+		RaiseStep: 200 * time.Millisecond,
+		RaisePct:  1.0,
+		LowerPct:  0.1,
 	}
 
 	for _, ca := range []struct {
@@ -23,7 +24,7 @@ func TestSRTLatencyNextValue(t *testing.T) {
 		dropPct float64
 		want    time.Duration
 	}{
-		{"raises above threshold", 500 * time.Millisecond, 1.01, 600 * time.Millisecond},
+		{"raises above threshold", 500 * time.Millisecond, 1.01, 700 * time.Millisecond},
 		{"holds exactly at raise threshold", 500 * time.Millisecond, 1.0, 500 * time.Millisecond},
 		{"lowers below threshold", 500 * time.Millisecond, 0.09, 400 * time.Millisecond},
 		{"holds exactly at lower threshold", 500 * time.Millisecond, 0.1, 500 * time.Millisecond},
@@ -42,40 +43,42 @@ func TestSRTLatencyNextValue(t *testing.T) {
 
 func TestSRTLatencyManagerRecordAdjustsPerEvent(t *testing.T) {
 	cfg := srtLatencyConfig{
-		Initial:  500 * time.Millisecond,
-		Min:      300 * time.Millisecond,
-		Max:      3000 * time.Millisecond,
-		Step:     100 * time.Millisecond,
-		RaisePct: 1.0,
-		LowerPct: 0.1,
+		Initial:   500 * time.Millisecond,
+		Min:       300 * time.Millisecond,
+		Max:       3000 * time.Millisecond,
+		Step:      100 * time.Millisecond,
+		RaiseStep: 200 * time.Millisecond,
+		RaisePct:  1.0,
+		LowerPct:  0.1,
 	}
 	m := newLatencyManager(cfg, nil)
 
 	require.Equal(t, 500*time.Millisecond, m.LatencyFor("path"))
 
-	// every >1% event raises by one step
-	m.Record("path", 1.5)
-	require.Equal(t, 600*time.Millisecond, m.LatencyFor("path"))
+	// every >1% event raises by the raise step (200ms)
 	m.Record("path", 1.5)
 	require.Equal(t, 700*time.Millisecond, m.LatencyFor("path"))
+	m.Record("path", 1.5)
+	require.Equal(t, 900*time.Millisecond, m.LatencyFor("path"))
 
 	// dead band holds
 	m.Record("path", 0.5)
-	require.Equal(t, 700*time.Millisecond, m.LatencyFor("path"))
+	require.Equal(t, 900*time.Millisecond, m.LatencyFor("path"))
 
 	// every <0.1% event lowers by one step
 	m.Record("path", 0.05)
-	require.Equal(t, 600*time.Millisecond, m.LatencyFor("path"))
+	require.Equal(t, 800*time.Millisecond, m.LatencyFor("path"))
 }
 
 func TestSRTLatencyManagerClampsToBounds(t *testing.T) {
 	cfg := srtLatencyConfig{
-		Initial:  500 * time.Millisecond,
-		Min:      300 * time.Millisecond,
-		Max:      3000 * time.Millisecond,
-		Step:     100 * time.Millisecond,
-		RaisePct: 1.0,
-		LowerPct: 0.1,
+		Initial:   500 * time.Millisecond,
+		Min:       300 * time.Millisecond,
+		Max:       3000 * time.Millisecond,
+		Step:      100 * time.Millisecond,
+		RaiseStep: 200 * time.Millisecond,
+		RaisePct:  1.0,
+		LowerPct:  0.1,
 	}
 	m := newLatencyManager(cfg, nil)
 
@@ -92,19 +95,20 @@ func TestSRTLatencyManagerClampsToBounds(t *testing.T) {
 
 func TestSRTLatencyManagerPathsIndependent(t *testing.T) {
 	cfg := srtLatencyConfig{
-		Initial:  500 * time.Millisecond,
-		Min:      300 * time.Millisecond,
-		Max:      3000 * time.Millisecond,
-		Step:     100 * time.Millisecond,
-		RaisePct: 1.0,
-		LowerPct: 0.1,
+		Initial:   500 * time.Millisecond,
+		Min:       300 * time.Millisecond,
+		Max:       3000 * time.Millisecond,
+		Step:      100 * time.Millisecond,
+		RaiseStep: 200 * time.Millisecond,
+		RaisePct:  1.0,
+		LowerPct:  0.1,
 	}
 	m := newLatencyManager(cfg, nil)
 
 	m.Record("bad", 5.0)
 	m.Record("good", 0.0)
 
-	require.Equal(t, 600*time.Millisecond, m.LatencyFor("bad"))
+	require.Equal(t, 700*time.Millisecond, m.LatencyFor("bad"))
 	require.Equal(t, 400*time.Millisecond, m.LatencyFor("good"))
 }
 
@@ -114,12 +118,13 @@ func TestSRTLatencyManagerUnknownPathSeeded(t *testing.T) {
 	// Record call it is never tuned, so an idle path is never pulled down
 	// by phantom "0% drop rate" samples.
 	cfg := srtLatencyConfig{
-		Initial:  500 * time.Millisecond,
-		Min:      300 * time.Millisecond,
-		Max:      3000 * time.Millisecond,
-		Step:     100 * time.Millisecond,
-		RaisePct: 1.0,
-		LowerPct: 0.1,
+		Initial:   500 * time.Millisecond,
+		Min:       300 * time.Millisecond,
+		Max:       3000 * time.Millisecond,
+		Step:      100 * time.Millisecond,
+		RaiseStep: 200 * time.Millisecond,
+		RaisePct:  1.0,
+		LowerPct:  0.1,
 	}
 	m := newLatencyManager(cfg, nil)
 
