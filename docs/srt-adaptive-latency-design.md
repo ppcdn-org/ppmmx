@@ -338,6 +338,18 @@ On a raise, a second line records the forced reconnect that applies it:
 [SRT] [conn <addr>] SRT receive latency raised for path live/x; forcing publisher reconnect to apply it
 ```
 
+When the publisher reconnects, the new publish connection reports the ingest
+interruption that forced reconnect cost, measured from the close to
+`AddPublisher` succeeding on the fresh connection:
+
+```
+[SRT] [conn <addr>] SRT publish resumed on path live/x after 1.1s of ingest interruption (adaptive-latency raise forced reconnect)
+```
+
+That line is the production readout of whether the ~1s reconnect assumption
+holds; a value far above ~1s is the signal to reconsider forcing a reconnect on
+raises (see [Why not the alternatives](#why-not-the-alternatives)).
+
 Events inside the dead band leave the value unchanged and are not logged;
 the per-minute `unrecoveredLoss=` field of the SRT stats line already
 reports every sample, so a quiet path is still distinguishable from a broken

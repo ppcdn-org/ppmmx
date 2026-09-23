@@ -106,6 +106,40 @@ func TestSRTLatencyManagerRecordReportsRaise(t *testing.T) {
 	require.False(t, m.Record("pinned", 5.0))
 }
 
+func TestSRTLatencyManagerRaiseCloseGap(t *testing.T) {
+	cfg := srtLatencyConfig{
+		Initial:   500 * time.Millisecond,
+		Min:       300 * time.Millisecond,
+		Max:       3000 * time.Millisecond,
+		Step:      100 * time.Millisecond,
+		RaiseStep: 200 * time.Millisecond,
+		RaisePct:  1.0,
+		LowerPct:  0.1,
+	}
+	m := newLatencyManager(cfg, nil)
+
+	// No pending close -> nothing to report (a normal first publish).
+	_, ok := m.TakeRaiseCloseGap("path", time.Now())
+	require.False(t, ok)
+
+	// After a raise-close, the next publish measures the gap and clears it.
+	t0 := time.Now()
+	m.MarkRaiseClose("path", t0)
+	gap, ok := m.TakeRaiseCloseGap("path", t0.Add(1200*time.Millisecond))
+	require.True(t, ok)
+	require.Equal(t, 1200*time.Millisecond, gap)
+
+	// The stamp is one-shot: a second publish on the same path reports nothing.
+	_, ok = m.TakeRaiseCloseGap("path", t0.Add(2*time.Second))
+	require.False(t, ok)
+
+	// A stale stamp (the publisher only came back much later) is discarded
+	// rather than reported as a bogus multi-minute interruption.
+	m.MarkRaiseClose("path", t0)
+	_, ok = m.TakeRaiseCloseGap("path", t0.Add(srtRaiseCloseStaleAfter+time.Second))
+	require.False(t, ok)
+}
+
 func TestSRTLatencyManagerClampsToBounds(t *testing.T) {
 	cfg := srtLatencyConfig{
 		Initial:   500 * time.Millisecond,

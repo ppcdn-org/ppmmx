@@ -312,6 +312,20 @@ func (c *conn) runPublishReader(sconn srt.Conn, streamID *streamID, pathConf *co
 	c.sconn = sconn
 	c.mutex.Unlock()
 
+	// Debug measurement: if this publish is the reconnect that an adaptive-
+	// latency raise forced (see runReceiveStatsSummary), log how long the path
+	// had no publisher - i.e. the ingest interruption that forced reconnect
+	// cost. AddPublisher has just succeeded, so media is about to flow again;
+	// the gap from the MarkRaiseClose stamp to now is the dead-air window. Only
+	// the reconnect after a raise has a pending stamp - a normal first publish
+	// takes nothing and logs nothing.
+	if c.latencyManager != nil {
+		if gap, ok := c.latencyManager.TakeRaiseCloseGap(streamID.path, time.Now()); ok {
+			c.Log(logger.Info, "SRT publish resumed on path %s after %v of ingest interruption (adaptive-latency raise forced reconnect)",
+				streamID.path, gap.Round(time.Millisecond))
+		}
+	}
+
 	// Publish session history (see publish_session_report.go): tells ppcenter
 	// this SRT stream went live, and - via the deferred call - when and why
 	// it stopped. Reported at the lifecycle boundaries rather than sampled,
@@ -517,6 +531,12 @@ func (c *conn) runReceiveStatsSummary(sconn srt.Conn, pathName string, done <-ch
 				// done after the stats line and loss sample so this interval is
 				// still fully logged first.
 				if latencyRaised {
+					// Stamp the close time so the reconnecting publisher can
+					// report how long the ingest was interrupted (see
+					// runPublishReader). latencyManager is non-nil here - a
+					// raise can only be reported after a Record call, which is
+					// itself guarded by the nil check above.
+					c.latencyManager.MarkRaiseClose(pathName, time.Now())
 					c.Log(logger.Info, "SRT receive latency raised for path %s; forcing publisher reconnect to apply it", pathName)
 					c.Close()
 					return

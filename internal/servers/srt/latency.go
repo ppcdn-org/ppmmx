@@ -23,7 +23,21 @@ type srtLatencyConfig struct {
 // srtLatencyPathState is one path's tuned latency.
 type srtLatencyPathState struct {
 	current time.Duration
+	// raiseClosedAt is when this path's publisher was last force-closed to
+	// apply a raise (zero = none pending). It lets the reconnecting publisher
+	// measure the ingest interruption that forced reconnect cost - see
+	// MarkRaiseClose / TakeRaiseCloseGap and conn.go.
+	raiseClosedAt time.Time
 }
+
+// srtRaiseCloseStaleAfter bounds how long a pending raise-close timestamp is
+// taken to belong to the reconnect it triggered. A publisher that only comes
+// back later than this is treated as an unrelated fresh publish, so a stale
+// timestamp never yields a bogus multi-minute "interruption" reading. Set well
+// above any plausible OBS reconnect (which is ~1s, but can be tens of seconds
+// if OBS is retrying) so a genuinely slow reconnect - exactly the case worth
+// measuring - is still captured.
+const srtRaiseCloseStaleAfter = 2 * time.Minute
 
 // latencyManager owns the per-path tuned SRT receive latency. It is safe
 // for concurrent use: Record is called from each connection's per-minute
@@ -102,6 +116,35 @@ func (m *latencyManager) LatencyFor(path string) time.Duration {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.getOrCreateLocked(path).current
+}
+
+// MarkRaiseClose records that path's publisher was just force-closed to apply
+// a raised latency, so the next publish on that path can measure and log the
+// reconnect gap (see conn.go). Safe for concurrent use.
+func (m *latencyManager) MarkRaiseClose(path string, at time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.getOrCreateLocked(path).raiseClosedAt = at
+}
+
+// TakeRaiseCloseGap returns the elapsed time since path's last raise-triggered
+// close and clears it, reporting ok == true only when a plausible pending
+// close exists (non-zero and within srtRaiseCloseStaleAfter). A path with no
+// pending close, or a stale one, returns ok == false so a normal publish logs
+// nothing.
+func (m *latencyManager) TakeRaiseCloseGap(path string, now time.Time) (time.Duration, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	st, ok := m.paths[path]
+	if !ok || st.raiseClosedAt.IsZero() {
+		return 0, false
+	}
+	gap := now.Sub(st.raiseClosedAt)
+	st.raiseClosedAt = time.Time{}
+	if gap < 0 || gap > srtRaiseCloseStaleAfter {
+		return 0, false
+	}
+	return gap, true
 }
 
 // srtLatencyNextValue applies one event's raise/lower/hold decision to
