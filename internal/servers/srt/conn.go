@@ -405,6 +405,7 @@ func (c *conn) runReceiveStatsSummary(sconn srt.Conn, pathName string, done <-ch
 				// active alarm.
 				var unrecoveredPct, recoverablePct float64
 				haveUnrecovered := false
+				latencyRaised := false
 				if st.Accumulated.PktRecvRetrans >= lastRetrans && st.Accumulated.PktRecvDrop >= lastDrop &&
 					st.Accumulated.PktRecvDuplicate >= lastDup && st.Accumulated.PktRecvLoss >= lastLoss {
 					dRetrans := st.Accumulated.PktRecvRetrans - lastRetrans
@@ -438,7 +439,7 @@ func (c *conn) runReceiveStatsSummary(sconn srt.Conn, pathName string, done <-ch
 					// otherwise look like a low-drop event and trigger a
 					// spurious latency reduction.
 					if c.latencyManager != nil && snap.PacketsExpected > 0 {
-						c.latencyManager.Record(pathName, unrecoveredPct)
+						latencyRaised = c.latencyManager.Record(pathName, unrecoveredPct)
 					}
 				}
 				lastRetrans, lastDrop, lastDup, lastLoss = st.Accumulated.PktRecvRetrans, st.Accumulated.PktRecvDrop, st.Accumulated.PktRecvDuplicate, st.Accumulated.PktRecvLoss
@@ -501,6 +502,24 @@ func (c *conn) runReceiveStatsSummary(sconn srt.Conn, pathName string, done <-ch
 							c.Log(logger.Debug, "SRT loss sample report failed: %v", err)
 						}
 					}()
+				}
+
+				// A newly RAISED tuned latency only reaches the wire on a
+				// fresh handshake - SRT fixes the receive/TSBPD delay at
+				// connect time (see docs/srt-adaptive-latency-design.md) - so
+				// force this publisher to reconnect and pick it up. Only raises
+				// trigger this: a raise is fixing active unrecovered loss, so
+				// the ~1s OBS reconnect pays for itself, whereas a lower would
+				// interrupt a healthy stream just to trim delay and is left to
+				// apply at the path's next natural reconnect. Same forced-
+				// reconnect lever as the loss disconnect above (if that already
+				// fired this interval it returned, so this never double-closes);
+				// done after the stats line and loss sample so this interval is
+				// still fully logged first.
+				if latencyRaised {
+					c.Log(logger.Info, "SRT receive latency raised for path %s; forcing publisher reconnect to apply it", pathName)
+					c.Close()
+					return
 				}
 			}
 

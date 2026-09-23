@@ -13,13 +13,24 @@ unrecovered-drop-rate event adjusts that path's latency: an event above the
 raise threshold adds one `srtLatencyRaiseStep`, one below the lower threshold
 subtracts one `srtLatencyStep`, and anything in between leaves it unchanged.
 The raise and lower steps are configured separately so latency can ramp up
-against loss faster than it walks back down. The new value is
-stored but is **not** applied to the connection currently running. It is
-applied when the next connection for that path performs its handshake.
+against loss faster than it walks back down.
 
-The scheme is deliberately opportunistic: it never forces a disconnect, so
-its runtime cost to viewers is zero. The trade-off is that a new value may
-remain pending for a long time (see [Latency of Effect](#latency-of-effect)).
+SRT fixes the receive/TSBPD delay at handshake time, so a retuned value only
+reaches the wire on a fresh connection. The two directions are therefore
+applied differently:
+
+- A **raise** forces the current publisher to reconnect immediately: the
+  server drops the connection and OBS reconnects on its own, renegotiating the
+  larger window. A raise is fixing active, viewer-visible unrecovered loss, so
+  the reconnect earns its cost.
+- A **lower** is left pending and applied opportunistically at that path's
+  next natural handshake. Lowering only trims a few hundred ms of delay off an
+  already-healthy link, which does not justify interrupting a working stream.
+
+This is a deliberate change from the original port, which never forced a
+disconnect in either direction (see
+[Why not the alternatives](#why-not-the-alternatives) and
+[Latency of Effect](#latency-of-effect)).
 
 `srtLatency` in the configuration file is never modified. It is only the
 starting value for a path that has not been tuned yet. The floor and
@@ -55,15 +66,23 @@ per minute.
 - **Static increase of `srtLatency`.** Works, costs nothing at runtime, but
   pays the worst-case latency all day, and directly increases glass-to-glass
   delay for every viewer.
-- **Forced reconnect on detection.** Typical OBS reconnect gaps run to
-  tens of seconds of dead air. Adjusting a 200ms window at that cost is a
-  poor trade. Rejected.
+- **Forced reconnect on *every* change.** The original port rejected forced
+  reconnect outright, assuming an OBS reconnect costs tens of seconds of dead
+  air. In this deployment an OBS SRT publisher reconnects in ~1s (measured in
+  production, ppcenter's rc042 rollout notes), so a reconnect is affordable
+  when it buys something. Reconnecting on a **lower** is still rejected -
+  interrupting a healthy stream to shave a few hundred ms of delay is a poor
+  trade. A **raise** is the opposite: it applies a larger window while the
+  link is actively losing packets a viewer can see, so that one direction
+  does force a reconnect. See [Applying the value](#5-applying-the-value).
 
 ## Non-Goals
 
-- Changing the latency of an established connection. SRT negotiates TSBPD
-  delay during the handshake and it is immutable for the life of the
-  connection. `gosrt`'s `Conn` interface exposes no setter.
+- Changing the latency of an established connection *in place*. SRT
+  negotiates TSBPD delay during the handshake and it is immutable for the
+  life of the connection; `gosrt`'s `Conn` interface exposes no setter. A
+  raise is applied by dropping the connection so the publisher reconnects and
+  renegotiates, never by mutating the live socket.
 - Persisting tuned values across process restarts. State is in-memory; a
   restart reseeds every path from `srtLatency`.
 - Tuning the sender side.
@@ -171,8 +190,10 @@ else                                   -> unchanged
 clamp(current, srtLatencyMin, srtLatencyMax)
 ```
 
-The decision is applied to the stored value immediately, but - as noted
-above - it only reaches the wire at that path's next handshake.
+The decision is applied to the stored value immediately. A raise then forces
+the current publisher to reconnect so the new value reaches the wire at once;
+a lower is left to reach the wire at that path's next natural handshake (see
+[Applying the value](#5-applying-the-value)).
 
 **Per event, not per window.** A windowed aggregate (an earlier revision
 used the p95 over a multi-hour interval) delays the response by up to a
@@ -248,13 +269,29 @@ Stream ID parsing already exists at `internal/servers/srt/streamid.go`
 `conf.SRTLatency` (the connection is rejected further along by the
 existing code path regardless).
 
+**Applying a raise to the running connection.** `Record` returns whether the
+event raised the tuned value. `runReceiveStatsSummary`
+(`internal/servers/srt/conn.go`), which produces the per-minute sample and
+already owns the publish connection, calls `c.Close()` when that return is
+true - after emitting the interval's stats line and loss sample so the moment
+is still fully logged. The publisher then reconnects on its own and
+`chNewConnRequest` hands it the freshly raised value through the `SetLatency`
+path above. This reuses the exact lever `srtLossDisconnect` already uses to
+make a wedged publisher reconnect; if both fire on the same interval the loss
+disconnect returns first and the raise reconnect is simply not reached. A
+lower returns false and changes nothing about the running connection. A path
+already pinned at `srtLatencyMax` never reports a raise (the clamped value
+does not move), so a saturated link does not reconnect on a loop.
+
 ### Latency of Effect
 
-A newly computed value takes effect only at the next handshake for that
-path. A long-lived publish connection may receive many events without ever
-seeing the new value applied. This is the direct consequence of refusing to
-force a reconnect, and it is the intended trade-off. Operators who need a
-value applied immediately can restart the publisher.
+A **raise** takes effect within one reconnect (~1s here) of the event that
+triggered it: the running publisher is dropped and comes back negotiating the
+higher value. A **lower** takes effect only at the path's next natural
+handshake, so a long-lived, healthy publish connection may sit above its
+tuned-down value indefinitely - which is harmless, since a pending lower means
+the link is already clean at the current (higher) latency. Operators who want
+a pending lower applied immediately can restart the publisher.
 
 ## Configuration
 
@@ -295,6 +332,12 @@ One line, logged whenever an event moves the tuned value:
 SRT latency tune - path: live/x, unrecovered drop: 1.04%, latency: 500ms -> 600ms
 ```
 
+On a raise, a second line records the forced reconnect that applies it:
+
+```
+[SRT] [conn <addr>] SRT receive latency raised for path live/x; forcing publisher reconnect to apply it
+```
+
 Events inside the dead band leave the value unchanged and are not logged;
 the per-minute `unrecoveredLoss=` field of the SRT stats line already
 reports every sample, so a quiet path is still distinguishable from a broken
@@ -332,6 +375,10 @@ Unit tests (`internal/servers/srt/latency_test.go`), no live link required:
 - Clamping at both bounds; repeated raises stop at `srtLatencyMax`,
   repeated lowers stop at `srtLatencyMin`, independent of the seed value
   `srtLatency`.
+- `Record` reports `raised == true` only when the event moves the value up
+  (loss above the raise threshold, not already at `srtLatencyMax`), and
+  `false` for a lower, a dead-band hold, and a raise event that is already
+  clamped at `srtLatencyMax`.
 - Two paths tune independently and do not share state.
 - An unknown path is seeded with `srtLatency`.
 - `fc >= bufBytes / 1316` holds for the fixed, startup-computed buffer
@@ -341,17 +388,19 @@ Integration (manual/production):
 
 - With `srtLatencyAutoTune: false`, the negotiated latency is identical to
   the pre-existing static behavior.
-- A connection established after a raise negotiates the new value; the
-  connection that was already running is untouched.
+- A raise closes the running publish connection; the publisher reconnects and
+  negotiates the higher value. A lower leaves the running connection in place,
+  and the lower value is negotiated only by that path's next connection.
 
 ## Risks
 
 | Risk | Mitigation |
 | --- | --- |
 | Forking `gosrt` adds maintenance cost | Change is ~8 lines, additive, on a stable interface; `replace` precedent already exists for `webtransport-go` |
-| Tuned value never applied on long-lived connections | Accepted and documented; zero-disruption was the requirement |
-| A single very bad event moves the tuned value | `srtLatencyRaiseStep`/`srtLatencyStep` bound each event to one step; the value only reaches the wire at the path's next handshake |
-| Oscillation around a threshold | `srtLatencyLowerPct`-`srtLatencyRaisePct` dead band (default 0.1%-1.0%) |
+| A raise reconnects the publisher; a lower may stay pending on a long-lived healthy connection | A pending lower is harmless (the link is clean at the higher latency); a raise, which fixes active loss, is applied within ~1s via the reconnect |
+| Repeated raises churn the connection with reconnects | A raise happens at most once per 60s sample and only while loss stays above `srtLatencyRaisePct`; each raise lifts the window, so a link settles after a bounded number of steps and then stops. A path already at `srtLatencyMax` does not reconnect (the clamped value cannot rise) |
+| A single very bad event moves the tuned value | `srtLatencyRaiseStep`/`srtLatencyStep` bound each event to one step; a raise reconnects to apply just that one step, then re-evaluates on the next 60s sample |
+| Oscillation around a threshold | `srtLatencyLowerPct`-`srtLatencyRaisePct` dead band (default 0.1%-1.0%); only raises reconnect, so a path hovering in the band neither retunes nor reconnects |
 | Larger buffers increase memory per connection | Fixed once for `srtLatencyMax`, not per-connection tuned value |
 | `srtLatencyAutoTune` defaults on, changing behavior at upgrade time | Documented above; operators wanting the old fixed behavior must set it to `false` |
 | Tuning masks a genuine network fault | Existing loss-alarm/degrade signals are unchanged and still fire off the same raw counters |

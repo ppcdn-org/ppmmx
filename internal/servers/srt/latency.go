@@ -68,19 +68,31 @@ func (m *latencyManager) getOrCreateLocked(path string) *srtLatencyPathState {
 // [cfg.Min, cfg.Max]. Callers must not record zero-traffic intervals
 // (totalPkts == 0) - an idle interval would otherwise look like a low-drop
 // event and trigger a spurious latency reduction.
-func (m *latencyManager) Record(path string, dropRatePct float64) {
+//
+// It returns raised == true only when this event moved the tuned value UP
+// (loss above cfg.RaisePct, and the path not already pinned at cfg.Max).
+// That is the signal the caller uses to force the current publisher to
+// reconnect so the higher latency actually reaches the wire (see conn.go and
+// docs/srt-adaptive-latency-design.md): a raise is fixing active,
+// viewer-visible loss, so the reconnect pays for itself. A lower only trims
+// delay off an already-healthy link and returns false - it is left to apply
+// opportunistically at the path's next natural handshake rather than
+// interrupting a working stream.
+func (m *latencyManager) Record(path string, dropRatePct float64) (raised bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	st := m.getOrCreateLocked(path)
 	next := srtLatencyNextValue(st.current, dropRatePct, m.cfg)
 	if next == st.current {
-		return
+		return false
 	}
 
 	m.logf(logger.Info, "path: %s, unrecovered drop: %.2f%%, latency: %v -> %v",
 		path, dropRatePct, st.current, next)
+	raised = next > st.current
 	st.current = next
+	return raised
 }
 
 // LatencyFor returns the latency a new connection on path should request.

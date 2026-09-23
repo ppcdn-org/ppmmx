@@ -606,13 +606,19 @@ type Conf struct {
 	// the dead band leaves it unchanged. A path seeds its tuned value from
 	// SRTLatency the first time it is seen.
 	//
-	// The new value is not applied to the connection that is currently
-	// publishing - SRT negotiates TSBPD delay once at handshake time and
-	// it cannot be changed for the life of a connection - it only takes
-	// effect the next time that path's publisher reconnects. This is
-	// deliberate: forcing a reconnect to apply a tuned value costs far
-	// more (measured ~27-28s of dead air, see the design doc) than the
-	// benefit of a few hundred ms of latency adjustment.
+	// SRT negotiates the TSBPD delay once at handshake time and it cannot
+	// be changed for the life of a connection, so a retuned value only
+	// reaches the wire on a fresh handshake. The two directions are handled
+	// differently (see the design doc and conn.go's runReceiveStatsSummary):
+	//   - a RAISE (loss above SRTLatencyRaisePct) forces the current
+	//     publisher to reconnect immediately, so the larger window is
+	//     actually applied - it is fixing active, viewer-visible unrecovered
+	//     loss, and the ~1s OBS SRT reconnect pays for itself;
+	//   - a LOWER only trims a few hundred ms of delay off an already-healthy
+	//     link, so it is left to apply opportunistically at that path's next
+	//     natural reconnect rather than interrupting a working stream.
+	// SRTLatencyAutoTune gates the whole mechanism, the raise reconnect
+	// included.
 	//
 	// SRTLatencyRaisePct/SRTLatencyLowerPct form a hysteresis band
 	// (SRTLatencyLowerPct < SRTLatencyRaisePct, enforced by Validate) so a

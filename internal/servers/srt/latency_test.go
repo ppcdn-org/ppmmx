@@ -70,6 +70,42 @@ func TestSRTLatencyManagerRecordAdjustsPerEvent(t *testing.T) {
 	require.Equal(t, 800*time.Millisecond, m.LatencyFor("path"))
 }
 
+func TestSRTLatencyManagerRecordReportsRaise(t *testing.T) {
+	cfg := srtLatencyConfig{
+		Initial:   500 * time.Millisecond,
+		Min:       300 * time.Millisecond,
+		Max:       3000 * time.Millisecond,
+		Step:      100 * time.Millisecond,
+		RaiseStep: 200 * time.Millisecond,
+		RaisePct:  1.0,
+		LowerPct:  0.1,
+	}
+	m := newLatencyManager(cfg, nil)
+
+	// An above-threshold event raises the value and reports it, so the caller
+	// can force the running publisher to reconnect and apply the larger window.
+	require.True(t, m.Record("path", 1.5))
+	require.Equal(t, 700*time.Millisecond, m.LatencyFor("path"))
+
+	// A dead-band event changes nothing and reports no raise.
+	require.False(t, m.Record("path", 0.5))
+	require.Equal(t, 700*time.Millisecond, m.LatencyFor("path"))
+
+	// A below-threshold event lowers the value but reports no raise: a lower is
+	// applied opportunistically at the next handshake, never by forced reconnect.
+	require.False(t, m.Record("path", 0.0))
+	require.Equal(t, 600*time.Millisecond, m.LatencyFor("path"))
+
+	// A raise event on a path already pinned at the ceiling does not move the
+	// clamped value, so it reports no raise - a saturated link must not
+	// reconnect on a loop.
+	for range 100 {
+		m.Record("pinned", 5.0)
+	}
+	require.Equal(t, cfg.Max, m.LatencyFor("pinned"))
+	require.False(t, m.Record("pinned", 5.0))
+}
+
 func TestSRTLatencyManagerClampsToBounds(t *testing.T) {
 	cfg := srtLatencyConfig{
 		Initial:   500 * time.Millisecond,
