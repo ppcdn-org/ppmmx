@@ -436,6 +436,13 @@ type sessionParent interface {
 	rtpLossAlarmThresholdPct() float64
 	rtpLossAlarmReporterHook() rtpLossAlarmReporter
 
+	// RTP loss recycle (see rtp_loss_alarm.go and conf.RTPLossRecycleEnable):
+	// closes this session so OBS reconnects when mild loss stays over
+	// threshold for a long time. Local self-heal, no reporter.
+	rtpLossRecycleEnabled() bool
+	rtpLossRecycleThresholdPct() float64
+	rtpLossRecycleSec() int
+
 	// Per-minute RTP loss samples (see rtp_loss_sample.go): the full series
 	// behind ppcenter's unified loss_samples table, independent of the alarm.
 	rtpLossSampleReporterHook() rtpLossSampleReporter
@@ -1347,6 +1354,10 @@ func (s *session) runReceiveStatsSummary(pc *webrtc.PeerConnection) {
 	nackSampler.seed(st)
 
 	var lossTracker recvstats.SustainedLossTracker
+	// Separate tracker for the loss-recycle tier: its threshold differs from
+	// the alarm's, and SustainedLossTracker keys its continuous-over-threshold
+	// clock to one threshold, so the two tiers cannot share an instance.
+	var recycleTracker recvstats.SustainedLossTracker
 
 	for {
 		select {
@@ -1373,9 +1384,9 @@ func (s *session) runReceiveStatsSummary(pc *webrtc.PeerConnection) {
 				}
 
 				if s.parent.rtpLossAlarmEnabled() {
-					// No disconnect feature for RTP (disconnectEnable=false,
-					// disconnectAfter unused) - unlike SRT's sustained-loss
-					// tracker, this is report-only.
+					// The alarm is report-only (disconnectEnable=false): forcing
+					// a reconnect is the loss-recycle tier's job below, on its
+					// own lower threshold and its own tracker.
 					decision := lossTracker.Update(snap.LossPct, s.parent.rtpLossAlarmThresholdPct(), false, 0, time.Now())
 					if decision.ShouldReport {
 						if reporter := s.parent.rtpLossAlarmReporterHook(); reporter != nil {
@@ -1390,6 +1401,26 @@ func (s *session) runReceiveStatsSummary(pc *webrtc.PeerConnection) {
 								}
 							}()
 						}
+					}
+				}
+
+				// Loss-recycle tier (see conf.RTPLossRecycleEnable): close the
+				// session so OBS reconnects on a fresh PeerConnection once mild
+				// loss has stayed over the (low) recycle threshold continuously
+				// for the (long) recycle window. Local self-heal, no reporter -
+				// the reconnect it forces is captured by the publish-session
+				// end/start reports. disconnectEnable=true so the tracker
+				// surfaces the decision; ShouldReport is irrelevant here and
+				// ignored. Kept separate from the alarm above so either can run
+				// alone. If it fires, close and stop sampling this session.
+				if s.parent.rtpLossRecycleEnabled() {
+					rd := recycleTracker.Update(snap.LossPct, s.parent.rtpLossRecycleThresholdPct(),
+						true, time.Duration(s.parent.rtpLossRecycleSec())*time.Second, time.Now())
+					if rd.ShouldDisconnect {
+						s.Log(logger.Warn, "[publish-stats] WHIP loss=%.2f%% mild but sustained %s >= %ds, recycling session so the publisher reconnects",
+							snap.LossPct, rd.Sustained.Round(time.Second), s.parent.rtpLossRecycleSec())
+						s.Close()
+						return
 					}
 				}
 			}

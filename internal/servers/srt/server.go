@@ -176,6 +176,15 @@ type Server struct {
 	// silently degrading indefinitely.
 	LossDisconnectEnable bool
 	LossDisconnectSec    int
+	// LossRecycleEnable is a second, slower disconnect tier below
+	// LossDisconnect (see conf.SRTLossRecycleEnable): chronic MILD
+	// unrecoverable loss (LossRecycleThresholdPct, default lower than the
+	// alarm) sustained for LossRecycleSec (default 1h, far longer than
+	// LossDisconnectSec) forces a reconnect. Its own tracker, so the two
+	// thresholds don't interfere. Also independent of MMXControl.
+	LossRecycleEnable       bool
+	LossRecycleThresholdPct float64
+	LossRecycleSec          int
 	// PublishSessionReporter reports a publish connection's start/end to
 	// ppcenter (see publish_session_report.go). Nil when MMXControl isn't
 	// set up - same construction gating as the reporters above.
@@ -407,12 +416,15 @@ outer:
 				parent:              s,
 				latencyManager:      s.latencyManager,
 
-				lossAlarmReporter:     s.LossAlarmReporter,
-				lossAlarmEnable:       s.LossAlarmEnable,
-				lossAlarmThresholdPct: s.LossAlarmThresholdPct,
-				lossSampleReporter:    s.LossSampleReporter,
-				lossDisconnectEnable:  s.LossDisconnectEnable,
-				lossDisconnectSec:     s.LossDisconnectSec,
+				lossAlarmReporter:       s.LossAlarmReporter,
+				lossAlarmEnable:         s.LossAlarmEnable,
+				lossAlarmThresholdPct:   s.LossAlarmThresholdPct,
+				lossSampleReporter:      s.LossSampleReporter,
+				lossDisconnectEnable:    s.LossDisconnectEnable,
+				lossDisconnectSec:       s.LossDisconnectSec,
+				lossRecycleEnable:       s.LossRecycleEnable,
+				lossRecycleThresholdPct: s.LossRecycleThresholdPct,
+				lossRecycleSec:          s.LossRecycleSec,
 
 				degradeManager:        s.DegradeManager,
 				degradeEnable:         s.DegradeEnable,

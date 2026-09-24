@@ -482,6 +482,28 @@ type Conf struct {
 	// RTPLossAlarmThresholdPct is a 0-100 percentage, not a 0-1 ratio.
 	RTPLossAlarmThresholdPct float64 `json:"rtpLossAlarmThresholdPct"`
 
+	// RTPLossRecycleEnable forces a WHIP publish session closed once its RTP
+	// loss rate has stayed above RTPLossRecycleThresholdPct continuously for
+	// RTPLossRecycleSec, so the publisher (typically OBS) reconnects on a
+	// fresh PeerConnection/ICE path. This is the WHIP counterpart to SRT's
+	// LossDisconnect self-heal, but tuned as a distinct "mild but chronic"
+	// tier: a low threshold sustained for a long time (default 1% for 1h),
+	// aimed at a connection that has settled into steady light loss the
+	// degrade FSM and the higher alarm threshold both tolerate, but that a
+	// reconnect would likely clear. Independent of RTPLossAlarmEnable and
+	// does not require MMXControl - a node self-heals with ppcenter
+	// unreachable (only the RTP loss ALARM needs the control plane).
+	RTPLossRecycleEnable bool `json:"rtpLossRecycleEnable"`
+	// RTPLossRecycleThresholdPct is a 0-100 percentage, not a 0-1 ratio.
+	// Deliberately lower than RTPLossAlarmThresholdPct: this tier is about
+	// chronic mild loss, not the alarm-level loss operators are paged for.
+	RTPLossRecycleThresholdPct float64 `json:"rtpLossRecycleThresholdPct"`
+	// RTPLossRecycleSec is how long loss must stay continuously over the
+	// threshold before the recycle fires. Long by design (default 3600) so a
+	// working-but-lossy stream is only recycled after the loss has clearly
+	// failed to clear on its own, keeping the ~1s reconnect blip rare.
+	RTPLossRecycleSec int `json:"rtpLossRecycleSec"`
+
 	// CDN ingest (pull external CDN sources, re-publish them locally over
 	// RTMP loopback so they're recorded/distributed like any other
 	// publisher). Defaults to false (see setDefaults) - opt in per
@@ -667,6 +689,24 @@ type Conf struct {
 	// self-heal with ppcenter unreachable.
 	SRTLossDisconnectEnable bool `json:"srtLossDisconnectEnable"`
 	SRTLossDisconnectSec    int  `json:"srtLossDisconnectSec"`
+	// SRTLossRecycleEnable is a second, independent disconnect tier below the
+	// SRTLossDisconnect one above. Where LossDisconnect reacts fast to
+	// alarm-level loss (SRTLossAlarmThresholdPct sustained SRTLossDisconnectSec,
+	// default 120s) - a link that genuinely can't carry the bitrate - Recycle
+	// targets a connection stuck in chronic MILD unrecoverable loss: a low
+	// threshold (default 1%) sustained for a long time (default 1h), which the
+	// degrade FSM tolerates but a fresh reconnect would likely clear. Both act
+	// on the UNRECOVERABLE loss rate (see runReceiveStatsSummary); each has its
+	// own tracker so the two thresholds don't interfere. Independent of
+	// SRTLossAlarmEnable and does not require MMXControl.
+	SRTLossRecycleEnable bool `json:"srtLossRecycleEnable"`
+	// SRTLossRecycleThresholdPct is a 0-100 percentage, not a 0-1 ratio,
+	// applied to the unrecoverable loss rate. Lower than SRTLossAlarmThresholdPct.
+	SRTLossRecycleThresholdPct float64 `json:"srtLossRecycleThresholdPct"`
+	// SRTLossRecycleSec is how long unrecoverable loss must stay continuously
+	// over SRTLossRecycleThresholdPct before the recycle fires. Long by design
+	// (default 3600) so the ~1s reconnect blip stays rare.
+	SRTLossRecycleSec int `json:"srtLossRecycleSec"`
 
 	// SRT-simulcast degrade (see docs/obs-mmx-degrade-protocol.md and
 	// internal/degrade): shares the same FSM/WS channel as WebRTCDegrade*
@@ -852,6 +892,12 @@ func (conf *Conf) setDefaults() {
 	// the same number is right for both).
 	conf.RTPLossAlarmEnable = false
 	conf.RTPLossAlarmThresholdPct = 2.0
+	// Mild-but-chronic loss recycle (opt-in, like the alarm). 1% is below the
+	// 2.0% alarm - the point is to catch loss too light to page on but that
+	// won't clear on its own; 3600s (1h) keeps the forced reconnect rare.
+	conf.RTPLossRecycleEnable = false
+	conf.RTPLossRecycleThresholdPct = 1.0
+	conf.RTPLossRecycleSec = 3600
 	// Default ingest source: pull mmx's own Tencent-forwarded backup domain
 	// back down and republish it locally. "tencent:" gets txSecret/txTime
 	// signed with TX_SECRET_KEY_BACK (see internal/ingest); other prefixes
@@ -912,6 +958,12 @@ func (conf *Conf) setDefaults() {
 	conf.SRTLossAlarmThresholdPct = 1.0
 	conf.SRTLossDisconnectEnable = false
 	conf.SRTLossDisconnectSec = 120
+	// Second, slower disconnect tier for chronic mild loss (see
+	// SRTLossRecycleEnable). 1% unrecoverable sustained for 1h - below the
+	// alarm/LossDisconnect threshold, far longer than its 120s.
+	conf.SRTLossRecycleEnable = false
+	conf.SRTLossRecycleThresholdPct = 1.0
+	conf.SRTLossRecycleSec = 3600
 	// Same starting numbers as WebRTCDegrade*'s own defaults below, absent
 	// any SRT-specific tuning data yet - independently adjustable per
 	// protocol once real-world loss characteristics diverge. Applied to

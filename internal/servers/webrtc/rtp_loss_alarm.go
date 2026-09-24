@@ -28,3 +28,18 @@ func (s *Server) rtpLossAlarmThresholdPct() float64 {
 func (s *Server) rtpLossAlarmReporterHook() rtpLossAlarmReporter {
 	return s.RTPLossAlarmReporter
 }
+
+// rtpLossRecycleEnabled implements the sessionParent hook.
+func (s *Server) rtpLossRecycleEnabled() bool {
+	return s.RTPLossRecycleEnable
+}
+
+// rtpLossRecycleThresholdPct implements the sessionParent hook.
+func (s *Server) rtpLossRecycleThresholdPct() float64 {
+	return s.RTPLossRecycleThresholdPct
+}
+
+// rtpLossRecycleSec implements the sessionParent hook.
+func (s *Server) rtpLossRecycleSec() int {
+	return s.RTPLossRecycleSec
+}

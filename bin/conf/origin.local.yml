@@ -63,8 +63,8 @@ srtLatencyMin: 300ms        # 下限
 srtLatencyMax: 3000ms       # 上限
 srtLatencyRaiseStep: 200ms  # >1% 事件每次 +200ms
 srtLatencyStep: 100ms       # <0.1% 事件每次 -100ms(下调步长)
-srtLatencyRaisePct: 1.0     # >1% 不可恢复丢包：延迟 +200ms
-srtLatencyLowerPct: 0.1     # <0.1% 不可恢复丢包：延迟 -100ms
+srtLatencyRaisePct: 0.8     # >1% 不可恢复丢包：延迟 +200ms
+srtLatencyLowerPct: 0.3     # <0.1% 不可恢复丢包：延迟 -100ms
 
 # 丢包率超过 srtLossAlarmThresholdPct(默认 10%)时上报告警到 ppcenter(需要
 # mmxControl 开启);srtLossDisconnectEnable 打开后,持续超阈值满
@@ -74,6 +74,13 @@ srtLossAlarmEnable: false
 srtLossAlarmThresholdPct: 10.0
 srtLossDisconnectEnable: false
 srtLossDisconnectSec: 120
+# 第二档"轻度丢包自恢复":比上面 LossDisconnect 更低的阈值、长得多的时长。
+# 针对长期只有轻微不可恢复丢包、degrade 也吃得住、但迟迟不自愈的连接:持续
+# 超过 srtLossRecycleThresholdPct(默认 1%)满 srtLossRecycleSec(默认 3600s=1h)
+# 就主动断开,逼 OBS 在新连接上重推,常能甩掉卡在次优路径上的旧连接。默认关闭。
+srtLossRecycleEnable: false
+srtLossRecycleThresholdPct: 1.0
+srtLossRecycleSec: 3600
 # SRT-simulcast degrade：与下面 webrtcDegrade* 共用同一套 FSM/WS 通道
 # (internal/degrade)，密钥/路径复用 webrtcDegradeWSPathSuffix + .env 的
 # WHIP_WS_SECRET，这里只单独配阈值。
@@ -119,6 +126,13 @@ webrtcDegradeObservationSec: 60
 # RTP loss alarm (POST /internal/mmx/v1/alarms/rtp-loss)。
 rtpLossAlarmEnable: true
 rtpLossAlarmThresholdPct: 2.0
+# WHIP 侧的"轻度丢包自恢复"(SRT srtLossRecycle* 的 WebRTC 对应物)。WHIP 原本
+# 只上报告警、从不主动断连;打开后,RTP 丢包率持续超过 rtpLossRecycleThresholdPct
+# (默认 1%,低于上面 2% 的告警阈值)满 rtpLossRecycleSec(默认 3600s=1h),就关闭
+# 该推流会话,让 OBS 在全新 PeerConnection/ICE 上重连。本地自愈,不依赖 mmxControl。
+rtpLossRecycleEnable: false
+rtpLossRecycleThresholdPct: 1.0
+rtpLossRecycleSec: 3600
 
 # ── Forward (腾讯云 WHIP 转推) ──────────────────
 # 默认关闭。开启前必须在下面填好账号级信息，且每条要转推的 path

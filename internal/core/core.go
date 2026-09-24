@@ -882,8 +882,14 @@ func (p *Core) createResources(initial bool) error {
 			DegradeWSSecret:          p.conf.WebRTCDegradeWSSecret,
 			RTPLossAlarmEnable:       p.conf.RTPLossAlarmEnable,
 			RTPLossAlarmThresholdPct: p.conf.RTPLossAlarmThresholdPct,
-			WHIPAuthKey:              p.conf.WebRTCWHIPAuthKey,
-			ForwardSecret:            p.conf.WebRTCForwardSecret,
+			// Loss-recycle self-heal. Like SRT's LossDisconnect it needs no
+			// reporter/MMXControl - the action is local (close the session so
+			// OBS reconnects), so it is wired unconditionally from config.
+			RTPLossRecycleEnable:       p.conf.RTPLossRecycleEnable,
+			RTPLossRecycleThresholdPct: p.conf.RTPLossRecycleThresholdPct,
+			RTPLossRecycleSec:          p.conf.RTPLossRecycleSec,
+			WHIPAuthKey:                p.conf.WebRTCWHIPAuthKey,
+			ForwardSecret:              p.conf.WebRTCForwardSecret,
 		}
 		// Same endpoint/credential reuse as trafficUsage/srtLossAlarmReporter
 		// above: every mmxControl deployment gets alarm reporting for free
@@ -1114,6 +1120,11 @@ func (p *Core) createResources(initial bool) error {
 			LossAlarmThresholdPct: p.conf.SRTLossAlarmThresholdPct,
 			LossDisconnectEnable:  p.conf.SRTLossDisconnectEnable,
 			LossDisconnectSec:     p.conf.SRTLossDisconnectSec,
+			// Second, slower disconnect tier for chronic mild loss - same
+			// MMXControl-independent self-heal rationale as LossDisconnect.
+			LossRecycleEnable:       p.conf.SRTLossRecycleEnable,
+			LossRecycleThresholdPct: p.conf.SRTLossRecycleThresholdPct,
+			LossRecycleSec:          p.conf.SRTLossRecycleSec,
 			// DegradeManager is nil when WebRTC is disabled (see its
 			// construction above) - DegradeEnable is forced false in that
 			// case too, since there would be nowhere for the executor to
@@ -1568,6 +1579,9 @@ func (p *Core) closeResources(newConf *conf.Conf, calledByAPI bool) {
 		newConf.WebRTCForwardSecret != p.conf.WebRTCForwardSecret ||
 		newConf.RTPLossAlarmEnable != p.conf.RTPLossAlarmEnable ||
 		newConf.RTPLossAlarmThresholdPct != p.conf.RTPLossAlarmThresholdPct ||
+		newConf.RTPLossRecycleEnable != p.conf.RTPLossRecycleEnable ||
+		newConf.RTPLossRecycleThresholdPct != p.conf.RTPLossRecycleThresholdPct ||
+		newConf.RTPLossRecycleSec != p.conf.RTPLossRecycleSec ||
 		newConf.DumpPackets != p.conf.DumpPackets ||
 		closeMetrics ||
 		closeDegradeManager ||
@@ -1588,6 +1602,9 @@ func (p *Core) closeResources(newConf *conf.Conf, calledByAPI bool) {
 		newConf.SRTLossAlarmThresholdPct != p.conf.SRTLossAlarmThresholdPct ||
 		newConf.SRTLossDisconnectEnable != p.conf.SRTLossDisconnectEnable ||
 		newConf.SRTLossDisconnectSec != p.conf.SRTLossDisconnectSec ||
+		newConf.SRTLossRecycleEnable != p.conf.SRTLossRecycleEnable ||
+		newConf.SRTLossRecycleThresholdPct != p.conf.SRTLossRecycleThresholdPct ||
+		newConf.SRTLossRecycleSec != p.conf.SRTLossRecycleSec ||
 		newConf.SRTDegradeEnable != p.conf.SRTDegradeEnable ||
 		newConf.SRTDegradeInstantLossPct != p.conf.SRTDegradeInstantLossPct ||
 		newConf.SRTDegradeAvgLossPct != p.conf.SRTDegradeAvgLossPct ||

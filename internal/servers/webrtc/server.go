@@ -260,6 +260,15 @@ type Server struct {
 	RTPLossAlarmThresholdPct float64
 	RTPLossAlarmReporter     rtpLossAlarmReporter
 
+	// RTP loss recycle (see conf.RTPLossRecycleEnable and session.go's
+	// runReceiveStatsSummary): a mild-but-chronic-loss self-heal that closes
+	// the publish session so OBS reconnects on a fresh PeerConnection.
+	// Independent of the alarm above and of MMXControl - no reporter, the
+	// action is local. Zero-value (disabled) unless set by core.go.
+	RTPLossRecycleEnable       bool
+	RTPLossRecycleThresholdPct float64
+	RTPLossRecycleSec          int
+
 	// Per-minute WHIP RTP loss samples (see rtp_loss_sample.go): the full
 	// series behind ppcenter's unified loss_samples table, reported every
 	// recvstats.Interval regardless of any threshold (ppcenter drops the

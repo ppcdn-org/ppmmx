@@ -60,12 +60,15 @@ type conn struct {
 	publishTokenReq     bool
 	parent              *Server
 
-	lossAlarmReporter     srtLossAlarmReporter
-	lossAlarmEnable       bool
-	lossAlarmThresholdPct float64
-	lossSampleReporter    srtLossSampleReporter
-	lossDisconnectEnable  bool
-	lossDisconnectSec     int
+	lossAlarmReporter       srtLossAlarmReporter
+	lossAlarmEnable         bool
+	lossAlarmThresholdPct   float64
+	lossSampleReporter      srtLossSampleReporter
+	lossDisconnectEnable    bool
+	lossDisconnectSec       int
+	lossRecycleEnable       bool
+	lossRecycleThresholdPct float64
+	lossRecycleSec          int
 
 	degradeManager        *degrade.Manager
 	degradeEnable         bool
@@ -379,6 +382,11 @@ func (c *conn) runReceiveStatsSummary(sconn srt.Conn, pathName string, done <-ch
 
 	var sampler recvstats.Sampler
 	var lossTracker recvstats.SustainedLossTracker
+	// Separate tracker for the loss-recycle tier: its threshold differs from
+	// the alarm/disconnect one, and SustainedLossTracker keys its continuous-
+	// over-threshold clock to a single threshold, so the tiers cannot share
+	// an instance.
+	var recycleTracker recvstats.SustainedLossTracker
 	var st srt.Statistics
 	sconn.Stats(&st)
 	sampler.Sample(st.Accumulated.ByteRecv, st.Accumulated.PktRecv, st.Accumulated.PktRecvLoss, time.Now()) // seed baseline
@@ -496,6 +504,25 @@ func (c *conn) runReceiveStatsSummary(sconn srt.Conn, pathName string, done <-ch
 					if decision.ShouldDisconnect {
 						c.Log(logger.Warn, "SRT unrecovered loss=%.2f%% sustained %s >= %ds, forcing disconnect so the publisher reconnects",
 							unrecoveredPct, decision.Sustained.Round(time.Second), c.lossDisconnectSec)
+						c.Close()
+						return
+					}
+				}
+
+				// Loss-recycle tier (see conf.SRTLossRecycleEnable): a second,
+				// slower disconnect for chronic MILD loss - a low threshold
+				// sustained far longer than lossDisconnectSec. Own tracker so it
+				// never shares the alarm/disconnect clock. The disconnect tier
+				// above returns on its first fire, so if both are enabled and it
+				// trips first this is not reached that interval. The log keeps
+				// the "SRT unrecovered loss=...forcing disconnect" shape so it
+				// classifies as the same publish-reconnect health event.
+				if c.lossRecycleEnable && haveUnrecovered {
+					rd := recycleTracker.Update(unrecoveredPct, c.lossRecycleThresholdPct, true,
+						time.Duration(c.lossRecycleSec)*time.Second, time.Now())
+					if rd.ShouldDisconnect {
+						c.Log(logger.Warn, "SRT unrecovered loss=%.2f%% mild but sustained %s >= %ds, forcing disconnect to recycle the connection so the publisher reconnects",
+							unrecoveredPct, rd.Sustained.Round(time.Second), c.lossRecycleSec)
 						c.Close()
 						return
 					}
