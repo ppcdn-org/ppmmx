@@ -28,8 +28,14 @@ const (
 	// abrWarmupPeriod is how long after the session starts the estimate is
 	// ignored. GCC reports its configured initial bitrate until enough
 	// feedback has arrived, so acting immediately would mean acting on a
-	// constant.
-	abrWarmupPeriod = 5 * time.Second
+	// constant. It also has to ride out the early over-reaction that the
+	// NoOpPacer (see peer_connection.go) can provoke: without packet
+	// pacing, the initial high layer is sent in bursts that GCC's delay
+	// controller can misread as congestion and collapse to its floor, which
+	// - via pick's "no layer fits -> lowest layer" fallback - would demote a
+	// viewer straight to the bottom of the ladder. A longer warmup lets the
+	// estimate recover before the first decision is made.
+	abrWarmupPeriod = 30 * time.Second
 
 	// A layer is only selected when the estimate covers its bitrate with
 	// this much headroom, and is only abandoned once the estimate drops
