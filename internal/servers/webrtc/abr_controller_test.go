@@ -82,26 +82,41 @@ func TestControllerHoldsWithinLossDeadBand(t *testing.T) {
 	}
 }
 
-// A climbing RTT blocks an upgrade even with zero loss, and drops the
-// partial streak so it has to be re-earned.
-func TestControllerHoldsUpgradeWhenRTTClimbs(t *testing.T) {
+// A climbing RTT is congestion even with zero loss (throttling queues packets
+// instead of dropping them), so it downgrades on its own.
+func TestControllerDowngradesWhenRTTClimbs(t *testing.T) {
 	sel := makeLadderSelector(t)
-	require.NoError(t, sel.Select(2))
+	require.NoError(t, sel.Select(0)) // top
 	c := newABRController(sel)
 
-	// Establish the baseline and build most of an upgrade streak.
-	for range abrUpgradeConfirmations - 1 {
-		_, ok := c.evaluate(0, 30)
-		require.False(t, ok)
+	// Baseline of 30ms (stable limit 39ms, congested limit 60ms).
+	_, ok := c.evaluate(0, 30)
+	require.False(t, ok)
+
+	// RTT far above the baseline: first congested sample, no switch yet.
+	_, ok = c.evaluate(0, 200)
+	require.False(t, ok)
+
+	// Second congested sample: downgrade one step, with zero packet loss.
+	target, ok := c.evaluate(0, 200)
+	require.True(t, ok)
+	require.Equal(t, 1, target)
+}
+
+// An RTT between the upgrade-stable and congestion thresholds is a dead zone:
+// neither direction moves.
+func TestControllerHoldsWhenRTTBetweenStableAndCongested(t *testing.T) {
+	sel := makeLadderSelector(t)
+	require.NoError(t, sel.Select(1))
+	c := newABRController(sel)
+
+	_, _ = c.evaluate(0, 30) // baseline 30ms
+
+	// 50ms is past the stable limit (39ms) but under the congested limit (60ms).
+	for range abrDowngradeConfirmations + abrUpgradeConfirmations + 3 {
+		_, ok := c.evaluate(0, 50)
+		require.False(t, ok, "switched while the RTT was between stable and congested")
 	}
-
-	// RTT climbs far past the stable band (30ms baseline -> 39ms limit).
-	_, ok := c.evaluate(0, 200)
-	require.False(t, ok, "upgraded while the RTT was unstable")
-
-	// The streak was dropped: the next stable sample must not fire.
-	_, ok = c.evaluate(0, 30)
-	require.False(t, ok, "upgrade fired on the first stable sample after the guard tripped")
 }
 
 func TestControllerNoSwitchAtLadderEnds(t *testing.T) {

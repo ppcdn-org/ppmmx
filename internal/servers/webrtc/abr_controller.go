@@ -11,8 +11,10 @@ import (
 //
 // Layer selection is driven by the packet loss the reader reports back for
 // the video it received (RTCP receiver reports, aggregated per evaluation
-// window by PeerConnection.OutboundVideoStats), together with RTT
-// stability. It deliberately does NOT use GCC's send-side bandwidth estimate
+// window by PeerConnection.OutboundVideoStats) and by RTT: RTT climbing far
+// above its rolling baseline downgrades even with zero loss (throttling /
+// bufferbloat queue packets instead of dropping them), and a modest RTT rise
+// blocks an upgrade. It deliberately does NOT use GCC's send-side bandwidth estimate
 // for the decision any more: GCC's delay-based controller only produces a
 // meaningful signal when outgoing packets are paced, and this deployment
 // forwards unpaced on purpose to keep latency low (see peer_connection.go's
@@ -45,14 +47,23 @@ const (
 	abrLossUpgradePct   = 1.0
 	abrLossDowngradePct = 5.0
 
-	// Upgrade RTT guard. An upgrade is only attempted while the current RTT
-	// is within this factor of the session's running minimum, so the
-	// controller doesn't climb into a link that is starting to bufferbloat
-	// (RTT rising before loss appears). The baseline is floored at
-	// abrRTTStableMinMs so sub-millisecond jitter can't make the guard
-	// impossibly tight.
-	abrRTTStableFactor = 1.30
-	abrRTTStableMinMs  = 20.0
+	// RTT thresholds, relative to a rolling baseline (see abrRTTWindowSamples).
+	// abrRTTStableFactor gates upgrades (don't climb into a link whose RTT is
+	// already rising); abrRTTDowngradeFactor triggers a downgrade even with no
+	// loss, which is what bandwidth throttling and bufferbloat look like when
+	// packets are queued rather than dropped - exactly the case a pure
+	// loss-based rule misses. The baseline is floored at abrRTTStableMinMs so
+	// sub-millisecond jitter can't make the thresholds impossibly tight.
+	abrRTTStableFactor    = 1.30
+	abrRTTDowngradeFactor = 2.00
+	abrRTTStableMinMs     = 20.0
+
+	// abrRTTWindowSamples is the length of the rolling RTT-minimum baseline.
+	// A window rather than an all-time minimum lets the baseline follow a
+	// genuine change in the link's base latency (e.g. a move to a
+	// higher-latency network), instead of treating a permanently higher but
+	// stable RTT as permanent congestion and downgrading forever.
+	abrRTTWindowSamples = 30
 
 	// Consecutive evaluations agreeing on a change before it is made.
 	// Downgrades react faster: one layer too low costs quality, one too high
@@ -71,39 +82,62 @@ type abrController struct {
 	downgradeCount int
 	upgradeCount   int
 
-	// Running minimum RTT, the baseline the upgrade stability guard compares
-	// against.
-	rttMinMs float64
-	haveRTT  bool
+	// Rolling-window RTT samples and the minimum over the window, the
+	// baseline the stability/congestion thresholds compare against.
+	rttWindow []float64
+	rttMinMs  float64
+	haveRTT   bool
 }
 
 func newABRController(selector *webrtcproto.TrackSelector) *abrController {
 	return &abrController{selector: selector}
 }
 
-// observeRTT folds a fresh RTT sample into the running-minimum baseline.
+// observeRTT folds a fresh RTT sample into the rolling-window baseline.
 func (c *abrController) observeRTT(rttMs float64) {
 	if rttMs <= 0 {
 		return
 	}
-	if !c.haveRTT || rttMs < c.rttMinMs {
-		c.rttMinMs = rttMs
-		c.haveRTT = true
+	c.rttWindow = append(c.rttWindow, rttMs)
+	if len(c.rttWindow) > abrRTTWindowSamples {
+		c.rttWindow = c.rttWindow[len(c.rttWindow)-abrRTTWindowSamples:]
 	}
+	base := c.rttWindow[0]
+	for _, v := range c.rttWindow {
+		if v < base {
+			base = v
+		}
+	}
+	c.rttMinMs = base
+	c.haveRTT = true
 }
 
-// rttStable reports whether rttMs is within abrRTTStableFactor of the running
-// minimum. With no baseline yet it returns true rather than blocking the
-// first upgrade.
-func (c *abrController) rttStable(rttMs float64) bool {
-	if !c.haveRTT || rttMs <= 0 {
-		return true
-	}
+// rttBaseline returns the rolling minimum, floored.
+func (c *abrController) rttBaseline() float64 {
 	base := c.rttMinMs
 	if base < abrRTTStableMinMs {
 		base = abrRTTStableMinMs
 	}
-	return rttMs <= base*abrRTTStableFactor
+	return base
+}
+
+// rttStable reports whether rttMs is within abrRTTStableFactor of the baseline.
+// With no baseline yet it returns true rather than blocking the first upgrade.
+func (c *abrController) rttStable(rttMs float64) bool {
+	if !c.haveRTT || rttMs <= 0 {
+		return true
+	}
+	return rttMs <= c.rttBaseline()*abrRTTStableFactor
+}
+
+// rttCongested reports whether rttMs is far enough above the baseline
+// (abrRTTDowngradeFactor) to count as congestion on its own, even with no
+// packet loss.
+func (c *abrController) rttCongested(rttMs float64) bool {
+	if !c.haveRTT || rttMs <= 0 {
+		return false
+	}
+	return rttMs > c.rttBaseline()*abrRTTDowngradeFactor
 }
 
 // videoLadder returns the video tracks sorted lowest-to-highest quality
@@ -152,7 +186,7 @@ func (c *abrController) evaluate(lossPct, rttMs float64) (int, bool) {
 	}
 	active := c.selector.ActiveTrackID()
 
-	if lossPct >= abrLossDowngradePct {
+	if lossPct >= abrLossDowngradePct || c.rttCongested(rttMs) {
 		c.upgradeCount = 0
 		c.downgradeCount++
 		if c.downgradeCount >= abrDowngradeConfirmations {
