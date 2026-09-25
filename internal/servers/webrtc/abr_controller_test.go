@@ -57,11 +57,11 @@ func TestControllerDowngradesOneStepFaster(t *testing.T) {
 	c := newABRController(sel)
 
 	for i := range abrDowngradeConfirmations - 1 {
-		_, ok := c.evaluate(10, 30)
+		_, ok := c.evaluate(2, 30)
 		require.Falsef(t, ok, "downgraded after only %d confirmations", i+1)
 	}
 
-	target, ok := c.evaluate(10, 30)
+	target, ok := c.evaluate(2, 30)
 	require.True(t, ok)
 	require.Equal(t, 1, target, "one step down from 0 is 1, not straight to the bottom")
 
@@ -77,7 +77,7 @@ func TestControllerHoldsWithinLossDeadBand(t *testing.T) {
 	c := newABRController(sel)
 
 	for range abrDowngradeConfirmations + abrUpgradeConfirmations + 3 {
-		_, ok := c.evaluate(3, 30) // 1 < 3 < 5
+		_, ok := c.evaluate(0.5, 30) // 0.3 < 0.5 < 1.0
 		require.False(t, ok, "switched while inside the loss dead band")
 	}
 }

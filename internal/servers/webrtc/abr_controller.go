@@ -41,11 +41,14 @@ const (
 	abrWarmupPeriod = 5 * time.Second
 
 	// Loss thresholds, as a percentage of the packets the reader was tracked
-	// as having received over one evaluation window. Hysteresis: an upgrade
-	// is considered at or below abrLossUpgradePct, a downgrade at or above
-	// abrLossDowngradePct, and the band in between holds the current layer.
-	abrLossUpgradePct   = 1.0
-	abrLossDowngradePct = 5.0
+	// as having received over one evaluation window, following the publish
+	// degrade protocol's hysteresis shape (degradeRaisePct/degradeLowerPct):
+	// an upgrade is considered at or below abrLossUpgradePct, a downgrade at
+	// or above abrLossDowngradePct, and the band in between holds. A 1%
+	// downgrade threshold (rather than a laxer 5%) reacts before a viewer
+	// sees real quality loss; loss on a healthy edge-to-viewer hop is ~0.
+	abrLossUpgradePct   = 0.3
+	abrLossDowngradePct = 1.0
 
 	// RTT thresholds, relative to a rolling baseline (see abrRTTWindowSamples).
 	// abrRTTStableFactor gates upgrades (don't climb into a link whose RTT is
