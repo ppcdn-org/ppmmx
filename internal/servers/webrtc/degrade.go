@@ -6,6 +6,7 @@ func (s *Server) recordDegradeSample(pathName string, cumUnrecov, cumTotal uint6
 	return s.DegradeManager.RecordSample(pathName, cumUnrecov, cumTotal, degrade.Thresholds{
 		RaisePct:       s.DegradeRaisePct,
 		LowerPct:       s.DegradeLowerPct,
+		RestartPct:     s.DegradeRestartPct,
 		ObservationSec: s.DegradeObservationSec,
 	})
 }

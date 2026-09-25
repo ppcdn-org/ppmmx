@@ -109,9 +109,9 @@ forwardMmx 是你自己运维的节点之间的基础设施流量，不是外部
 - 在 Origin 的 path 配置里，把这个值填进 `forwardMmxToken`（或
   `forwardMmxTargets[].token`）。
 
-`MMX_FORWARD_SECRET` 和 `WHIP_AUTH_KEY`（外部 ppobs 用）、`WHIP_WS_SECRET`（降级协议
-WS 通道用）三者相互独立，**不要复用同一个值**——一旦复用，其中一个用途的密钥泄露
-会连带影响另外两个。
+`MMX_FORWARD_SECRET` 和 `WHIP_AUTH_KEY`（外部 ppobs 用）相互独立，**不要复用同一个
+值**——一旦复用，其中一个用途的密钥泄露会连带影响另一个。降级协议 WS 通道不再有独立
+密钥：它复用 ppobs 的 ppcenter publish token（同样由 `WHIP_AUTH_KEY` 校验）。
 
 ## 四、User-Agent / 身份标识
 
@@ -134,9 +134,9 @@ User-Agent: ppobs/1.0 (OBS-Studio/<版本>; <操作系统>; <locale>)
   `checkWHIPDeviceID` 解密必然失败，所有 WHIP publish 请求 fail-closed 返回 `403`，
   直到显式配置这个变量为止（见 [internal/conf/conf.go](../internal/conf/conf.go) 的
   `WebRTCWHIPAuthKey` 和 [.env.example](../.env.example)）。
-- 这个密钥和降级协议 WS 控制通道（`ws://.../{path}/ws/whip`）用的
-  `WHIP_WS_SECRET` 是**两个完全独立的密钥**，互不影响——`WHIP_WS_SECRET` 继续只
-  负责降级协议自己的 WS 鉴权，改动其中一个不需要动另一个。详见
+- 同一个 `WHIP_AUTH_KEY` 也负责降级协议 WS 控制通道
+  （`ws://.../{path}/ws/whip`）的鉴权：它校验的是 ppobs 从 ppcenter 拿到的那把
+  publish bearer token，两者是同一把凭证、同一把密钥。详见
   [docs/obs-mmx-degrade-protocol.md](obs-mmx-degrade-protocol.md)。
 - 密钥轮换：ppcenter 和所有 mmx Origin 节点必须同步更新 `WHIP_AUTH_KEY`，否则
   轮换窗口期内旧节点会拒绝新签发的 token（反之亦然）。由于 token TTL 只有 24

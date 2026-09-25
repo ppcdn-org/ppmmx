@@ -62,8 +62,8 @@ webrtcABREnable: true
 webrtcABRWSPath: /ws/control
 webrtcABRSwitchCooldown: 3000
 
-# WHIP degrade protocol (docs/obs-mmx-degrade-protocol.md). Secret comes
-# from .env (WHIP_WS_SECRET), not from this file.
+# WHIP degrade protocol (docs/obs-mmx-degrade-protocol.md). Auth reuses the
+# ppcenter publish token (WHIP_AUTH_KEY in .env), not a value from this file.
 webrtcDegradeEnable: false
 webrtcDegradeWSPathSuffix: /ws/whip
 webrtcDegradeInstantLossPct: 5.0
@@ -92,8 +92,8 @@ paths:
     # origin 主动推流过来(见 origin.local.yml 的 forwardMmxEnable/forwardMmx*),
     # 本节点只是被动接受 WHIP 发布,鉴权走 Authorization: Bearer <token>,
     # token 必须等于这台机器 .env 里的 MMX_FORWARD_SECRET(要跟 origin.local.yml
-    # 里那条 forwardMmxTargets[].token 配成一样的值；不是 WHIP_WS_SECRET，那个是
-    # 降级协议 WS 通道专用，见 docs/obs-whip-publish-auth-protocol.md 第八节)。
+# 里那条 forwardMmxTargets[].token 配成一样的值；跟 WHIP_AUTH_KEY 无关，
+# 见 docs/obs-whip-publish-auth-protocol.md 第八节)。
     source: publisher
     sourceOnDemand: false
 

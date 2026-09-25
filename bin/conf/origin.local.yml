@@ -82,8 +82,8 @@ srtLossRecycleEnable: false
 srtLossRecycleThresholdPct: 1.0
 srtLossRecycleSec: 3600
 # SRT-simulcast degrade：与下面 webrtcDegrade* 共用同一套 FSM/WS 通道
-# (internal/degrade)，密钥/路径复用 webrtcDegradeWSPathSuffix + .env 的
-# WHIP_WS_SECRET，这里只单独配阈值。
+# (internal/degrade)，路径复用 webrtcDegradeWSPathSuffix、鉴权复用 .env 的
+# WHIP_AUTH_KEY(与 WHIP publish 同一把 ppcenter token)，这里只单独配阈值。
 srtDegradeEnable: true
 srtDegradeInstantLossPct: 5.0
 srtDegradeAvgLossPct: 1.0
@@ -111,8 +111,8 @@ webrtcABREnable: true
 webrtcABRWSPath: /ws/control
 webrtcABRSwitchCooldown: 3000
 
-# WHIP degrade protocol (docs/obs-mmx-degrade-protocol.md). Secret comes
-# from .env (WHIP_WS_SECRET), not from this file.
+# WHIP degrade protocol (docs/obs-mmx-degrade-protocol.md). Auth reuses the
+# ppcenter publish token (WHIP_AUTH_KEY in .env), not a value from this file.
 # Recover* < Degrade* 留出一个 gap(死区)：丢包率在两者之间时不升不降，
 # 避免在单一阈值附近来回抖动(反复升降级)。两者相等则等价于旧的单阈值行为。
 webrtcDegradeEnable: true
@@ -153,7 +153,7 @@ tencentWHIPTokenDays: 30
 # token 不写在本文件里：所有转发目标都是自己的节点、共用同一个预共享密钥，
 # 所以统一取 .env 的 MMX_FORWARD_SECRET(见 conf.Path.validate)，避免密钥进
 # 版本库。本节点的 MMX_FORWARD_SECRET 必须和每个目标节点的完全一致。该密钥
-# 与 WHIP_AUTH_KEY/WHIP_WS_SECRET 相互独立，不要复用(见
+# 与 WHIP_AUTH_KEY 相互独立，不要复用(见
 # docs/obs-whip-publish-auth-protocol.md 第八节)。
 forwardMmxEnable: true
 

@@ -1,30 +1,33 @@
 package webrtc
 
 import (
-	"crypto/subtle"
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
 	"github.com/bluenviron/mediamtx/internal/logger"
+	"github.com/bluenviron/mediamtx/internal/protocols/publishtoken"
 	wsproto "github.com/bluenviron/mediamtx/internal/protocols/websocket"
 )
 
-// verifyDegradeAuth checks the connection request for WHIP_WS_SECRET,
-// via either an "Authorization: Bearer <secret>" header or a "?token=<secret>"
-// query parameter (whichever is easier for the connecting client to set).
+// verifyDegradeAuth checks that the connection request carries a
+// ppcenter-issued publish bearer token valid for this exact path, via either
+// an "Authorization: Bearer <token>" header or a "?token=<token>" query
+// parameter. It reuses the identical credential and key as WHIP publish
+// (see checkWHIPDeviceID and docs/obs-whip-publish-auth-protocol.md): the
+// OBS-side executor sends the whipTracks bearer_token it already obtained
+// from ppcenter for this codec, so there is no separate shared secret to
+// provision or keep in sync any more.
 //
-// This is a static shared secret, not a signed/expiring token like
-// split-rec's "advance" mode: unlike that public API, this WS endpoint has
-// exactly one intended client (the OBS-side executor, itself under the
-// same operator's control), so there's no third party to forge requests
-// as and no repeated-request replay surface to worry about - a fixed
-// secret is proportionate and far simpler for a native OBS build to
-// implement than HMAC-signing a canonical string.
-func verifyDegradeAuth(secret string, ctx *gin.Context) bool {
-	if secret == "" {
+// The token is codec-bound (appId/stream/codec), and pathName here is
+// exactly that 3-segment path (the degrade WS URL is derived from the WHIP
+// URL by swapping the trailing "/whip" for "/ws/whip", so the codec segment
+// is preserved) - claims.PathMatches enforces the binding.
+func verifyDegradeAuth(authKey, pathName string, ctx *gin.Context) bool {
+	if authKey == "" {
 		return false
 	}
 	token := ctx.Query("token")
@@ -36,7 +39,11 @@ func verifyDegradeAuth(secret string, ctx *gin.Context) bool {
 	if token == "" {
 		return false
 	}
-	return subtle.ConstantTimeCompare([]byte(token), []byte(secret)) == 1
+	claims, err := publishtoken.Decrypt(authKey, token, time.Now())
+	if err != nil {
+		return false
+	}
+	return claims.PathMatches(pathName)
 }
 
 // handleWHIPDegradeWebSocket handles GET /{path}/ws/whip - the control
@@ -50,13 +57,13 @@ func (s *httpServer) handleWHIPDegradeWebSocket(ctx *gin.Context, pathName strin
 		return
 	}
 
-	if !verifyDegradeAuth(s.parent.DegradeWSSecret, ctx) {
+	if !verifyDegradeAuth(s.parent.WHIPAuthKey, pathName, ctx) {
 		// Logged (unlike most writeErrorNoLog call sites): an auth
 		// rejection here is the connecting executor's *only* signal that
 		// something is wrong (the WS handshake just fails from its
 		// perspective, with no detail) - without a line in mmx's own
 		// logs, diagnosing it means reading the OBS side's logs instead.
-		// Never log the secret or the token supplied.
+		// Never log the token supplied.
 		s.Log(logger.Warn, "[degrade] path=%s executor connection rejected: invalid or missing token", pathName)
 		s.writeErrorNoLog(ctx, http.StatusUnauthorized, fmt.Errorf("publish deviceID authentication failure!"))
 		return

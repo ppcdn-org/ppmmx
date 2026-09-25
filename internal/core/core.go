@@ -876,9 +876,9 @@ func (p *Core) createResources(initial bool) error {
 			DegradeWSPathSuffix:   p.conf.WebRTCDegradeWSPathSuffix,
 			DegradeRaisePct:       degradeRaisePct(p.conf),
 			DegradeLowerPct:       degradeLowerPct(p.conf),
+			DegradeRestartPct:     p.conf.DegradeRestartPct,
 			DegradeObservationSec: degradeObservationSec(p.conf),
 			DegradeSampleSec:      p.conf.DegradeSampleSec,
-			DegradeWSSecret:       p.conf.WebRTCDegradeWSSecret,
 			RTPLossAlarmEnable:       p.conf.RTPLossAlarmEnable,
 			RTPLossAlarmThresholdPct: p.conf.RTPLossAlarmThresholdPct,
 			// Loss-recycle self-heal. Like SRT's LossDisconnect it needs no
@@ -1132,6 +1132,7 @@ func (p *Core) createResources(initial bool) error {
 			DegradeEnable:           (p.conf.DegradeEnable || p.conf.SRTDegradeEnable) && p.degradeManager != nil,
 			DegradeRaisePct:         degradeRaisePct(p.conf),
 			DegradeLowerPct:         degradeLowerPct(p.conf),
+			DegradeRestartPct:       p.conf.DegradeRestartPct,
 			DegradeObservationSec:   degradeObservationSec(p.conf),
 			DegradeRaiseLatencyStep: time.Duration(p.conf.DegradeRaiseLatencyStep),
 			DegradeLowerLatencyStep: time.Duration(p.conf.DegradeLowerLatencyStep),
@@ -1368,7 +1369,6 @@ func (p *Core) closeResources(newConf *conf.Conf, calledByAPI bool) {
 	closeDegradeManager := newConf == nil ||
 		newConf.WebRTC != p.conf.WebRTC ||
 		newConf.WebRTCDegradeWSPathSuffix != p.conf.WebRTCDegradeWSPathSuffix ||
-		newConf.WebRTCDegradeWSSecret != p.conf.WebRTCDegradeWSSecret ||
 		closeLogger
 
 	closePPROF := newConf == nil ||
@@ -1575,10 +1575,10 @@ func (p *Core) closeResources(newConf *conf.Conf, calledByAPI bool) {
 		newConf.WebRTCRecoverInstantLossPct != p.conf.WebRTCRecoverInstantLossPct ||
 		newConf.WebRTCRecoverAvgLossPct != p.conf.WebRTCRecoverAvgLossPct ||
 		newConf.WebRTCDegradeObservationSec != p.conf.WebRTCDegradeObservationSec ||
-		newConf.WebRTCDegradeWSSecret != p.conf.WebRTCDegradeWSSecret ||
 		newConf.DegradeEnable != p.conf.DegradeEnable ||
 		newConf.DegradeRaisePct != p.conf.DegradeRaisePct ||
 		newConf.DegradeLowerPct != p.conf.DegradeLowerPct ||
+		newConf.DegradeRestartPct != p.conf.DegradeRestartPct ||
 		newConf.DegradeSampleSec != p.conf.DegradeSampleSec ||
 		newConf.DegradeObservationSec != p.conf.DegradeObservationSec ||
 		newConf.DegradeNackTimeoutMs != p.conf.DegradeNackTimeoutMs ||
@@ -1621,6 +1621,7 @@ func (p *Core) closeResources(newConf *conf.Conf, calledByAPI bool) {
 		newConf.DegradeEnable != p.conf.DegradeEnable ||
 		newConf.DegradeRaisePct != p.conf.DegradeRaisePct ||
 		newConf.DegradeLowerPct != p.conf.DegradeLowerPct ||
+		newConf.DegradeRestartPct != p.conf.DegradeRestartPct ||
 		newConf.DegradeObservationSec != p.conf.DegradeObservationSec ||
 		newConf.DegradeRaiseLatencyStep != p.conf.DegradeRaiseLatencyStep ||
 		newConf.DegradeLowerLatencyStep != p.conf.DegradeLowerLatencyStep ||

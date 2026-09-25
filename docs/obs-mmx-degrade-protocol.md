@@ -26,6 +26,7 @@ maxLayers-1 / 码率100%
 
 规则：
 - 单向阶梯，一次只走一级，不允许跨级跳变。
+- **砍层（会导致推流重启）有独立门槛 `degradeRestartPct`（默认 1.6%，0-100）**：ULR 一旦超过 `degradeRaisePct` 就开始降级，但只降码率（100%→80%→60%，不中断推流）；只有 ULR 同时超过 `degradeRestartPct` 时才进入砍层阶段（OBS 会重启推流来应用），SRT 侧"抬高接收延迟→强制重连"也只在这一档触发。`degradeRestartPct <= 0` 视为关闭该门槛（等价于旧行为：每次降级都可能砍层/重连）。校验要求 `degradeRestartPct >= degradeRaisePct`。
 - **降级、恢复阈值分开配置（滞回/gap）**：丢包率超过 `Degrade*` 阈值才计入降级观察，跌回 `Recover*` 阈值（含）以下才计入恢复观察；`Recover* < Degrade*` 时中间留一段"死区"——瞬时/均值丢包率落在死区内既不计入降级也不计入恢复，只是让已经在跑的计时器继续计时，不会被这一个样本重置或提前触发，避免丢包率贴着单一阈值来回抖动导致反复升降级。`Recover* == Degrade*`（默认）等价于旧的单阈值行为，死区宽度为 0。实现见 [internal/degrade](../internal/degrade)（WHIP/SRT 各自独立配置数值，共用同一套状态机/WS 通道）。
 - **SRT 侧喂给状态机的是"不可恢复丢包率"，不是原始丢包率**：原始丢包里绝大部分会被 SRT ARQ 重传补回（实测健康链路上 ~5–10% raw vs ~0.1% unrecoverable），按原始丢包触发会在链路其实正常时就把阶梯一路降到底。SRT 输入取 `PktRecvLoss - PktRecvRetrans` 的每 1s 增量并累积成单调计数（见 [internal/servers/srt/conn.go](../internal/servers/srt/conn.go) 的 `unrecoverableAccumulator`）。WHIP 侧仍按 RTP 丢包计算（见 `二、mmx 任务`）。
 - 终止态（1层/码率80%仍不合规）不再自动继续降码率，只记日志/告警，交人工处理。
@@ -45,10 +46,10 @@ maxLayers-1 / 码率100%
 1. **丢包率计算**：每个 WHIP（publish）session，每 1s 采样 `InboundRTPPackets`/`InboundRTPPacketsLost`（已有字段，见 [internal/servers/webrtc/session.go](../internal/servers/webrtc/session.go)）差分算出瞬时丢包率，维护 5 分钟滑动窗口算出均值丢包率。SRT 侧（[internal/servers/srt/conn.go](../internal/servers/srt/conn.go)）同样 1s 采样，但喂的是**不可恢复丢包率**（`PktRecvLoss - PktRecvRetrans` 的增量累积），不是 `PktRecvLoss` 原始值。
 2. **状态机**：按 path 维护 `{当前层级, 当前码率比例, 上次动作时间}`，跑上述状态机；WHIP session 重连后先查该 path 是否已有状态，有则延用，不重置。
 3. **新增 WS 端点**，路径与对应 WHIP 推流地址绑定（如 `ws://.../live/table1-fwv/ws/whip`，从 WHIP 推流地址 `.../live/table1-fwv/whip` 去掉 `/whip`、换成 `/ws/whip`，这也是 OBS 侧实测已经在用的推导方式）：
-   - **鉴权**：固定共享密钥，不是签名/带过期时间的 token（那套复杂度是给外部公开 API 防重放用的，这个 WS 端点从头到尾只有 OBS 侧这一个可信客户端，不需要）。密钥就是 mmx 部署环境变量 `WHIP_WS_SECRET` 的值，两种方式任选一种带上：
-     - Header：`Authorization: Bearer <secret>`
-     - 或查询参数：`ws://.../live/table1-fwv/ws/whip?token=<secret>`
-     - 两个都没带 / 值不对，返回 `401`，mmx 会记一条 `WAR [degrade] path=... executor connection rejected` 日志（不会记密钥本身）。
+   - **鉴权**：复用 ppcenter 签发的 publish bearer token（与该 codec 的 WHIP publish 是同一把），不再有单独的共享密钥。OBS 侧执行器把已拿到的 `whipTracks[<codec>].bearer_token` 原样带上，两种方式任选一种：
+     - Header：`Authorization: Bearer <token>`
+     - 或查询参数：`ws://.../live/table1-fwv/h264/ws/whip?token=<token>`
+     - mmx 用 `WHIP_AUTH_KEY` 解密校验 token 的 appId/stream/codec 与路径一致且未过期；失败返回 `401`，并记一条 `WAR [degrade] path=... executor connection rejected` 日志（不会记 token 本身）。
    - **声明式推送协议**（每次都发"当前应处于的目标状态"，不是一次性指令，避免消息丢失导致两端状态不一致）：
      ```json
      {"type":"TARGET_STATE","path":"live/table1-fwv","layers":2,"bitrate_percent":100}
@@ -65,7 +66,7 @@ maxLayers-1 / 码率100%
 需要一个跟 OBS 同机/同网运行的组件，具体如何与定制版 OBS 通信，由 OBS 侧自行决定。目前 OBS 补丁里已经直接内置了 WS 客户端（不是独立进程），对外契约如下：
 
 - **连接**：WHIP 推流地址 `.../{path}/whip` 对应的 WS 地址是 `.../{path}/ws/whip`（同 host:port，`ws://` 而非 `wss://`，除非 mmx 开了 TLS）。
-- **鉴权**：按上一节的方式带上 `WHIP_WS_SECRET`（Header 或 query 二选一）。这个密钥目前只存在于 mmx 部署环境的 `bin/.env` / VPS 上的 `.env`，需要单独同步给 OBS 侧配置，不在这份文档里明文写出。
+- **鉴权**：按上一节的方式带上 ppcenter 签发的 publish bearer token（Header 或 query 二选一）。它与该 codec 的 WHIP publish token 是同一把，无需额外配置或同步。
 - **输入**：监听 `TARGET_STATE` 消息。
 - **行为**：收到 `TARGET_STATE` 时，确保 OBS 当前实际的同播层数、码率与消息里的 `layers`/`bitrate_percent` 一致，不一致则通过重启推流的方式切换到目标状态。**层数减少时必须砍掉当前最高分辨率的一层**（见第一节「层数减少的方向」），层数增加时按相反顺序、从低到高逐层加回；不得跨级跳变、不得砍非最高层。
 - **幂等性要求**：收到的 `TARGET_STATE` 如果与 OBS 当前状态已经一致，不应重复触发重启（避免连接建立时收到的初始状态消息造成无意义重启）。

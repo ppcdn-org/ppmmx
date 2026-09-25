@@ -452,20 +452,18 @@ type Conf struct {
 	WebRTCRecoverInstantLossPct float64 `json:"webrtcRecoverInstantLossPct" deprecated:"true"`
 	WebRTCRecoverAvgLossPct     float64 `json:"webrtcRecoverAvgLossPct" deprecated:"true"`
 	WebRTCDegradeObservationSec int     `json:"webrtcDegradeObservationSec" deprecated:"true"`
-	WebRTCDegradeWSSecret       string  `json:"-"`
 
 	// WHIP publish auth (see docs/obs-whip-publish-auth-protocol.md): AES key
 	// checkWHIPDeviceID uses to decrypt the ppcenter-issued bearer token
-	// every WHIP publish request must carry. Independent of
-	// WebRTCDegradeWSSecret above (that one authenticates the degrade
-	// protocol's own WS channel, not WHIP publish).
+	// every WHIP publish request must carry. The same key authenticates the
+	// degrade protocol's own WS channel (see degrade_ws_handler.go), which
+	// reuses the publisher's ppcenter token instead of a separate secret.
 	WebRTCWHIPAuthKey string `json:"-"`
 
 	// WebRTCForwardSecret is a static pre-shared secret checkWHIPDeviceID
 	// also accepts, for mmx-to-mmx forwardMmx pushes between your own
-	// trusted nodes (see Path.ForwardMmx*). Independent of both
-	// WebRTCWHIPAuthKey (external ppobs publishers) and
-	// WebRTCDegradeWSSecret (degrade WS channel).
+	// trusted nodes (see Path.ForwardMmx*). Independent of
+	// WebRTCWHIPAuthKey (external ppobs publishers).
 	WebRTCForwardSecret string `json:"-"`
 
 	// Unified degrade protocol (see docs/design/publish-degrade-protocol.zh-CN.md):
@@ -473,10 +471,16 @@ type Conf struct {
 	// latency thresholds. DegradeRaisePct/DegradeLowerPct form a hysteresis
 	// band; a sample above RaisePct triggers immediate degrade (with cooldown),
 	// a sample at/below LowerPct counts toward sustained recovery.
+	// DegradeRestartPct gates the disruptive layer phase (and, on SRT, the
+	// forced publisher reconnect that applies a raised receiver latency): the
+	// non-disruptive bitrate phase still runs between RaisePct and
+	// RestartPct, but the ladder will not interrupt the publish until ULR
+	// also exceeds RestartPct.
 	// DegradeEnable gates the whole mechanism.
 	DegradeEnable          bool     `json:"degradeEnable"`
 	DegradeRaisePct        float64  `json:"degradeRaisePct"`
 	DegradeLowerPct        float64  `json:"degradeLowerPct"`
+	DegradeRestartPct      float64  `json:"degradeRestartPct"`
 	DegradeSampleSec       int      `json:"degradeSampleSec"`
 	DegradeObservationSec  int      `json:"degradeObservationSec"`
 	DegradeRaiseLatencyStep Duration `json:"degradeRaiseLatencyStep"`
@@ -727,7 +731,7 @@ type Conf struct {
 
 	// SRT-simulcast degrade (see docs/obs-mmx-degrade-protocol.md and
 	// internal/degrade): shares the same FSM/WS channel as WebRTCDegrade*
-	// below (same WebRTCDegradeWSPathSuffix/WebRTCDegradeWSSecret) - only
+	// below (same WebRTCDegradeWSPathSuffix and degrade WS auth) - only
 	// the trigger thresholds are configured separately per protocol, since
 	// SRT and WHIP ingest can have different loss characteristics.
 	// Requires WebRTC to also be enabled, since that's what serves the
@@ -907,6 +911,9 @@ func (conf *Conf) setDefaults() {
 	conf.DegradeEnable = false
 	conf.DegradeRaisePct = 0.8
 	conf.DegradeLowerPct = 0.3
+	// RestartPct sits well above RaisePct: moderate loss reduces bitrate
+	// (non-disruptive) without cutting a layer / forcing a reconnect.
+	conf.DegradeRestartPct = 1.6
 	conf.DegradeSampleSec = 6
 	conf.DegradeObservationSec = 60
 	conf.DegradeRaiseLatencyStep = 200 * Duration(time.Millisecond)
@@ -1036,7 +1043,6 @@ func Load(fpath string, defaultConfPaths []string, l logger.Writer) (*Conf, stri
 	}
 	conf.TencentWHIPSecretKey = DotenvValue("TX_SECRET_KEY")
 	conf.TXSecretKeyBack = DotenvValue("TX_SECRET_KEY_BACK")
-	conf.WebRTCDegradeWSSecret = DotenvValue("WHIP_WS_SECRET")
 	conf.WebRTCWHIPAuthKey = DotenvValue("WHIP_AUTH_KEY")
 	conf.WebRTCForwardSecret = DotenvValue("MMX_FORWARD_SECRET")
 	conf.MMXNodeSecret = DotenvValue("MMX_NODE_SECRET")
@@ -1566,8 +1572,8 @@ func (conf *Conf) Validate(l logger.Writer) error {
 		return fmt.Errorf("'splitRecAuthMode' must be either 'simple' or 'advance'")
 	}
 
-	if conf.WebRTCDegradeEnable && conf.WebRTCDegradeWSSecret == "" {
-		return fmt.Errorf("WHIP_WS_SECRET must be set when webrtcDegradeEnable is true")
+	if conf.WebRTCDegradeEnable && conf.WebRTCWHIPAuthKey == "" {
+		return fmt.Errorf("WHIP_AUTH_KEY must be set when webrtcDegradeEnable is true")
 	}
 	if conf.WebRTCDegradeEnable && conf.WebRTCRecoverInstantLossPct > conf.WebRTCDegradeInstantLossPct {
 		return fmt.Errorf("'webrtcRecoverInstantLossPct' must be <= 'webrtcDegradeInstantLossPct' " +
@@ -1621,8 +1627,8 @@ func (conf *Conf) Validate(l logger.Writer) error {
 		}
 	}
 
-	if conf.SRTDegradeEnable && conf.WebRTCDegradeWSSecret == "" {
-		return fmt.Errorf("WHIP_WS_SECRET must be set when srtDegradeEnable is true")
+	if conf.SRTDegradeEnable && conf.WebRTCWHIPAuthKey == "" {
+		return fmt.Errorf("WHIP_AUTH_KEY must be set when srtDegradeEnable is true")
 	}
 	if conf.SRTDegradeEnable && !conf.WebRTC {
 		return fmt.Errorf("'webrtc' must be enabled when srtDegradeEnable is true (the degrade WS channel is served by the WebRTC server)")
@@ -1638,8 +1644,8 @@ func (conf *Conf) Validate(l logger.Writer) error {
 	// Unified degrade protocol (see docs/design/publish-degrade-protocol.zh-CN.md):
 	// migrate from deprecated old fields.
 	if conf.DegradeEnable {
-		if conf.WebRTCDegradeWSSecret == "" {
-			return fmt.Errorf("WHIP_WS_SECRET must be set when degradeEnable is true")
+		if conf.WebRTCWHIPAuthKey == "" {
+			return fmt.Errorf("WHIP_AUTH_KEY must be set when degradeEnable is true")
 		}
 		if !conf.WebRTC {
 			return fmt.Errorf("'webrtc' must be enabled when degradeEnable is true " +
@@ -1648,6 +1654,10 @@ func (conf *Conf) Validate(l logger.Writer) error {
 		if conf.DegradeRaisePct <= conf.DegradeLowerPct {
 			return fmt.Errorf("'degradeRaisePct' must be > 'degradeLowerPct', " +
 				"otherwise there is no hysteresis band and the FSM oscillates")
+		}
+		if conf.DegradeRestartPct < conf.DegradeRaisePct {
+			return fmt.Errorf("'degradeRestartPct' must be >= 'degradeRaisePct', " +
+				"otherwise the restart gate can never hold a degrade back")
 		}
 		if conf.DegradeSampleSec <= 0 {
 			return fmt.Errorf("'degradeSampleSec' must be greater than zero")

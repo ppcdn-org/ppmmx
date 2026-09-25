@@ -196,11 +196,13 @@ type Server struct {
 	// by the caller (there would be nowhere for the executor to connect).
 	DegradeManager *degrade.Manager
 	DegradeEnable  bool
-	// DegradeRaisePct/DegradeLowerPct are the unified ULR thresholds (see
-	// docs/design/publish-degrade-protocol.zh-CN.md). Applied to the
+	// DegradeRaisePct/DegradeLowerPct are the unified ULR thresholds, and
+	// DegradeRestartPct gates the disruptive layer phase / forced reconnect
+	// (see docs/design/publish-degrade-protocol.zh-CN.md). Applied to the
 	// connection's UNRECOVERABLE loss rate via runDegradeSampling.
 	DegradeRaisePct        float64
 	DegradeLowerPct        float64
+	DegradeRestartPct      float64
 	DegradeObservationSec  int
 	DegradeSampleSec       int
 	DegradeRaiseLatencyStep time.Duration
@@ -458,6 +460,7 @@ outer:
 				degradeEnable:           s.DegradeEnable,
 				degradeRaisePct:         s.DegradeRaisePct,
 				degradeLowerPct:         s.DegradeLowerPct,
+				degradeRestartPct:       s.DegradeRestartPct,
 				degradeObservationSec:   s.DegradeObservationSec,
 				degradeSampleSec:        s.DegradeSampleSec,
 				degradeRaiseLatencyStep: s.DegradeRaiseLatencyStep,

@@ -6,7 +6,9 @@
 //   1. Bitrate phase (no interruption): 100% -> 80% -> 60%
 //   2. Layer phase (~1s interruption): maxLayers -> maxLayers-1 -> ... -> 1
 // Degrade triggers on the first sample above RaisePct (no sustained wait),
-// then enters a cooldown. Recovery requires sustained compliance for
+// then enters a cooldown. The layer phase (which restarts the publish) only
+// engages when ULR is also above RestartPct, so moderate loss reduces bitrate
+// without an interruption. Recovery requires sustained compliance for
 // ObservationSec.
 //
 // State is kept per path, not per ingest session: the OBS-side executor
@@ -58,9 +60,15 @@ func SamplePeriod(sec int) time.Duration {
 // cooldown), a sample at/below LowerPct counts toward sustained recovery,
 // and anything in between is a dead zone that neither degrades nor recovers.
 type Thresholds struct {
-	RaisePct       float64 // 0-100 - ULR above this triggers degrade
-	LowerPct       float64 // 0-100 - ULR at/below this counts toward recovery
-	ObservationSec int     // cooldown after degrade / sustained window for recovery
+	RaisePct float64 // 0-100 - ULR above this triggers degrade
+	LowerPct float64 // 0-100 - ULR at/below this counts toward recovery
+	// RestartPct (0-100) is the ULR above which the layer phase - which the
+	// executor applies by restarting the publish, a ~1s interruption - is
+	// allowed. Below it, only the non-disruptive bitrate phase runs and the
+	// ladder holds at bitrate=60%. A value <= 0 disables the gate (every
+	// degrade may cut a layer), preserving the pre-RestartPct behavior.
+	RestartPct     float64
+	ObservationSec int // cooldown after degrade / sustained window for recovery
 }
 
 // TargetStateMsg is pushed on every transition and once on (re)connect -
@@ -105,7 +113,12 @@ type Action int
 
 const (
 	ActionNone Action = iota
+	// ActionDegrade advanced the non-disruptive bitrate phase only.
 	ActionDegrade
+	// ActionRestart cut a simulcast layer; the executor applies it by
+	// restarting the publish (a ~1s interruption), and SRT additionally
+	// forces its own reconnect to apply the raised receiver latency.
+	ActionRestart
 	ActionRecover
 )
 
@@ -211,12 +224,18 @@ func (d *State) recordSample(unrecovDelta, totalDelta uint64, t Thresholds) Acti
 
 	observation := time.Duration(t.ObservationSec) * time.Second
 
-	// Degrade: immediate on threshold crossing, with cooldown.
+	// Degrade: immediate on threshold crossing, with cooldown. The layer
+	// phase (a publish restart) is gated behind RestartPct; a RestartPct <= 0
+	// disables the gate for backward compatibility.
 	if ulr > t.RaisePct {
 		d.goodSince = time.Time{}
 		if !now.Before(d.degradeCooldownUntil) {
-			d.degrade(now)
+			allowLayer := t.RestartPct <= 0 || ulr > t.RestartPct
+			restarted := d.degrade(now, allowLayer)
 			d.degradeCooldownUntil = now.Add(observation)
+			if restarted {
+				return ActionRestart
+			}
 			return ActionDegrade
 		}
 		return ActionNone
@@ -241,14 +260,24 @@ func (d *State) recordSample(unrecovDelta, totalDelta uint64, t Thresholds) Acti
 
 // degrade and recover must be called with d.mu held.
 
-func (d *State) degrade(now time.Time) {
+// degrade advances the ladder one step (caller holds d.mu) and reports
+// whether that step cut a simulcast layer, i.e. needs a publish restart to
+// apply. allowLayer is false when ULR is at/below RestartPct: the bitrate
+// phase still proceeds, but the ladder holds at its bitrate floor rather
+// than interrupting the stream to cut a layer.
+func (d *State) degrade(now time.Time, allowLayer bool) bool {
+	restart := false
 	switch {
 	case d.maxLayers == 0:
-		return
+		return false
 	case d.bitratePercent > 60:
 		d.bitratePercent -= 20
 	case d.layers > 1:
+		if !allowLayer {
+			return false
+		}
 		d.layers--
+		restart = true
 	default:
 		// Terminal: layers=1, bitrate=60%, still non-compliant.
 		if d.lastAlertTime.IsZero() || now.Sub(d.lastAlertTime) >= time.Duration(60)*time.Second {
@@ -260,10 +289,11 @@ func (d *State) degrade(now time.Time) {
 				Reason: "layer=1,bitrate=60%,仍不合规",
 			})
 		}
-		return
+		return false
 	}
 	d.log.Log(logger.Info, "[degrade] path=%s -> layers=%d bitrate=%d%%", d.path, d.layers, d.bitratePercent)
 	d.pushTargetStateLocked()
+	return restart
 }
 
 func (d *State) recover(now time.Time) {

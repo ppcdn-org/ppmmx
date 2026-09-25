@@ -74,6 +74,7 @@ type conn struct {
 	degradeEnable          bool
 	degradeRaisePct        float64
 	degradeLowerPct        float64
+	degradeRestartPct      float64
 	degradeObservationSec  int
 	degradeSampleSec       int
 	degradeRaiseLatencyStep time.Duration
@@ -663,22 +664,31 @@ func (c *conn) runDegradeSampling(sconn srt.Conn, pathName string, videoLayers i
 			if acc.add(st.Accumulated.PktRecvLoss, st.Accumulated.PktRecvRetrans, st.Accumulated.PktRecv) {
 				changed := c.degradeManager.RecordSample(pathName, acc.unrecoverable,
 					acc.expected, degrade.Thresholds{
-						RaisePct:       c.degradeRaisePct,
-						LowerPct:       c.degradeLowerPct,
-						ObservationSec: c.degradeObservationSec,
-					})
-				// On degrade/recover, also adjust SRT receiver latency.
-				if changed != degrade.ActionNone && c.latencyManager != nil {
-					raise := changed == degrade.ActionDegrade
-					step := c.degradeRaiseLatencyStep
-					if !raise {
-						step = c.degradeLowerLatencyStep
-					}
-					if raised := c.latencyManager.AdjustLatency(pathName, raise, step,
-						c.degradeLatencyMin, c.degradeLatencyMax); raised {
-						c.latencyManager.MarkRaiseClose(pathName, time.Now())
-						c.Log(logger.Info, "[degrade] path=%s raise-triggered latency raise; forcing reconnect", pathName)
-						c.Close()
+					RaisePct:       c.degradeRaisePct,
+					LowerPct:       c.degradeLowerPct,
+					RestartPct:     c.degradeRestartPct,
+					ObservationSec: c.degradeObservationSec,
+				})
+				// On a restart-tier degrade (a layer cut) or a recovery, also
+				// adjust SRT receiver latency. A latency raise can only reach
+				// the wire on a fresh handshake, so it forces a reconnect -
+				// hence it is gated behind the layer phase, which is itself
+				// gated behind degradeRestartPct. A bitrate-only degrade
+				// (ActionDegrade) never restarts the publisher here.
+				if c.latencyManager != nil {
+					switch changed {
+					case degrade.ActionRestart:
+						if raised := c.latencyManager.AdjustLatency(pathName, true,
+							c.degradeRaiseLatencyStep, c.degradeLatencyMin,
+							c.degradeLatencyMax); raised {
+							c.latencyManager.MarkRaiseClose(pathName, time.Now())
+							c.Log(logger.Info, "[degrade] path=%s raise-triggered latency raise; forcing reconnect", pathName)
+							c.Close()
+						}
+					case degrade.ActionRecover:
+						c.latencyManager.AdjustLatency(pathName, false,
+							c.degradeLowerLatencyStep, c.degradeLatencyMin,
+							c.degradeLatencyMax)
 					}
 				}
 			}

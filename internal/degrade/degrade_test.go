@@ -263,9 +263,50 @@ func TestActionReturned(t *testing.T) {
 	require.Equal(t, ActionDegrade, ds.recordSample(50, 100, th), "bad sample degrades")
 	require.Equal(t, ActionNone, ds.recordSample(50, 100, th), "cooldown suppresses the next action")
 
+	// Clear the cooldown and drop to the bitrate floor to reach the layer
+	// phase: a layer cut is reported as ActionRestart, distinct from the
+	// bitrate-only ActionDegrade above.
+	ds.degradeCooldownUntil = time.Time{}
+	ds.bitratePercent = 60
+	require.Equal(t, ActionRestart, ds.recordSample(50, 100, th), "a layer cut reports a restart")
+
 	ds.degradeCooldownUntil = time.Time{} // clear cooldown for the recovery check
 	require.Equal(t, ActionNone, ds.recordSample(0, 100, th), "first good sample only starts the timer")
 
 	time.Sleep(1200 * time.Millisecond)
 	require.Equal(t, ActionRecover, ds.recordSample(0, 100, th), "sustained compliance recovers")
+}
+
+// TestDegradeLayerPhaseGatedByRestartPct verifies that a ULR between RaisePct
+// and RestartPct only runs the non-disruptive bitrate phase: the ladder holds
+// at its bitrate floor instead of cutting a layer (which would restart the
+// publish). The layer phase only resumes once ULR exceeds RestartPct.
+func TestDegradeLayerPhaseGatedByRestartPct(t *testing.T) {
+	const observationSec = 1
+	th := Thresholds{RaisePct: 5, LowerPct: 1, RestartPct: 10, ObservationSec: observationSec}
+	ds := newState("live/test", test.NilLogger)
+	ds.ObserveSessionLayerCount(3)
+
+	wait := func() { time.Sleep(time.Duration(observationSec)*time.Second + 200*time.Millisecond) }
+
+	// 7%: above RaisePct (degrade) but below RestartPct (bitrate only).
+	require.Equal(t, ActionDegrade, ds.recordSample(7, 100, th))
+	require.Equal(t, 80, ds.bitratePercent)
+	require.Equal(t, 3, ds.layers)
+
+	wait()
+	require.Equal(t, ActionDegrade, ds.recordSample(7, 100, th))
+	require.Equal(t, 60, ds.bitratePercent)
+	require.Equal(t, 3, ds.layers)
+
+	// At the bitrate floor and still below RestartPct: hold, no layer cut.
+	wait()
+	require.Equal(t, ActionDegrade, ds.recordSample(7, 100, th))
+	require.Equal(t, 60, ds.bitratePercent, "bitrate is already at the floor")
+	require.Equal(t, 3, ds.layers, "must not cut a layer below the restart threshold")
+
+	// Above RestartPct: the layer phase runs and reports a restart.
+	wait()
+	require.Equal(t, ActionRestart, ds.recordSample(15, 100, th))
+	require.Equal(t, 2, ds.layers)
 }

@@ -241,9 +241,9 @@ type Server struct {
 	DegradeWSPathSuffix string
 	DegradeRaisePct     float64
 	DegradeLowerPct     float64
+	DegradeRestartPct   float64
 	DegradeObservationSec int
 	DegradeSampleSec    int
-	DegradeWSSecret     string
 
 	// RTP loss alarm (see rtp_loss_alarm.go): reports a WHIP publish
 	// session's RTP loss rate to ppcenter as a superadmin node alarm,
@@ -281,15 +281,15 @@ type Server struct {
 
 	// WHIP publish auth (see docs/obs-whip-publish-auth-protocol.md): shared
 	// AES key used by checkWHIPDeviceID to decrypt the ppcenter-issued
-	// bearer token every ppobs publish request must carry. Distinct from
-	// DegradeWSSecret, which authenticates the degrade protocol's own WS
-	// control channel, not WHIP publish.
+	// bearer token every ppobs publish request must carry. The same key and
+	// credential also authenticate the degrade protocol's WS control channel
+	// (see degrade_ws_handler.go), so there is no separate secret for it.
 	WHIPAuthKey string
 
 	// ForwardSecret is a static pre-shared secret checkWHIPDeviceID also
 	// accepts, for mmx-to-mmx forwardMmx pushes between your own trusted
 	// nodes (see internal/forward/mmx.go) - distinct from WHIPAuthKey
-	// (external ppobs publishers) and DegradeWSSecret (degrade WS channel).
+	// (external ppobs publishers).
 	ForwardSecret string
 
 	ctx              context.Context
