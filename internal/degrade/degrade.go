@@ -24,6 +24,7 @@
 package degrade
 
 import (
+	"strings"
 	"sync"
 	"time"
 
@@ -68,9 +69,26 @@ type Thresholds struct {
 type TargetStateMsg struct {
 	Type           string `json:"type"`
 	Path           string `json:"path"`
+	Codec          string `json:"codec"`
 	Layers         int    `json:"layers"`
 	BitratePercent int    `json:"bitrate_percent"`
 	LatencyMs      int    `json:"latency_ms"`
+}
+
+// codecFromPath returns the codec segment of a path name, or "" for the
+// legacy/ambiguous 2-segment shape. HEVC/H264 multitrack publishes each codec
+// on its own path (app/stream/h264, app/stream/hevc) with its own FSM state;
+// the executor is told which codec a target state belongs to so it can apply
+// bitrate/layers to the matching encoder group.
+func codecFromPath(path string) string {
+	switch {
+	case strings.HasSuffix(path, "/h264"):
+		return "h264"
+	case strings.HasSuffix(path, "/hevc"):
+		return "hevc"
+	default:
+		return ""
+	}
 }
 
 // AlertMsg fires once (throttled) when the ladder has bottomed out
@@ -265,6 +283,7 @@ func (d *State) pushTargetStateLocked() {
 	d.pushLocked(TargetStateMsg{
 		Type:           "TARGET_STATE",
 		Path:           d.path,
+		Codec:          codecFromPath(d.path),
 		Layers:         d.layers,
 		BitratePercent: d.bitratePercent,
 	})
@@ -300,6 +319,7 @@ func (d *State) BindConn(conn *wsproto.ServerConn) {
 	msg := TargetStateMsg{
 		Type:           "TARGET_STATE",
 		Path:           d.path,
+		Codec:          codecFromPath(d.path),
 		Layers:         d.layers,
 		BitratePercent: d.bitratePercent,
 	}
