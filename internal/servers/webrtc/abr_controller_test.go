@@ -11,7 +11,8 @@ import (
 )
 
 // Three video layers plus audio, matching layerDefaults in
-// track_selector.go: track 0 = 2000kbps, 1 = 1000kbps, 2 = 400kbps.
+// track_selector.go: track 0 = 2000kbps, 1 = 1000kbps, 2 = 400kbps. Sorted
+// low-to-high that is the ladder 2 -> 1 -> 0.
 func makeLadderSelector(t *testing.T) *webrtcproto.TrackSelector {
 	t.Helper()
 
@@ -33,140 +34,112 @@ func makeLadderSelector(t *testing.T) *webrtcproto.TrackSelector {
 	return sel
 }
 
-func TestVideoBudgetReservesAudio(t *testing.T) {
-	require.Equal(t, 1_000_000-abrAudioReserveBits, videoBudget(1_000_000))
-	// Never negative, even when the estimate is below the audio reserve.
-	require.Equal(t, 0, videoBudget(50_000))
-}
-
-func TestPickHighestFittingLayer(t *testing.T) {
-	sel := makeLadderSelector(t)
-	tracks := sel.GetTracks()
-
-	// Comfortably above 2000k * 1.2 - top layer.
-	id, ok := pick(tracks, 3_000_000)
-	require.True(t, ok)
-	require.Equal(t, 0, id)
-
-	// Above 1000k * 1.2 but below 2000k * 1.2 - middle layer.
-	id, ok = pick(tracks, 1_500_000)
-	require.True(t, ok)
-	require.Equal(t, 1, id)
-
-	// Above 400k * 1.2 but below 1000k * 1.2 - bottom layer.
-	id, ok = pick(tracks, 600_000)
-	require.True(t, ok)
-	require.Equal(t, 2, id)
-}
-
-func TestPickFallsBackToLowestWhenNothingFits(t *testing.T) {
-	sel := makeLadderSelector(t)
-
-	// Below even the lowest layer's requirement: something still has to be
-	// sent, and the lowest layer is the closest available approximation.
-	id, ok := pick(sel.GetTracks(), 10_000)
-	require.True(t, ok)
-	require.Equal(t, 2, id)
-}
-
-func TestPickNoVideoTracks(t *testing.T) {
-	desc := &description.Session{
-		Medias: []*description.Media{
-			{Type: description.MediaTypeAudio, Formats: []format.Format{&format.Opus{PayloadTyp: 111}}},
-		},
-	}
-	sel := webrtcproto.NewTrackSelector(nil, func(_, _ int) {})
-	require.NoError(t, sel.LoadFromDescription(desc))
-
-	_, ok := pick(sel.GetTracks(), 5_000_000)
-	require.False(t, ok)
-}
-
-func TestControllerUpgradeRequiresConfirmations(t *testing.T) {
+func TestControllerUpgradesOneStepAfterConfirmations(t *testing.T) {
 	sel := makeLadderSelector(t)
 	require.NoError(t, sel.Select(2)) // start at the bottom
 	c := newABRController(sel)
 
-	// Plenty of bandwidth for the top layer, but a single sample must not
-	// move anything.
+	// No loss, stable RTT: upgrade is warranted, but a single sample must
+	// not move anything.
 	for i := range abrUpgradeConfirmations - 1 {
-		_, ok := c.evaluate(5_000_000)
+		_, ok := c.evaluate(0, 30)
 		require.Falsef(t, ok, "upgraded after only %d confirmations", i+1)
 	}
 
-	target, ok := c.evaluate(5_000_000)
+	target, ok := c.evaluate(0, 30)
 	require.True(t, ok)
-	require.Equal(t, 0, target)
+	require.Equal(t, 1, target, "one step up from 2 is 1, not straight to the top")
 }
 
-func TestControllerDowngradeRequiresFewerConfirmations(t *testing.T) {
+func TestControllerDowngradesOneStepFaster(t *testing.T) {
 	sel := makeLadderSelector(t)
 	require.NoError(t, sel.Select(0)) // start at the top
 	c := newABRController(sel)
 
-	// Collapse to well under the top layer's needs.
 	for i := range abrDowngradeConfirmations - 1 {
-		_, ok := c.evaluate(500_000)
+		_, ok := c.evaluate(10, 30)
 		require.Falsef(t, ok, "downgraded after only %d confirmations", i+1)
 	}
 
-	target, ok := c.evaluate(500_000)
+	target, ok := c.evaluate(10, 30)
 	require.True(t, ok)
-	require.Equal(t, 2, target)
+	require.Equal(t, 1, target, "one step down from 0 is 1, not straight to the bottom")
 
 	// Downgrades are meant to react faster than upgrades.
 	require.Less(t, abrDowngradeConfirmations, abrUpgradeConfirmations)
 }
 
-// The band between "not enough headroom to pick this layer" and "genuinely
-// short of what this layer needs" is what stops a steady estimate sitting
-// just under the upgrade threshold from repeatedly abandoning the layer it
-// just settled on.
-func TestControllerHoldsLayerWithinHysteresisBand(t *testing.T) {
+// Loss between the upgrade and downgrade thresholds is a dead zone: neither
+// direction moves.
+func TestControllerHoldsWithinLossDeadBand(t *testing.T) {
 	sel := makeLadderSelector(t)
-	require.NoError(t, sel.Select(1)) // 1000kbps layer
+	require.NoError(t, sel.Select(1))
 	c := newABRController(sel)
 
-	// Budget covers the layer itself but not the 1.2x headroom pick()
-	// would require to choose it afresh.
-	estimate := 1_050_000 + abrAudioReserveBits
-
-	for range abrDowngradeConfirmations + 3 {
-		_, ok := c.evaluate(estimate)
-		require.False(t, ok, "switched while inside the hysteresis band")
+	for range abrDowngradeConfirmations + abrUpgradeConfirmations + 3 {
+		_, ok := c.evaluate(3, 30) // 1 < 3 < 5
+		require.False(t, ok, "switched while inside the loss dead band")
 	}
 }
 
-func TestControllerNoSwitchWhenAlreadyOnTarget(t *testing.T) {
-	sel := makeLadderSelector(t)
-	require.NoError(t, sel.Select(0))
-	c := newABRController(sel)
-
-	for range abrUpgradeConfirmations + 3 {
-		_, ok := c.evaluate(5_000_000)
-		require.False(t, ok)
-	}
-}
-
-// A downgrade decision partway through an upgrade streak (and vice versa)
-// must not inherit the other direction's progress.
-func TestControllerCountersResetOnDirectionChange(t *testing.T) {
+// A climbing RTT blocks an upgrade even with zero loss, and drops the
+// partial streak so it has to be re-earned.
+func TestControllerHoldsUpgradeWhenRTTClimbs(t *testing.T) {
 	sel := makeLadderSelector(t)
 	require.NoError(t, sel.Select(2))
 	c := newABRController(sel)
 
+	// Establish the baseline and build most of an upgrade streak.
 	for range abrUpgradeConfirmations - 1 {
-		_, ok := c.evaluate(5_000_000)
+		_, ok := c.evaluate(0, 30)
 		require.False(t, ok)
 	}
 
-	// Estimate collapses; already on the lowest layer so there is nothing
-	// to drop to, and the pending upgrade progress must be discarded.
-	_, ok := c.evaluate(50_000)
+	// RTT climbs far past the stable band (30ms baseline -> 39ms limit).
+	_, ok := c.evaluate(0, 200)
+	require.False(t, ok, "upgraded while the RTT was unstable")
+
+	// The streak was dropped: the next stable sample must not fire.
+	_, ok = c.evaluate(0, 30)
+	require.False(t, ok, "upgrade fired on the first stable sample after the guard tripped")
+}
+
+func TestControllerNoSwitchAtLadderEnds(t *testing.T) {
+	top := makeLadderSelector(t)
+	require.NoError(t, top.Select(0))
+	cTop := newABRController(top)
+	for range abrUpgradeConfirmations + 2 {
+		_, ok := cTop.evaluate(0, 30)
+		require.False(t, ok, "cannot upgrade past the top layer")
+	}
+
+	bottom := makeLadderSelector(t)
+	require.NoError(t, bottom.Select(2))
+	cBottom := newABRController(bottom)
+	for range abrDowngradeConfirmations + 2 {
+		_, ok := cBottom.evaluate(10, 30)
+		require.False(t, ok, "cannot downgrade past the bottom layer")
+	}
+}
+
+// A decision in one direction must not inherit the other direction's
+// progress.
+func TestControllerCountersResetOnDirectionChange(t *testing.T) {
+	sel := makeLadderSelector(t)
+	require.NoError(t, sel.Select(1))
+	c := newABRController(sel)
+
+	for range abrUpgradeConfirmations - 1 {
+		_, ok := c.evaluate(0, 30)
+		require.False(t, ok)
+	}
+
+	// A lossy sample flips direction and discards the upgrade streak.
+	_, ok := c.evaluate(10, 30)
 	require.False(t, ok)
 
-	_, ok = c.evaluate(5_000_000)
-	require.False(t, ok, "upgrade fired on the first sample after a reset")
+	_, ok = c.evaluate(0, 30)
+	require.False(t, ok, "upgrade fired on the first sample after a direction change")
 }
 
 func TestControllerResetClearsCounters(t *testing.T) {
@@ -175,12 +148,49 @@ func TestControllerResetClearsCounters(t *testing.T) {
 	c := newABRController(sel)
 
 	for range abrUpgradeConfirmations - 1 {
-		_, ok := c.evaluate(5_000_000)
+		_, ok := c.evaluate(0, 30)
 		require.False(t, ok)
 	}
 
 	c.reset()
 
-	_, ok := c.evaluate(5_000_000)
+	_, ok := c.evaluate(0, 30)
 	require.False(t, ok, "upgrade fired on the first sample after reset()")
+}
+
+func TestVideoLadderSortsLowToHigh(t *testing.T) {
+	sel := makeLadderSelector(t)
+	ladder := videoLadder(sel.GetTracks())
+	require.Len(t, ladder, 3)
+	require.Equal(t, []int{2, 1, 0}, []int{ladder[0].ID, ladder[1].ID, ladder[2].ID})
+
+	// step moves exactly one rung and refuses to fall off either end.
+	id, ok := step(ladder, 2, +1)
+	require.True(t, ok)
+	require.Equal(t, 1, id)
+
+	id, ok = step(ladder, 0, -1)
+	require.True(t, ok)
+	require.Equal(t, 1, id)
+
+	_, ok = step(ladder, 0, +1)
+	require.False(t, ok)
+	_, ok = step(ladder, 2, -1)
+	require.False(t, ok)
+	_, ok = step(ladder, 99, -1)
+	require.False(t, ok, "an unknown active track has no ladder position")
+}
+
+func TestControllerNoSwitchWithoutVideoLadder(t *testing.T) {
+	desc := &description.Session{
+		Medias: []*description.Media{
+			{Type: description.MediaTypeAudio, Formats: []format.Format{&format.Opus{PayloadTyp: 111}}},
+		},
+	}
+	sel := webrtcproto.NewTrackSelector(nil, func(_, _ int) {})
+	require.NoError(t, sel.LoadFromDescription(desc))
+	c := newABRController(sel)
+
+	_, ok := c.evaluate(10, 30)
+	require.False(t, ok)
 }

@@ -520,6 +520,11 @@ type session struct {
 	// Defaults to true: a reader that never sends SET_ABR_MODE (an older
 	// client) gets adaptive behaviour rather than being pinned forever.
 	abrAutoMode bool
+	// abrRTTMs is the most recent RTT the reader reported in LATENCY_REPORT,
+	// used by the loss/RTT-based ABR controller's upgrade stability guard
+	// (see runABRControl). Guarded by the same mutex as the other ABR
+	// fields; zero until the first report arrives.
+	abrRTTMs float64
 
 	// OBS abs-timestamp protocol (see docs/obs-abs-timestamp-protocol.md
 	// in the OBS repo): end-to-end publish latency computed from the most
@@ -1149,11 +1154,13 @@ func (s *session) onInboundDataChannel(dc *pwebrtc.DataChannel) {
 
 // runABRControl drives server-side layer *decisions* for one WHEP reader.
 //
-// The decision input is the send-side bandwidth estimate GCC derives from
-// the reader's TWCC feedback (see PeerConnection.EstimateBandwidth). Every
-// estimate is reported to the reader so it can display it; whether a
-// resulting recommendation is acted upon depends on the reader's ABR mode,
-// which the reader owns via SET_ABR_MODE.
+// The decision input is the packet loss the reader reports back for the
+// video it received (RTCP receiver reports, aggregated per interval by
+// PeerConnection.OutboundVideoStats) plus RTT stability - see
+// abr_controller.go for why GCC's send-side estimate is no longer used. The
+// GCC estimate is still reported to the reader (BANDWIDTH_ESTIMATE) for
+// display only. Whether a recommendation is acted upon depends on the
+// reader's ABR mode, which the reader owns via SET_ABR_MODE.
 //
 // Execution is deliberately NOT done here: this goroutine only ever sends
 // ABR_RECOMMEND and leaves calling TrackSelector.Select to the client's own
@@ -1184,19 +1191,36 @@ func (s *session) runABRControl(pc *webrtc.PeerConnection, selector *webrtc.Trac
 	controller := newABRController(selector)
 	startedAt := time.Now()
 
+	// Cumulative outbound video counters from the previous tick; their
+	// difference is this window's loss.
+	var lastSent, lastLost uint64
+	haveLast := false
+
 	for {
 		select {
 		case <-ticker.C:
-			estimate, ok := pc.EstimateBandwidth()
-			if !ok {
-				continue
+			// The GCC estimate is no longer a decision input (see
+			// abr_controller.go), but it is still reported so a player can
+			// display it - in manual mode that is the only thing that tells
+			// the user what the link would support.
+			if estimate, ok := pc.EstimateBandwidth(); ok {
+				s.writeABRMessage(bandwidthEstimateMessage(estimate)) //nolint:errcheck
 			}
 
-			// Report regardless of mode: in manual mode this is what lets
-			// a player show the user what the link would support.
-			s.writeABRMessage(bandwidthEstimateMessage(estimate)) //nolint:errcheck
+			sent, lost := pc.OutboundVideoStats()
+			lossPct := 0.0
+			haveLoss := false
+			if haveLast && sent >= lastSent && lost >= lastLost {
+				dSent := sent - lastSent
+				dLost := lost - lastLost
+				if denom := dSent + dLost; denom > 0 {
+					lossPct = float64(dLost) / float64(denom) * 100
+					haveLoss = true
+				}
+			}
+			lastSent, lastLost, haveLast = sent, lost, true
 
-			if time.Since(startedAt) < abrWarmupPeriod {
+			if time.Since(startedAt) < abrWarmupPeriod || !haveLoss {
 				continue
 			}
 
@@ -1204,6 +1228,7 @@ func (s *session) runABRControl(pc *webrtc.PeerConnection, selector *webrtc.Trac
 			auto := s.abrAutoMode
 			lastSwitch := s.lastSwitchTime
 			cooldown := s.abrSwitchCooldown
+			rttMs := s.abrRTTMs
 			s.mutex.RUnlock()
 
 			if !auto {
@@ -1220,7 +1245,7 @@ func (s *session) runABRControl(pc *webrtc.PeerConnection, selector *webrtc.Trac
 				continue
 			}
 
-			target, switchNow := controller.evaluate(estimate)
+			target, switchNow := controller.evaluate(lossPct, rttMs)
 			if !switchNow {
 				continue
 			}
@@ -1235,8 +1260,8 @@ func (s *session) runABRControl(pc *webrtc.PeerConnection, selector *webrtc.Trac
 			// needed here.
 			s.writeABRMessage(abrRecommendMessage(target)) //nolint:errcheck
 
-			s.Log(logger.Info, "ABR: recommending track %d (estimate=%dkbps)",
-				target, estimate/1000)
+			s.Log(logger.Info, "ABR: recommending track %d (loss=%.2f%% rtt=%.0fms)",
+				target, lossPct, rttMs)
 
 		case <-s.ctx.Done():
 			return

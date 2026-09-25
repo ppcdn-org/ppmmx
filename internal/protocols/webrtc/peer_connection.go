@@ -1271,6 +1271,29 @@ func (co *PeerConnection) OutboundTrackStats() map[string]*rtpsender.Stats {
 	return out
 }
 
+// OutboundVideoStats returns the aggregate outbound video packet counts from
+// the remote receiver's own RTCP receiver reports: Sent is the cumulative
+// number of video RTP packets this peer has sent, ReportedLost the number the
+// receiver reported missing. Both are cumulative - callers that want a rate
+// difference successive readings (see servers/webrtc/abr_controller.go).
+//
+// Loss-based ABR uses this instead of GCC's send-side estimate: it measures
+// the actual edge-to-viewer hop directly, and is unaffected by the burstiness
+// that unpaced forwarding (see the NoOpPacer comment in registerInterceptors)
+// introduces into GCC's delay signal.
+func (co *PeerConnection) OutboundVideoStats() (sent, lost uint64) {
+	for _, tr := range co.OutboundTracks {
+		if tr == nil || tr.rtcpSender == nil || !tr.isVideo() {
+			continue
+		}
+		if st := tr.rtcpSender.Stats(); st != nil {
+			sent += st.Sent
+			lost += st.ReportedLost
+		}
+	}
+	return sent, lost
+}
+
 // InboundTrackStats returns per-track receive statistics, keyed by a label
 // identifying the track (RID for Simulcast layers, else the track ID). The
 // aggregate Stats() sums every layer together, which hides a single bad

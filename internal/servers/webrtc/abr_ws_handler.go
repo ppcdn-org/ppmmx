@@ -88,10 +88,11 @@ type layerSwitchedData struct {
 
 // LATENCY_REPORT 请求
 //
-// FPS is carried for statistics only. It used to drive the client's own
-// up/downgrade decisions; layer selection is now made server-side from the
-// bandwidth estimate (see abr_controller.go), which is a property of the
-// link rather than of the viewer's decoder.
+// RTT feeds the server-side ABR controller's upgrade stability guard; the
+// rest is statistics only. FPS used to drive the client's own up/downgrade
+// decisions; layer selection is now made server-side from the reported loss
+// and RTT (see abr_controller.go), which are properties of the link rather
+// than of the viewer's decoder.
 type latencyReportData struct {
 	RTTMs          float64 `json:"rtt_ms"`
 	JitterBufferMs float64 `json:"jitter_buffer_ms"`
@@ -297,7 +298,11 @@ func (s *httpServer) handleABRWebSocket(ctx *gin.Context) {
 			if err := json.Unmarshal(msg.Data, &data); err != nil {
 				continue
 			}
-			// Log latency metrics (can be used for server-side ABR decisions)
+			// The RTT feeds the ABR controller's upgrade stability guard
+			// (see runABRControl / abr_controller.go).
+			sx.mutex.Lock()
+			sx.abrRTTMs = data.RTTMs
+			sx.mutex.Unlock()
 			sx.Log(logger.Debug, "ABR LATENCY: rtt=%.1fms jb=%.1fms loss=%d fps=%.1f e2e=%.1fms",
 				data.RTTMs, data.JitterBufferMs, data.PacketsLost, data.FPS, data.EstimatedE2EMs)
 
