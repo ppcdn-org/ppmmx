@@ -871,15 +871,14 @@ func (p *Core) createResources(initial bool) error {
 			ABRSwitchCooldown:        p.conf.WebRTCABRSwitchCooldown,
 			RecMgr:                   p.recMgr,
 			SplitHandler:             p.splitHandler,
-			DegradeManager:           p.degradeManager,
-			DegradeEnable:            p.conf.WebRTCDegradeEnable,
-			DegradeWSPathSuffix:      p.conf.WebRTCDegradeWSPathSuffix,
-			DegradeInstantLossPct:    p.conf.WebRTCDegradeInstantLossPct,
-			DegradeAvgLossPct:        p.conf.WebRTCDegradeAvgLossPct,
-			RecoverInstantLossPct:    p.conf.WebRTCRecoverInstantLossPct,
-			RecoverAvgLossPct:        p.conf.WebRTCRecoverAvgLossPct,
-			DegradeObservationSec:    p.conf.WebRTCDegradeObservationSec,
-			DegradeWSSecret:          p.conf.WebRTCDegradeWSSecret,
+			DegradeManager:        p.degradeManager,
+			DegradeEnable:         p.conf.DegradeEnable || p.conf.WebRTCDegradeEnable,
+			DegradeWSPathSuffix:   p.conf.WebRTCDegradeWSPathSuffix,
+			DegradeRaisePct:       degradeRaisePct(p.conf),
+			DegradeLowerPct:       degradeLowerPct(p.conf),
+			DegradeObservationSec: degradeObservationSec(p.conf),
+			DegradeSampleSec:      p.conf.DegradeSampleSec,
+			DegradeWSSecret:       p.conf.WebRTCDegradeWSSecret,
 			RTPLossAlarmEnable:       p.conf.RTPLossAlarmEnable,
 			RTPLossAlarmThresholdPct: p.conf.RTPLossAlarmThresholdPct,
 			// Loss-recycle self-heal. Like SRT's LossDisconnect it needs no
@@ -1129,13 +1128,15 @@ func (p *Core) createResources(initial bool) error {
 			// construction above) - DegradeEnable is forced false in that
 			// case too, since there would be nowhere for the executor to
 			// connect (see conf.Validate's srtDegradeEnable check).
-			DegradeManager:        p.degradeManager,
-			DegradeEnable:         p.conf.SRTDegradeEnable && p.degradeManager != nil,
-			DegradeInstantLossPct: p.conf.SRTDegradeInstantLossPct,
-			DegradeAvgLossPct:     p.conf.SRTDegradeAvgLossPct,
-			RecoverInstantLossPct: p.conf.SRTRecoverInstantLossPct,
-			RecoverAvgLossPct:     p.conf.SRTRecoverAvgLossPct,
-			DegradeObservationSec: p.conf.SRTDegradeObservationSec,
+			DegradeManager:          p.degradeManager,
+			DegradeEnable:           (p.conf.DegradeEnable || p.conf.SRTDegradeEnable) && p.degradeManager != nil,
+			DegradeRaisePct:         degradeRaisePct(p.conf),
+			DegradeLowerPct:         degradeLowerPct(p.conf),
+			DegradeObservationSec:   degradeObservationSec(p.conf),
+			DegradeRaiseLatencyStep: time.Duration(p.conf.DegradeRaiseLatencyStep),
+			DegradeLowerLatencyStep: time.Duration(p.conf.DegradeLowerLatencyStep),
+			DegradeLatencyMin:       time.Duration(p.conf.DegradeLatencyMin),
+			DegradeLatencyMax:       time.Duration(p.conf.DegradeLatencyMax),
 			Parent:                p,
 		}
 		// Same endpoint/credential reuse as trafficUsage/splitRecFileReporter
@@ -1575,6 +1576,12 @@ func (p *Core) closeResources(newConf *conf.Conf, calledByAPI bool) {
 		newConf.WebRTCRecoverAvgLossPct != p.conf.WebRTCRecoverAvgLossPct ||
 		newConf.WebRTCDegradeObservationSec != p.conf.WebRTCDegradeObservationSec ||
 		newConf.WebRTCDegradeWSSecret != p.conf.WebRTCDegradeWSSecret ||
+		newConf.DegradeEnable != p.conf.DegradeEnable ||
+		newConf.DegradeRaisePct != p.conf.DegradeRaisePct ||
+		newConf.DegradeLowerPct != p.conf.DegradeLowerPct ||
+		newConf.DegradeSampleSec != p.conf.DegradeSampleSec ||
+		newConf.DegradeObservationSec != p.conf.DegradeObservationSec ||
+		newConf.DegradeNackTimeoutMs != p.conf.DegradeNackTimeoutMs ||
 		newConf.WebRTCWHIPAuthKey != p.conf.WebRTCWHIPAuthKey ||
 		newConf.WebRTCForwardSecret != p.conf.WebRTCForwardSecret ||
 		newConf.RTPLossAlarmEnable != p.conf.RTPLossAlarmEnable ||
@@ -1611,6 +1618,14 @@ func (p *Core) closeResources(newConf *conf.Conf, calledByAPI bool) {
 		newConf.SRTRecoverInstantLossPct != p.conf.SRTRecoverInstantLossPct ||
 		newConf.SRTRecoverAvgLossPct != p.conf.SRTRecoverAvgLossPct ||
 		newConf.SRTDegradeObservationSec != p.conf.SRTDegradeObservationSec ||
+		newConf.DegradeEnable != p.conf.DegradeEnable ||
+		newConf.DegradeRaisePct != p.conf.DegradeRaisePct ||
+		newConf.DegradeLowerPct != p.conf.DegradeLowerPct ||
+		newConf.DegradeObservationSec != p.conf.DegradeObservationSec ||
+		newConf.DegradeRaiseLatencyStep != p.conf.DegradeRaiseLatencyStep ||
+		newConf.DegradeLowerLatencyStep != p.conf.DegradeLowerLatencyStep ||
+		newConf.DegradeLatencyMin != p.conf.DegradeLatencyMin ||
+		newConf.DegradeLatencyMax != p.conf.DegradeLatencyMax ||
 		closeMetrics ||
 		closeDegradeManager ||
 		closePathManager ||
@@ -1897,4 +1912,20 @@ func portFromAddress(addr string) (string, error) {
 		return "", fmt.Errorf("invalid listen address %q: %w", addr, err)
 	}
 	return port, nil
+}
+
+// degradeRaisePct returns the effective degrade raise threshold, preferring
+// the unified field over the deprecated per-protocol fields.
+func degradeRaisePct(c *conf.Conf) float64 {
+	return c.DegradeRaisePct
+}
+
+// degradeLowerPct returns the effective degrade lower threshold.
+func degradeLowerPct(c *conf.Conf) float64 {
+	return c.DegradeLowerPct
+}
+
+// degradeObservationSec returns the effective degrade observation seconds.
+func degradeObservationSec(c *conf.Conf) int {
+	return c.DegradeObservationSec
 }

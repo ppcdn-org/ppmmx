@@ -196,19 +196,17 @@ type Server struct {
 	// by the caller (there would be nowhere for the executor to connect).
 	DegradeManager *degrade.Manager
 	DegradeEnable  bool
-	// DegradeInstantLossPct/DegradeAvgLossPct (and the Recover* pair below)
-	// are applied to the connection's UNRECOVERABLE loss rate, not raw SRT
-	// loss - see runDegradeSampling/unrecoverableAccumulator in conn.go for
-	// why.
-	DegradeInstantLossPct float64
-	DegradeAvgLossPct     float64
-	// RecoverInstantLossPct/RecoverAvgLossPct are the hysteresis "recover"
-	// thresholds paired with DegradeInstantLossPct/DegradeAvgLossPct above -
-	// see the Thresholds doc comment in internal/degrade for why they're
-	// separate.
-	RecoverInstantLossPct float64
-	RecoverAvgLossPct     float64
-	DegradeObservationSec int
+	// DegradeRaisePct/DegradeLowerPct are the unified ULR thresholds (see
+	// docs/design/publish-degrade-protocol.zh-CN.md). Applied to the
+	// connection's UNRECOVERABLE loss rate via runDegradeSampling.
+	DegradeRaisePct        float64
+	DegradeLowerPct        float64
+	DegradeObservationSec  int
+	DegradeSampleSec       int
+	DegradeRaiseLatencyStep time.Duration
+	DegradeLowerLatencyStep time.Duration
+	DegradeLatencyMin      time.Duration
+	DegradeLatencyMax      time.Duration
 	Parent                serverParent
 
 	ctx            context.Context
@@ -232,10 +230,41 @@ type Server struct {
 func (s *Server) Initialize() error {
 	bufSize := uint64(s.ReceiverBufferSize)
 	fc := s.FlowControlWindow
-	if s.LatencyAutoTune {
-		// Sized for LatencyMax (the worst case any path can ever be tuned
-		// to), not for Latency - see srtWorstCaseBuffer's doc comment.
-		bufSize, fc = srtWorstCaseBuffer(time.Duration(s.LatencyMax), bufSize, fc)
+	// Latency is tuned either by the legacy per-minute auto-tuner
+	// (LatencyAutoTune) or by the unified degrade protocol (DegradeEnable),
+	// so the worst-case buffer must be allocated whenever either is on.
+	latencyTuning := s.LatencyAutoTune || s.DegradeEnable
+	// Effective latency-tuning parameters: the unified degrade protocol
+	// owns them when enabled (its own step/bounds and a single raise
+	// threshold shared with the degrade trigger), otherwise the legacy
+	// auto-tuner's config applies. Only the startup log and the
+	// (degrade-gated) legacy Record path read these.
+	effLatencyMin := time.Duration(s.LatencyMin)
+	effLatencyMax := time.Duration(s.LatencyMax)
+	effLatencyStep := time.Duration(s.LatencyStep)
+	effLatencyRaiseStep := time.Duration(s.LatencyRaiseStep)
+	effRaisePct := s.LatencyRaisePct
+	effLowerPct := s.LatencyLowerPct
+	tuningSource := "legacy auto-tune"
+	if s.DegradeEnable {
+		tuningSource = "unified degrade"
+		effLatencyMin = time.Duration(s.DegradeLatencyMin)
+		effLatencyMax = time.Duration(s.DegradeLatencyMax)
+		effLatencyStep = time.Duration(s.DegradeLowerLatencyStep)
+		effLatencyRaiseStep = time.Duration(s.DegradeRaiseLatencyStep)
+		effRaisePct = s.DegradeRaisePct
+		effLowerPct = s.DegradeLowerPct
+	}
+	if latencyTuning {
+		// Sized for the largest latency ceiling any path can reach (the
+		// legacy auto-tuner's LatencyMax and/or the unified
+		// DegradeLatencyMax), not for the current value - see
+		// srtWorstCaseBuffer's doc comment.
+		latencyMax := effLatencyMax
+		if d := time.Duration(s.LatencyMax); d > latencyMax {
+			latencyMax = d
+		}
+		bufSize, fc = srtWorstCaseBuffer(latencyMax, bufSize, fc)
 	}
 
 	conf := srt.DefaultConfig()
@@ -298,22 +327,21 @@ func (s *Server) Initialize() error {
 	s.Log(logger.Info, "SRT receive window: latency %v, buffer %s, flow control window %d packets",
 		time.Duration(s.Latency), bytefmt.ByteSize(bufSize), fc)
 
-	if s.LatencyAutoTune {
+	if latencyTuning {
 		s.latencyManager = newLatencyManager(srtLatencyConfig{
 			Initial:   time.Duration(s.Latency),
-			Min:       time.Duration(s.LatencyMin),
-			Max:       time.Duration(s.LatencyMax),
-			Step:      time.Duration(s.LatencyStep),
-			RaiseStep: time.Duration(s.LatencyRaiseStep),
-			RaisePct:  s.LatencyRaisePct,
-			LowerPct:  s.LatencyLowerPct,
+			Min:       effLatencyMin,
+			Max:       effLatencyMax,
+			Step:      effLatencyStep,
+			RaiseStep: effLatencyRaiseStep,
+			RaisePct:  effRaisePct,
+			LowerPct:  effLowerPct,
 		}, s.Log)
 
-		s.Log(logger.Info, "SRT adaptive latency: enabled, range [%v, %v], raise step %v, "+
+		s.Log(logger.Info, "SRT latency tuning: enabled (%s), range [%v, %v], raise step %v, "+
 			"lower step %v, raise/lower thresholds %.2f%%/%.2f%%",
-			time.Duration(s.LatencyMin), time.Duration(s.LatencyMax),
-			time.Duration(s.LatencyRaiseStep), time.Duration(s.LatencyStep),
-			s.LatencyRaisePct, s.LatencyLowerPct)
+			tuningSource, effLatencyMin, effLatencyMax,
+			effLatencyRaiseStep, effLatencyStep, effRaisePct, effLowerPct)
 	}
 
 	// Forwards gosrt's NAK trace into our own logger. Exits via s.ctx rather
@@ -426,13 +454,16 @@ outer:
 				lossRecycleThresholdPct: s.LossRecycleThresholdPct,
 				lossRecycleSec:          s.LossRecycleSec,
 
-				degradeManager:        s.DegradeManager,
-				degradeEnable:         s.DegradeEnable,
-				degradeInstantLossPct: s.DegradeInstantLossPct,
-				degradeAvgLossPct:     s.DegradeAvgLossPct,
-				recoverInstantLossPct: s.RecoverInstantLossPct,
-				recoverAvgLossPct:     s.RecoverAvgLossPct,
-				degradeObservationSec: s.DegradeObservationSec,
+				degradeManager:          s.DegradeManager,
+				degradeEnable:           s.DegradeEnable,
+				degradeRaisePct:         s.DegradeRaisePct,
+				degradeLowerPct:         s.DegradeLowerPct,
+				degradeObservationSec:   s.DegradeObservationSec,
+				degradeSampleSec:        s.DegradeSampleSec,
+				degradeRaiseLatencyStep: s.DegradeRaiseLatencyStep,
+				degradeLowerLatencyStep: s.DegradeLowerLatencyStep,
+				degradeLatencyMin:       s.DegradeLatencyMin,
+				degradeLatencyMax:       s.DegradeLatencyMax,
 			}
 			c.initialize()
 			s.conns[c] = struct{}{}

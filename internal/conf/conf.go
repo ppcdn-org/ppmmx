@@ -445,13 +445,13 @@ type Conf struct {
 	// neither, so a loss rate hovering near a single boundary can't flap
 	// the ladder back and forth every ObservationSec. Setting Recover* ==
 	// Degrade* (the default) collapses the dead zone to zero width.
-	WebRTCDegradeEnable         bool    `json:"webrtcDegradeEnable"`
+	WebRTCDegradeEnable         bool    `json:"webrtcDegradeEnable" deprecated:"true"`
 	WebRTCDegradeWSPathSuffix   string  `json:"webrtcDegradeWSPathSuffix"`
-	WebRTCDegradeInstantLossPct float64 `json:"webrtcDegradeInstantLossPct"`
-	WebRTCDegradeAvgLossPct     float64 `json:"webrtcDegradeAvgLossPct"`
-	WebRTCRecoverInstantLossPct float64 `json:"webrtcRecoverInstantLossPct"`
-	WebRTCRecoverAvgLossPct     float64 `json:"webrtcRecoverAvgLossPct"`
-	WebRTCDegradeObservationSec int     `json:"webrtcDegradeObservationSec"`
+	WebRTCDegradeInstantLossPct float64 `json:"webrtcDegradeInstantLossPct" deprecated:"true"`
+	WebRTCDegradeAvgLossPct     float64 `json:"webrtcDegradeAvgLossPct" deprecated:"true"`
+	WebRTCRecoverInstantLossPct float64 `json:"webrtcRecoverInstantLossPct" deprecated:"true"`
+	WebRTCRecoverAvgLossPct     float64 `json:"webrtcRecoverAvgLossPct" deprecated:"true"`
+	WebRTCDegradeObservationSec int     `json:"webrtcDegradeObservationSec" deprecated:"true"`
 	WebRTCDegradeWSSecret       string  `json:"-"`
 
 	// WHIP publish auth (see docs/obs-whip-publish-auth-protocol.md): AES key
@@ -467,6 +467,23 @@ type Conf struct {
 	// WebRTCWHIPAuthKey (external ppobs publishers) and
 	// WebRTCDegradeWSSecret (degrade WS channel).
 	WebRTCForwardSecret string `json:"-"`
+
+	// Unified degrade protocol (see docs/design/publish-degrade-protocol.zh-CN.md):
+	// replaces the per-protocol WebRTCDegrade*/SRTDegrade* and SRT adaptive
+	// latency thresholds. DegradeRaisePct/DegradeLowerPct form a hysteresis
+	// band; a sample above RaisePct triggers immediate degrade (with cooldown),
+	// a sample at/below LowerPct counts toward sustained recovery.
+	// DegradeEnable gates the whole mechanism.
+	DegradeEnable          bool     `json:"degradeEnable"`
+	DegradeRaisePct        float64  `json:"degradeRaisePct"`
+	DegradeLowerPct        float64  `json:"degradeLowerPct"`
+	DegradeSampleSec       int      `json:"degradeSampleSec"`
+	DegradeObservationSec  int      `json:"degradeObservationSec"`
+	DegradeRaiseLatencyStep Duration `json:"degradeRaiseLatencyStep"`
+	DegradeLowerLatencyStep Duration `json:"degradeLowerLatencyStep"`
+	DegradeLatencyMin      Duration `json:"degradeLatencyMin"`
+	DegradeLatencyMax      Duration `json:"degradeLatencyMax"`
+	DegradeNackTimeoutMs   Duration `json:"degradeNackTimeoutMs"`
 
 	// RTPLossAlarmEnable reports a WHIP publish session's RTP packet-loss
 	// rate (the same figure logged every recvstats.Interval as
@@ -652,17 +669,17 @@ type Conf struct {
 	// (possibly lower) tuned value would mean a later raise could outgrow
 	// a buffer already allocated - the same problem this whole mechanism
 	// exists to avoid for latency itself.
-	SRTLatencyAutoTune bool     `json:"srtLatencyAutoTune"`
-	SRTLatencyMin      Duration `json:"srtLatencyMin"`
-	SRTLatencyMax      Duration `json:"srtLatencyMax"`
+	SRTLatencyAutoTune bool     `json:"srtLatencyAutoTune" deprecated:"true"`
+	SRTLatencyMin      Duration `json:"srtLatencyMin" deprecated:"true"`
+	SRTLatencyMax      Duration `json:"srtLatencyMax" deprecated:"true"`
 	// SRTLatencyRaiseStep is how much one above-threshold event adds;
 	// SRTLatencyStep is how much one below-threshold event subtracts. They
 	// are deliberately separate so ramping up against loss can be faster
 	// than walking back down once the link is clean.
-	SRTLatencyRaiseStep Duration `json:"srtLatencyRaiseStep"`
-	SRTLatencyStep      Duration `json:"srtLatencyStep"`
-	SRTLatencyRaisePct  float64  `json:"srtLatencyRaisePct"`
-	SRTLatencyLowerPct  float64  `json:"srtLatencyLowerPct"`
+	SRTLatencyRaiseStep Duration `json:"srtLatencyRaiseStep" deprecated:"true"`
+	SRTLatencyStep      Duration `json:"srtLatencyStep" deprecated:"true"`
+	SRTLatencyRaisePct  float64  `json:"srtLatencyRaisePct" deprecated:"true"`
+	SRTLatencyLowerPct  float64  `json:"srtLatencyLowerPct" deprecated:"true"`
 
 	// SRTLossAlarmEnable reports a publish connection's SRT UNRECOVERABLE
 	// loss rate to ppcenter (POST /internal/mmx/v1/alarms/srt-loss) whenever
@@ -724,12 +741,12 @@ type Conf struct {
 	// loss stays ~0.1%, so triggering on raw loss bottoms the ladder out on
 	// a condition SRT is designed to absorb. These are 0-100 percentages
 	// applied to that unrecoverable rate.
-	SRTDegradeEnable         bool    `json:"srtDegradeEnable"`
-	SRTDegradeInstantLossPct float64 `json:"srtDegradeInstantLossPct"`
-	SRTDegradeAvgLossPct     float64 `json:"srtDegradeAvgLossPct"`
-	SRTRecoverInstantLossPct float64 `json:"srtRecoverInstantLossPct"`
-	SRTRecoverAvgLossPct     float64 `json:"srtRecoverAvgLossPct"`
-	SRTDegradeObservationSec int     `json:"srtDegradeObservationSec"`
+	SRTDegradeEnable         bool    `json:"srtDegradeEnable" deprecated:"true"`
+	SRTDegradeInstantLossPct float64 `json:"srtDegradeInstantLossPct" deprecated:"true"`
+	SRTDegradeAvgLossPct     float64 `json:"srtDegradeAvgLossPct" deprecated:"true"`
+	SRTRecoverInstantLossPct float64 `json:"srtRecoverInstantLossPct" deprecated:"true"`
+	SRTRecoverAvgLossPct     float64 `json:"srtRecoverAvgLossPct" deprecated:"true"`
+	SRTDegradeObservationSec int     `json:"srtDegradeObservationSec" deprecated:"true"`
 
 	// MoQ server
 	MoQ               bool       `json:"moq"`
@@ -886,6 +903,17 @@ func (conf *Conf) setDefaults() {
 	conf.WebRTCRecoverInstantLossPct = 5.0
 	conf.WebRTCRecoverAvgLossPct = 1.0
 	conf.WebRTCDegradeObservationSec = 60
+	// Unified degrade defaults (see docs/design/publish-degrade-protocol.zh-CN.md)
+	conf.DegradeEnable = false
+	conf.DegradeRaisePct = 0.8
+	conf.DegradeLowerPct = 0.3
+	conf.DegradeSampleSec = 6
+	conf.DegradeObservationSec = 60
+	conf.DegradeRaiseLatencyStep = 200 * Duration(time.Millisecond)
+	conf.DegradeLowerLatencyStep = 100 * Duration(time.Millisecond)
+	conf.DegradeLatencyMin = 300 * Duration(time.Millisecond)
+	conf.DegradeLatencyMax = 3000 * Duration(time.Millisecond)
+	conf.DegradeNackTimeoutMs = 300 * Duration(time.Millisecond)
 	// Opt-in, matching SRTLossAlarmEnable - 2.0% chosen as a first-cut
 	// default, distinct from SRT's own 10.0% (RTP and SRT loss have
 	// different underlying transports/error-recovery, no reason to assume
@@ -1605,6 +1633,62 @@ func (conf *Conf) Validate(l logger.Writer) error {
 	}
 	if conf.SRTDegradeEnable && conf.SRTRecoverAvgLossPct > conf.SRTDegradeAvgLossPct {
 		return fmt.Errorf("'srtRecoverAvgLossPct' must be <= 'srtDegradeAvgLossPct'")
+	}
+
+	// Unified degrade protocol (see docs/design/publish-degrade-protocol.zh-CN.md):
+	// migrate from deprecated old fields.
+	if conf.DegradeEnable {
+		if conf.WebRTCDegradeWSSecret == "" {
+			return fmt.Errorf("WHIP_WS_SECRET must be set when degradeEnable is true")
+		}
+		if !conf.WebRTC {
+			return fmt.Errorf("'webrtc' must be enabled when degradeEnable is true " +
+				"(the degrade WS channel is served by the WebRTC server)")
+		}
+		if conf.DegradeRaisePct <= conf.DegradeLowerPct {
+			return fmt.Errorf("'degradeRaisePct' must be > 'degradeLowerPct', " +
+				"otherwise there is no hysteresis band and the FSM oscillates")
+		}
+		if conf.DegradeSampleSec <= 0 {
+			return fmt.Errorf("'degradeSampleSec' must be greater than zero")
+		}
+		if conf.DegradeObservationSec <= 0 {
+			return fmt.Errorf("'degradeObservationSec' must be greater than zero")
+		}
+		if conf.DegradeRaiseLatencyStep <= 0 {
+			return fmt.Errorf("'degradeRaiseLatencyStep' must be greater than zero")
+		}
+		if conf.DegradeLowerLatencyStep <= 0 {
+			return fmt.Errorf("'degradeLowerLatencyStep' must be greater than zero")
+		}
+		if conf.DegradeLatencyMin <= 0 {
+			return fmt.Errorf("'degradeLatencyMin' must be greater than zero")
+		}
+		if conf.DegradeLatencyMax < conf.DegradeLatencyMin {
+			return fmt.Errorf("'degradeLatencyMax' must be >= 'degradeLatencyMin'")
+		}
+		if conf.DegradeNackTimeoutMs <= 0 {
+			return fmt.Errorf("'degradeNackTimeoutMs' must be greater than zero")
+		}
+	}
+	// Log deprecation warnings for old degrade fields.
+	if conf.WebRTCDegradeInstantLossPct != 5.0 || conf.WebRTCDegradeAvgLossPct != 1.0 ||
+		conf.WebRTCRecoverInstantLossPct != 5.0 || conf.WebRTCRecoverAvgLossPct != 1.0 ||
+		conf.WebRTCDegradeObservationSec != 60 {
+		l.Log(logger.Warn, "webrtcDegrade* fields are deprecated; use degradeRaisePct/degradeLowerPct")
+	}
+	if conf.SRTDegradeInstantLossPct != 5.0 || conf.SRTDegradeAvgLossPct != 1.0 ||
+		conf.SRTRecoverInstantLossPct != 5.0 || conf.SRTRecoverAvgLossPct != 1.0 ||
+		conf.SRTDegradeObservationSec != 60 {
+		l.Log(logger.Warn, "srtDegrade* fields are deprecated; use degradeRaisePct/degradeLowerPct")
+	}
+	if conf.SRTLatencyRaisePct != 1.0 || conf.SRTLatencyLowerPct != 0.1 ||
+		conf.SRTLatencyStep != Duration(100*time.Millisecond) ||
+		conf.SRTLatencyRaiseStep != Duration(200*time.Millisecond) ||
+		conf.SRTLatencyMin != Duration(300*time.Millisecond) ||
+		conf.SRTLatencyMax != Duration(3000*time.Millisecond) {
+		l.Log(logger.Warn, "srtLatencyRaisePct/LowerPct/Step/RaiseStep/Min/Max are deprecated; "+
+			"use degradeRaisePct/degradeLowerPct/degradeRaiseLatencyStep/degradeLowerLatencyStep")
 	}
 
 	if conf.MMXControl {

@@ -70,13 +70,16 @@ type conn struct {
 	lossRecycleThresholdPct float64
 	lossRecycleSec          int
 
-	degradeManager        *degrade.Manager
-	degradeEnable         bool
-	degradeInstantLossPct float64
-	degradeAvgLossPct     float64
-	recoverInstantLossPct float64
-	recoverAvgLossPct     float64
-	degradeObservationSec int
+	degradeManager         *degrade.Manager
+	degradeEnable          bool
+	degradeRaisePct        float64
+	degradeLowerPct        float64
+	degradeObservationSec  int
+	degradeSampleSec       int
+	degradeRaiseLatencyStep time.Duration
+	degradeLowerLatencyStep time.Duration
+	degradeLatencyMin      time.Duration
+	degradeLatencyMax      time.Duration
 
 	// latencyManager feeds this connection's unrecovered drop rate into
 	// the per-path adaptive latency tuner (see latency.go and
@@ -460,7 +463,12 @@ func (c *conn) runReceiveStatsSummary(sconn srt.Conn, pathName string, done <-ch
 					// intervals are never recorded: an idle path would
 					// otherwise look like a low-drop event and trigger a
 					// spurious latency reduction.
-					if c.latencyManager != nil && snap.PacketsExpected > 0 {
+					//
+					// Skipped when the unified degrade protocol is enabled:
+					// that path tunes latency on its own degrade/recover
+					// events (runDegradeSampling -> AdjustLatency), so
+					// letting this 60s path also tune would double-adjust.
+					if c.latencyManager != nil && snap.PacketsExpected > 0 && !c.degradeEnable {
 						latencyRaised = c.latencyManager.Record(pathName, unrecoveredPct)
 					}
 				}
@@ -632,19 +640,18 @@ func (a *unrecoverableAccumulator) add(curLoss, curRetrans, curRecv uint64) bool
 
 // runDegradeSampling periodically feeds this SRT publish connection's
 // UNRECOVERABLE packet-loss rate into the path's degrade FSM (see
-// internal/degrade and docs/obs-mmx-degrade-protocol.md), at the same
-// 1-second cadence WHIP's own equivalent uses (degrade.SampleInterval) -
-// the FSM's trailing average window is calibrated assuming every caller
-// samples at that exact cadence. Unrecoverable (lost minus what ARQ
-// retransmitted), not raw loss: raw loss is mostly recovered on healthy
-// links and would over-degrade (see unrecoverableAccumulator). videoLayers
-// is this connection's multiplexed video track count (see
-// runPublishReader's mpegts.ValidateVideoTracks call), SRT's analog of
-// WHIP's inbound Simulcast track count.
+// internal/degrade and docs/design/publish-degrade-protocol.zh-CN.md), at
+// the degrade package's default cadence (6s). On a degrade action, it also
+// adjusts the per-path SRT receiver latency (raise: force reconnect; lower:
+// opportunistic). Unrecoverable (lost minus what ARQ retransmitted), not raw
+// loss: raw loss is mostly recovered on healthy links and would over-degrade
+// (see unrecoverableAccumulator). videoLayers is this connection's multiplexed
+// video track count (see runPublishReader's mpegts.ValidateVideoTracks call),
+// SRT's analog of WHIP's inbound Simulcast track count.
 func (c *conn) runDegradeSampling(sconn srt.Conn, pathName string, videoLayers int, done <-chan struct{}) {
 	c.degradeManager.ObserveSessionLayers(pathName, videoLayers)
 
-	ticker := time.NewTicker(degrade.SampleInterval)
+	ticker := time.NewTicker(degrade.SamplePeriod(c.degradeSampleSec))
 	defer ticker.Stop()
 
 	var st srt.Statistics
@@ -654,17 +661,26 @@ func (c *conn) runDegradeSampling(sconn srt.Conn, pathName string, videoLayers i
 		case <-ticker.C:
 			sconn.Stats(&st)
 			if acc.add(st.Accumulated.PktRecvLoss, st.Accumulated.PktRecvRetrans, st.Accumulated.PktRecv) {
-				// Hand the FSM lost=unrecoverable,
-				// received=expected-unrecoverable, so the rate it
-				// computes is unrecoverable/expected (see
-				// unrecoverableAccumulator).
-				c.degradeManager.RecordSample(pathName, acc.unrecoverable, acc.expected-acc.unrecoverable, degrade.Thresholds{
-					DegradeInstantLossPct: c.degradeInstantLossPct,
-					DegradeAvgLossPct:     c.degradeAvgLossPct,
-					RecoverInstantLossPct: c.recoverInstantLossPct,
-					RecoverAvgLossPct:     c.recoverAvgLossPct,
-					ObservationSec:        c.degradeObservationSec,
-				})
+				changed := c.degradeManager.RecordSample(pathName, acc.unrecoverable,
+					acc.expected, degrade.Thresholds{
+						RaisePct:       c.degradeRaisePct,
+						LowerPct:       c.degradeLowerPct,
+						ObservationSec: c.degradeObservationSec,
+					})
+				// On degrade/recover, also adjust SRT receiver latency.
+				if changed != degrade.ActionNone && c.latencyManager != nil {
+					raise := changed == degrade.ActionDegrade
+					step := c.degradeRaiseLatencyStep
+					if !raise {
+						step = c.degradeLowerLatencyStep
+					}
+					if raised := c.latencyManager.AdjustLatency(pathName, raise, step,
+						c.degradeLatencyMin, c.degradeLatencyMax); raised {
+						c.latencyManager.MarkRaiseClose(pathName, time.Now())
+						c.Log(logger.Info, "[degrade] path=%s raise-triggered latency raise; forcing reconnect", pathName)
+						c.Close()
+					}
+				}
 			}
 
 		case <-done:

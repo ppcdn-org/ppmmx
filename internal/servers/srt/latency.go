@@ -127,6 +127,37 @@ func (m *latencyManager) MarkRaiseClose(path string, at time.Time) {
 	m.getOrCreateLocked(path).raiseClosedAt = at
 }
 
+// AdjustLatency directly adjusts the path's latency by a fixed step, without
+// evaluating the drop rate against thresholds. Used by the unified degrade FSM
+// (see docs/design/publish-degrade-protocol.zh-CN.md) to raise/lower latency
+// when a degrade/recover action fires. Returns raised == true when the value
+// moved up (caller should force reconnect).
+func (m *latencyManager) AdjustLatency(path string, raise bool, step, min, max time.Duration) (raised bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	st := m.getOrCreateLocked(path)
+	next := st.current
+	if raise {
+		next += step
+		if next > max {
+			next = max
+		}
+	} else {
+		next -= step
+		if next < min {
+			next = min
+		}
+	}
+	if next == st.current {
+		return false
+	}
+	raised = next > st.current
+	m.logf(logger.Info, "path: %s, degrade %s -> %v (step=%v)",
+		path, st.current, next, step)
+	st.current = next
+	return raised
+}
+
 // TakeRaiseCloseGap returns the elapsed time since path's last raise-triggered
 // close and clears it, reporting ok == true only when a plausible pending
 // close exists (non-zero and within srtRaiseCloseStaleAfter). A path with no

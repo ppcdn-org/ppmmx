@@ -424,9 +424,10 @@ type sessionParent interface {
 	generateICEServers(clientConfig bool) ([]pwebrtc.ICEServer, error)
 	logger.Writer
 
-	// WHIP degrade protocol (see docs/obs-mmx-degrade-protocol.md)
+	// WHIP degrade protocol (see docs/design/publish-degrade-protocol.zh-CN.md)
 	degradeSampleEnabled() bool
-	recordDegradeSample(pathName string, cumLost, cumReceived uint64)
+	degradeSampleSec() int
+	recordDegradeSample(pathName string, cumLost, cumReceived uint64) degrade.Action
 	observeDegradeSessionLayers(pathName string, realLayers int)
 
 	// RTP loss alarm (see rtp_loss_alarm.go): reports a WHIP publish
@@ -1245,13 +1246,12 @@ func (s *session) runABRControl(pc *webrtc.PeerConnection, selector *webrtc.Trac
 
 // degradeStatsLogInterval is how often runDegradeSampling logs the
 // received bitrate / active simulcast layer count - independent of
-// degrade.SampleInterval (the FSM's 1s loss-sampling cadence, which stays
-// fine-grained since it drives the observation window).
+// degrade.SampleInterval (the FSM's 6s loss-sampling cadence).
 const degradeStatsLogInterval = 5 * time.Second
 
 // runDegradeSampling periodically feeds this publish session's cumulative
-// RTP loss/received counters into the path's degrade FSM (see
-// docs/obs-mmx-degrade-protocol.md), and separately logs a live
+// unrecoverable RTP loss/total counters into the path's degrade FSM (see
+// docs/design/publish-degrade-protocol.zh-CN.md), and separately logs a live
 // bitrate/layer-count summary every degradeStatsLogInterval - useful for
 // telling apart "OBS's own WebRTC congestion control already throttled
 // the send bitrate (or paused a layer) down on its own" from "the
@@ -1259,6 +1259,12 @@ const degradeStatsLogInterval = 5 * time.Second
 // loss". Only meaningful once pc.StartReading has been called
 // (PeerConnection.Stats only reports inbound-track stats after that
 // point).
+//
+// RTPPacketsLost from gortsplib's receiver is already the loss the
+// reorder/retransmit buffer could not absorb (a late NACK retransmit that
+// lands inside WebRTCInboundRTPBufferSize is recovered and not counted), so
+// it is the WHIP analogue of SRT's unrecoverable loss. Total = lost +
+// received, i.e. expected.
 func (s *session) runDegradeSampling(pc *webrtc.PeerConnection) {
 	videoLayers := 0
 	for _, tr := range pc.InboundTracks() {
@@ -1268,7 +1274,7 @@ func (s *session) runDegradeSampling(pc *webrtc.PeerConnection) {
 	}
 	s.parent.observeDegradeSessionLayers(s.pathName, videoLayers)
 
-	sampleTicker := time.NewTicker(degrade.SampleInterval)
+	sampleTicker := time.NewTicker(degrade.SamplePeriod(s.parent.degradeSampleSec()))
 	defer sampleTicker.Stop()
 	statsTicker := time.NewTicker(degradeStatsLogInterval)
 	defer statsTicker.Stop()
@@ -1281,7 +1287,14 @@ func (s *session) runDegradeSampling(pc *webrtc.PeerConnection) {
 		select {
 		case <-sampleTicker.C:
 			stats := pc.Stats()
-			s.parent.recordDegradeSample(s.pathName, stats.RTPPacketsLost, stats.RTPPacketsReceived)
+			// The returned Action drives WHIP-side latency in the design,
+			// but the inbound RTP reorder buffer (WebRTCInboundRTPBufferSize)
+			// is fixed when the receiver is created, so there is no runtime
+			// knob to turn yet. Log the transition for observability.
+			if action := s.parent.recordDegradeSample(s.pathName, stats.RTPPacketsLost,
+				stats.RTPPacketsLost+stats.RTPPacketsReceived); action != degrade.ActionNone {
+				s.Log(logger.Info, "[degrade] path=%s action=%d", s.pathName, action)
+			}
 
 		case <-statsTicker.C:
 			stats := pc.Stats()

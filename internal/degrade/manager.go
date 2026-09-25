@@ -40,9 +40,9 @@ func (m *Manager) GetOrCreate(path string) *State {
 
 // RecordSample feeds one loss sample into path's degrade State, using
 // thresholds supplied by the calling protocol (see Thresholds' doc
-// comment).
-func (m *Manager) RecordSample(path string, cumLost, cumReceived uint64, t Thresholds) {
-	m.GetOrCreate(path).Sample(cumLost, cumReceived, t)
+// comment). Returns the action that fired, if any.
+func (m *Manager) RecordSample(path string, cumUnrecov, cumTotal uint64, t Thresholds) Action {
+	return m.GetOrCreate(path).Sample(cumUnrecov, cumTotal, t)
 }
 
 // ObserveSessionLayers reports a fresh publish session/connection's real

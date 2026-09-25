@@ -231,24 +231,19 @@ type Server struct {
 	RecMgr       *recording.Manager
 	SplitHandler *recording.SplitRecHandler
 
-	// WHIP degrade protocol (see docs/obs-mmx-degrade-protocol.md and
-	// internal/degrade). DegradeManager is constructed and owned by
+	// WHIP degrade protocol (see docs/design/publish-degrade-protocol.zh-CN.md
+	// and internal/degrade). DegradeManager is constructed and owned by
 	// internal/core (shared with internal/servers/srt, which feeds the same
 	// per-path state via its own thresholds) - never nil when DegradeEnable
 	// can be true, see core.go's construction gating.
-	DegradeManager        *degrade.Manager
-	DegradeEnable         bool
-	DegradeWSPathSuffix   string
-	DegradeInstantLossPct float64
-	DegradeAvgLossPct     float64
-	// RecoverInstantLossPct/RecoverAvgLossPct are the hysteresis "recover"
-	// thresholds paired with DegradeInstantLossPct/DegradeAvgLossPct above -
-	// see the Thresholds doc comment in internal/degrade for why they're
-	// separate.
-	RecoverInstantLossPct float64
-	RecoverAvgLossPct     float64
+	DegradeManager      *degrade.Manager
+	DegradeEnable       bool
+	DegradeWSPathSuffix string
+	DegradeRaisePct     float64
+	DegradeLowerPct     float64
 	DegradeObservationSec int
-	DegradeWSSecret       string
+	DegradeSampleSec    int
+	DegradeWSSecret     string
 
 	// RTP loss alarm (see rtp_loss_alarm.go): reports a WHIP publish
 	// session's RTP loss rate to ppcenter as a superadmin node alarm,

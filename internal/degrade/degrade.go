@@ -1,26 +1,26 @@
 // Package degrade implements the OBS-degrade protocol's per-path state
 // machine, independent of which ingest protocol (WHIP, SRT, ...) feeds it.
 //
-// See docs/obs-mmx-degrade-protocol.md for the full protocol: on sustained
-// RTP/packet loss on a publish, mmx degrades simulcast layers (3->2->1)
-// then bitrate (100%->80%) in single steps, pushing the resulting target
-// state to a per-path WebSocket that an OBS-side executor connects to.
-// Recovery walks the same steps in reverse (bitrate first, then layers)
-// once loss is compliant again.
+// See docs/design/publish-degrade-protocol.zh-CN.md for the full protocol.
+// The ladder has two phases:
+//   1. Bitrate phase (no interruption): 100% -> 80% -> 60%
+//   2. Layer phase (~1s interruption): maxLayers -> maxLayers-1 -> ... -> 1
+// Degrade triggers on the first sample above RaisePct (no sustained wait),
+// then enters a cooldown. Recovery requires sustained compliance for
+// ObservationSec.
 //
 // State is kept per path, not per ingest session: the OBS-side executor
 // applies a degrade/recover step by restarting the publish, which creates
 // a brand new session (WHIP) or connection (SRT). If state lived on the
 // session/connection, every executor-triggered restart would silently
-// reset it back to layers=3/bitrate=100%, and the FSM would immediately
-// re-degrade, oscillating forever.
+// reset it back to layers=maxLayers/bitrate=100%, and the FSM would
+// immediately re-degrade, oscillating forever.
 //
-// Callers (one per ingest protocol) own their own sampling cadence/
-// threshold config and feed this package through a Manager; the WS
-// delivery channel itself is served by whichever protocol server has an
-// HTTP listener (today, only WebRTC's) - this package only tracks state
-// and pushes messages to an already-bound *wsproto.ServerConn, it never
-// serves the WebSocket itself.
+// Callers (one per ingest protocol) own their own sampling cadence and
+// feed this package through a Manager; the WS delivery channel itself is
+// served by whichever protocol server has an HTTP listener (today, only
+// WebRTC's) - this package only tracks state and pushes messages to an
+// already-bound *wsproto.ServerConn, it never serves the WebSocket itself.
 package degrade
 
 import (
@@ -32,11 +32,9 @@ import (
 )
 
 const (
-	// SampleInterval is the cadence every caller MUST sample at. AvgWindowSize
-	// below is a sample COUNT, not a duration - it only means "5 minutes" if
-	// every caller samples at exactly this interval.
-	SampleInterval = 1 * time.Second
-	AvgWindowSize  = 300 // 5 minutes at SampleInterval
+	// SampleInterval is the cadence every caller SHOULD sample at. The FSM
+	// treats a gap larger than StaleGap as a stale epoch (timers reset).
+	SampleInterval = 6 * time.Second
 
 	// StaleGap: a gap this large between samples means the path had no
 	// active publish session sampling it for a while (not just a
@@ -44,29 +42,24 @@ const (
 	StaleGap = 5 * SampleInterval
 )
 
-// Thresholds is one protocol's trigger/debounce configuration. WHIP and SRT
-// each pass their own value on every call rather than it being stored on
-// State/Manager, so the same shared per-path state can react differently
-// depending on which protocol most recently fed it a sample, with neither
-// side's config ever silently overwriting the other's.
-//
-// Degrade* and Recover* are deliberately separate (hysteresis/Schmitt
-// trigger): a sample above Degrade* counts toward degrading, a sample at or
-// below Recover* counts toward recovering, and anything strictly in between
-// (Recover* < loss <= Degrade*, whenever Recover* < Degrade*) is a dead zone
-// that does neither - it freezes whatever badSince/goodSince timer was
-// already running instead of resetting it. Without this gap, a loss rate
-// hovering right at a single shared threshold can flip badSince/goodSince
-// back and forth every sample and oscillate the ladder step forever once
-// ObservationSec elapses on either side. Setting Recover* == Degrade*
-// collapses the dead zone to zero width, reproducing the old single-
-// threshold behavior exactly.
+// SamplePeriod returns the configured sampling period, falling back to
+// SampleInterval when sec is non-positive.
+func SamplePeriod(sec int) time.Duration {
+	if sec <= 0 {
+		return SampleInterval
+	}
+	return time.Duration(sec) * time.Second
+}
+
+// Thresholds is the unified trigger/debounce configuration for a protocol.
+// RaisePct and LowerPct form a hysteresis band (LowerPct < RaisePct enforced
+// by the caller): a sample above RaisePct triggers immediate degrade (with
+// cooldown), a sample at/below LowerPct counts toward sustained recovery,
+// and anything in between is a dead zone that neither degrades nor recovers.
 type Thresholds struct {
-	DegradeInstantLossPct float64 // 0-100 - sustained loss ABOVE this degrades
-	DegradeAvgLossPct     float64 // 0-100
-	RecoverInstantLossPct float64 // 0-100 - loss must stay AT/BELOW this to recover
-	RecoverAvgLossPct     float64 // 0-100
-	ObservationSec        int
+	RaisePct       float64 // 0-100 - ULR above this triggers degrade
+	LowerPct       float64 // 0-100 - ULR at/below this counts toward recovery
+	ObservationSec int     // cooldown after degrade / sustained window for recovery
 }
 
 // TargetStateMsg is pushed on every transition and once on (re)connect -
@@ -77,49 +70,26 @@ type TargetStateMsg struct {
 	Path           string `json:"path"`
 	Layers         int    `json:"layers"`
 	BitratePercent int    `json:"bitrate_percent"`
+	LatencyMs      int    `json:"latency_ms"`
 }
 
 // AlertMsg fires once (throttled) when the ladder has bottomed out
-// (layers=1, bitrate=80%) and loss is still non-compliant.
+// (layers=1, bitrate=60%) and loss is still non-compliant.
 type AlertMsg struct {
 	Type   string `json:"type"`
 	Path   string `json:"path"`
 	Reason string `json:"reason"`
 }
 
-// lossWindow is a fixed-size ring buffer of per-sample (lost, received)
-// deltas, used to compute a trailing average loss rate.
-type lossWindow struct {
-	lost, received [AvgWindowSize]uint64
-	idx            int
-	filled         bool
-}
+// Action reports what a Sample call did to the ladder, so callers can react
+// (e.g. SRT raises receiver latency on a degrade, lowers it on a recover).
+type Action int
 
-func (w *lossWindow) add(lostDelta, receivedDelta uint64) {
-	w.lost[w.idx] = lostDelta
-	w.received[w.idx] = receivedDelta
-	w.idx++
-	if w.idx == AvgWindowSize {
-		w.idx = 0
-		w.filled = true
-	}
-}
-
-func (w *lossWindow) averageLossRate() float64 {
-	n := w.idx
-	if w.filled {
-		n = AvgWindowSize
-	}
-	var lost, total uint64
-	for i := 0; i < n; i++ {
-		lost += w.lost[i]
-		total += w.lost[i] + w.received[i]
-	}
-	if total == 0 {
-		return 0
-	}
-	return float64(lost) / float64(total)
-}
+const (
+	ActionNone Action = iota
+	ActionDegrade
+	ActionRecover
+)
 
 // State is the FSM + loss tracking for a single path. Owned by a Manager,
 // looked up/created by path name; long-lived across ingest session/
@@ -128,18 +98,17 @@ type State struct {
 	path string
 	log  logger.Writer
 
-	mu             sync.Mutex
-	maxLayers      int // "full"/undegraded layer count - see ObserveSessionLayerCount
-	layers         int
-	bitratePercent int
-	window         lossWindow
-	haveLastCum    bool
-	lastLost       uint64
-	lastReceived   uint64
-	badSince       time.Time
-	goodSince      time.Time
-	lastSampleAt   time.Time
-	lastAlertTime  time.Time
+	mu                   sync.Mutex
+	maxLayers            int // "full"/undegraded layer count - see ObserveSessionLayerCount
+	layers               int
+	bitratePercent       int
+	haveLastCum          bool
+	lastUnrecov          uint64
+	lastTotal            uint64
+	goodSince            time.Time
+	lastSampleAt         time.Time
+	degradeCooldownUntil time.Time
+	lastAlertTime        time.Time
 
 	wsWriteMutex sync.Mutex
 	wsConn       *wsproto.ServerConn
@@ -182,114 +151,95 @@ func (d *State) ObserveSessionLayerCount(realLayers int) {
 	}
 }
 
-// Sample feeds a fresh (cumulative lost, cumulative received) reading from
-// a publish connection's stats. Cumulative counters reset to near-zero
-// whenever a new ingest session/connection starts (server restart,
-// executor-triggered reconnect, or a plain network drop) - such a reset is
-// detected and treated as a new baseline rather than an (invalid, huge)
-// negative delta.
-func (d *State) Sample(cumLost, cumReceived uint64, t Thresholds) {
+// Sample feeds a fresh (cumulative unrecoverable loss, cumulative total
+// packets) reading from a publish connection's stats. Cumulative counters
+// reset to near-zero whenever a new ingest session/connection starts (server
+// restart, executor-triggered reconnect, or a plain network drop) - such a
+// reset is detected and treated as a new baseline rather than an (invalid,
+// huge) negative delta. Returns the action that fired, if any.
+func (d *State) Sample(cumUnrecov, cumTotal uint64, t Thresholds) Action {
 	d.mu.Lock()
-	if !d.haveLastCum || cumLost < d.lastLost || cumReceived < d.lastReceived {
-		d.lastLost, d.lastReceived = cumLost, cumReceived
+	if !d.haveLastCum || cumUnrecov < d.lastUnrecov || cumTotal < d.lastTotal {
+		d.lastUnrecov, d.lastTotal = cumUnrecov, cumTotal
 		d.haveLastCum = true
 		d.mu.Unlock()
-		return
+		return ActionNone
 	}
-	lostDelta := cumLost - d.lastLost
-	receivedDelta := cumReceived - d.lastReceived
-	d.lastLost, d.lastReceived = cumLost, cumReceived
+	unrecovDelta := cumUnrecov - d.lastUnrecov
+	totalDelta := cumTotal - d.lastTotal
+	d.lastUnrecov, d.lastTotal = cumUnrecov, cumTotal
 	d.mu.Unlock()
 
-	d.recordSample(lostDelta, receivedDelta, t)
+	return d.recordSample(unrecovDelta, totalDelta, t)
 }
 
-func (d *State) recordSample(lostDelta, receivedDelta uint64, t Thresholds) {
+func (d *State) recordSample(unrecovDelta, totalDelta uint64, t Thresholds) Action {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
 	now := time.Now()
 
-	// If nothing has sampled this path in a while - no active publish
-	// session, e.g. between a dropped connection and its eventual
-	// reconnect - badSince/goodSince stop describing a continuously
-	// observed condition, and the average window holds data from a
-	// different, no-longer-relevant network circumstance. Start a fresh
-	// observation epoch: reconnecting after a long silence must earn its
-	// own ObservationSec of continuous (non-)compliance, not inherit
-	// whatever the state happened to be when sampling last stopped. This
-	// does NOT touch layers/bitratePercent - those intentionally persist
-	// across reconnects (see the package doc comment).
+	// Stale gap: reset observation timers after a long silence.
 	if !d.lastSampleAt.IsZero() && now.Sub(d.lastSampleAt) > StaleGap {
-		d.badSince = time.Time{}
 		d.goodSince = time.Time{}
-		d.window = lossWindow{}
+		d.degradeCooldownUntil = time.Time{}
 	}
 	d.lastSampleAt = now
 
-	instant := 0.0
-	if total := lostDelta + receivedDelta; total > 0 {
-		instant = float64(lostDelta) / float64(total)
+	ulr := 0.0
+	if totalDelta > 0 {
+		ulr = float64(unrecovDelta) / float64(totalDelta) * 100
 	}
-	d.window.add(lostDelta, receivedDelta)
-	avg := d.window.averageLossRate()
 
-	good := instant <= t.RecoverInstantLossPct/100 && avg <= t.RecoverAvgLossPct/100
-	bad := instant > t.DegradeInstantLossPct/100 || avg > t.DegradeAvgLossPct/100
 	observation := time.Duration(t.ObservationSec) * time.Second
 
-	switch {
-	case good:
-		d.badSince = time.Time{}
+	// Degrade: immediate on threshold crossing, with cooldown.
+	if ulr > t.RaisePct {
+		d.goodSince = time.Time{}
+		if !now.Before(d.degradeCooldownUntil) {
+			d.degrade(now)
+			d.degradeCooldownUntil = now.Add(observation)
+			return ActionDegrade
+		}
+		return ActionNone
+	}
+
+	// Recovery: sustained compliance for ObservationSec.
+	if ulr <= t.LowerPct {
+		d.degradeCooldownUntil = time.Time{}
 		if d.goodSince.IsZero() {
 			d.goodSince = now
-		}
-		if now.Sub(d.goodSince) >= observation {
+		} else if now.Sub(d.goodSince) >= observation {
 			d.recover(now)
 			d.goodSince = now
+			return ActionRecover
 		}
-
-	case bad:
-		d.goodSince = time.Time{}
-		if d.badSince.IsZero() {
-			d.badSince = now
-		}
-		if now.Sub(d.badSince) >= observation {
-			d.degrade(now, observation)
-			d.badSince = now
-		}
-
-	default:
-		// Dead zone (Recover* < loss <= Degrade*): neither good nor bad
-		// enough to count. Leave badSince/goodSince exactly as they are -
-		// a timer already running keeps accumulating in wall-clock time
-		// toward its own threshold, it just isn't reset or advanced by
-		// this particular sample.
+		return ActionNone
 	}
+
+	// Dead zone (LowerPct < ULR <= RaisePct): leave timers as they are.
+	return ActionNone
 }
 
 // degrade and recover must be called with d.mu held.
 
-func (d *State) degrade(now time.Time, observation time.Duration) {
+func (d *State) degrade(now time.Time) {
 	switch {
 	case d.maxLayers == 0:
-		// No session has reported its real layer count yet - nothing
-		// meaningful to degrade.
 		return
+	case d.bitratePercent > 60:
+		d.bitratePercent -= 20
 	case d.layers > 1:
 		d.layers--
-	case d.layers == 1 && d.bitratePercent == 100:
-		d.bitratePercent = 80
 	default:
-		// Terminal state: layers=1, bitrate=80%, still non-compliant.
-		// No further automatic action - alert (throttled) and stop.
-		if d.lastAlertTime.IsZero() || now.Sub(d.lastAlertTime) >= observation {
+		// Terminal: layers=1, bitrate=60%, still non-compliant.
+		if d.lastAlertTime.IsZero() || now.Sub(d.lastAlertTime) >= time.Duration(60)*time.Second {
 			d.lastAlertTime = now
-			d.log.Log(logger.Warn, "[degrade] path=%s layers=1 bitrate=80%% still non-compliant, giving up", d.path)
+			d.log.Log(logger.Warn, "[degrade] path=%s layers=1 bitrate=60%% still non-compliant, giving up", d.path)
 			d.pushLocked(AlertMsg{
 				Type:   "ALERT",
 				Path:   d.path,
-				Reason: "layer=1,bitrate=80%,仍不合规",
+				Reason: "layer=1,bitrate=60%,仍不合规",
 			})
 		}
 		return
@@ -300,12 +250,12 @@ func (d *State) degrade(now time.Time, observation time.Duration) {
 
 func (d *State) recover(now time.Time) {
 	switch {
-	case d.bitratePercent == 80:
-		d.bitratePercent = 100
 	case d.layers < d.maxLayers:
 		d.layers++
+	case d.bitratePercent < 100:
+		d.bitratePercent += 20
 	default:
-		return // already fully recovered (or maxLayers still unknown)
+		return
 	}
 	d.log.Log(logger.Info, "[degrade] path=%s recovering -> layers=%d bitrate=%d%%", d.path, d.layers, d.bitratePercent)
 	d.pushTargetStateLocked()
@@ -356,8 +306,6 @@ func (d *State) BindConn(conn *wsproto.ServerConn) {
 	d.mu.Unlock()
 
 	if maxLayers == 0 {
-		// No publish session has reported its real layer count yet -
-		// nothing meaningful to sync the executor to.
 		return
 	}
 
@@ -366,8 +314,7 @@ func (d *State) BindConn(conn *wsproto.ServerConn) {
 	}
 }
 
-// UnbindConn clears the executor connection if it's still the current one
-// (a newer connection may have already replaced it via BindConn).
+// UnbindConn clears the executor connection if it's still the current one.
 func (d *State) UnbindConn(conn *wsproto.ServerConn) {
 	d.wsWriteMutex.Lock()
 	if d.wsConn == conn {
